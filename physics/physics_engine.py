@@ -327,6 +327,9 @@ class PhysicsEngine:
                 'desired_heading_deg': desired_heading_deg,
                 'align_tolerance_deg': 8.0,
                 'align_speed_deg_per_sec': 360.0,
+                'align_last_abs_diff': None,
+                'align_stuck_time': 0.0,
+                'align_probe_index': 0,
             }
         self._update_step_climb(entity, map_manager, dt)
 
@@ -347,6 +350,35 @@ class PhysicsEngine:
             angle_diff = self._normalize_angle_diff(desired_heading - float(getattr(entity, 'angle', 0.0)))
             tolerance = float(state.get('align_tolerance_deg', 8.0))
             if abs(angle_diff) > tolerance:
+                last_abs_diff = state.get('align_last_abs_diff')
+                current_abs_diff = abs(angle_diff)
+                if last_abs_diff is not None and abs(current_abs_diff - float(last_abs_diff)) <= 0.35:
+                    state['align_stuck_time'] = float(state.get('align_stuck_time', 0.0)) + float(dt)
+                else:
+                    state['align_stuck_time'] = 0.0
+                state['align_last_abs_diff'] = current_abs_diff
+
+                if float(state.get('align_stuck_time', 0.0)) >= 0.45:
+                    probe_step = self._meters_to_world_units(0.14)
+                    probe_offsets = (probe_step, -probe_step, probe_step * 2.0, -probe_step * 2.0)
+                    probe_index = int(state.get('align_probe_index', 0)) % len(probe_offsets)
+                    lateral = probe_offsets[probe_index]
+                    state['align_probe_index'] = probe_index + 1
+                    state['align_stuck_time'] = 0.0
+
+                    heading_rad = math.radians(desired_heading)
+                    side_x = -math.sin(heading_rad)
+                    side_y = math.cos(heading_rad)
+                    candidate_x = float(start_point[0]) + side_x * lateral
+                    candidate_y = float(start_point[1]) + side_y * lateral
+                    if map_manager.is_position_valid_for_radius(
+                        candidate_x,
+                        candidate_y,
+                        collision_radius=float(getattr(entity, 'collision_radius', 0.0)),
+                    ):
+                        start_point = (candidate_x, candidate_y)
+                        state['start_point'] = start_point
+
                 turn_speed = float(state.get('align_speed_deg_per_sec', 360.0)) * float(dt)
                 turn_step = max(-turn_speed, min(turn_speed, angle_diff))
                 entity.angle = (float(getattr(entity, 'angle', 0.0)) + turn_step) % 360.0
@@ -361,6 +393,8 @@ class PhysicsEngine:
             state['progress'] = 0.0
             state['start_point'] = (float(entity.position['x']), float(entity.position['y']))
             state['start_height'] = map_manager.get_terrain_height_m(entity.position['x'], entity.position['y'])
+            state['align_stuck_time'] = 0.0
+            state['align_last_abs_diff'] = None
 
         state['progress'] = float(state.get('progress', 0.0)) + float(dt)
         duration = max(float(state.get('duration', self.default_step_climb_duration_sec)), 1e-6)

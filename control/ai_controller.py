@@ -73,6 +73,7 @@ class AIController:
         engineer_tree = Selector(
             Sequence(Condition(self._should_recover_after_respawn), Action(self._action_recover_after_respawn)),
             Sequence(Condition(self._is_critical_state), Action(self._action_emergency_retreat)),
+            Sequence(Condition(self._should_push_base), Action(self._action_push_base)),
             Sequence(Condition(self._needs_mining_cycle), Action(self._action_engineer_mining_cycle)),
             Sequence(Condition(self._needs_structure_support), Action(self._action_support_structures)),
             Sequence(Condition(self._should_cross_terrain), Action(self._action_cross_terrain)),
@@ -509,7 +510,11 @@ class AIController:
         if enemy_base is None or not enemy_base.is_alive():
             return False
         enemy_outpost = context.data.get('enemy_outpost')
-        return context.data.get('late_phase') or enemy_outpost is None or not enemy_outpost.is_alive()
+        if enemy_outpost is not None and enemy_outpost.is_alive():
+            return bool(context.data.get('late_phase'))
+        if context.rules_engine is not None and hasattr(context.rules_engine, 'is_base_shielded'):
+            return not bool(context.rules_engine.is_base_shielded(enemy_base))
+        return True
 
     def _can_hero_lob_shot(self, context):
         if context.data.get('role_key') != 'hero':
@@ -967,6 +972,22 @@ class AIController:
         return self._set_decision(context, '沿关键设施轮巡，保持阵型与视野', target=context.data.get('target'), target_point=patrol_target, speed=speed, turret_state='aiming' if context.data.get('target') else 'searching', angular_velocity=12.0)
 
     def select_priority_target(self, entity, enemies, strategy, rules_engine=None, max_distance=None):
+        enemy_base = None
+        enemy_outpost_alive = False
+        for other in enemies:
+            if other.type == 'base':
+                enemy_base = other
+            elif other.type == 'outpost' and other.is_alive():
+                enemy_outpost_alive = True
+        base_unlocked = False
+        if enemy_base is not None and enemy_base.is_alive() and not enemy_outpost_alive:
+            if rules_engine is not None and hasattr(rules_engine, 'is_base_shielded'):
+                base_unlocked = not bool(rules_engine.is_base_shielded(enemy_base))
+            else:
+                base_unlocked = True
+        if base_unlocked:
+            return self.entity_to_target(enemy_base, entity)
+
         priority_targets = strategy.get('priority_targets', ['sentry', 'robot', 'outpost', 'base'])
         priority_map = {target_type: len(priority_targets) - index for index, target_type in enumerate(priority_targets)}
         visible_combat_target_exists = False

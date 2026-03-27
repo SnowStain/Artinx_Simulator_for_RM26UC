@@ -598,12 +598,21 @@ class RulesEngine:
         return float(map_manager.get_terrain_height_m(entity.position['x'], entity.position['y']))
 
     def _shooter_view_height_m(self, shooter):
-        shooting = self.rules['shooting']
-        view_offset = float(shooting.get('turret_axis_height_m', shooting.get('camera_height_m', 0.45)))
-        return self._entity_ground_height_m(shooter) + view_offset
+        return self._entity_ground_height_m(shooter) + 0.45
 
     def _target_armor_height_m(self, target):
-        return self._entity_ground_height_m(target) + float(self.rules['shooting'].get('armor_center_height_m', 0.15))
+        return self._entity_ground_height_m(target) + 0.15
+
+    def is_base_shielded(self, base_entity):
+        if base_entity is None or getattr(base_entity, 'type', None) != 'base':
+            return False
+        if getattr(base_entity, 'invincible_timer', 0.0) > 0 or getattr(base_entity, 'dynamic_invincible', False):
+            return True
+        own_team = getattr(base_entity, 'team', None)
+        if own_team not in {'red', 'blue'}:
+            return False
+        own_outpost = self._find_entity(getattr(self, '_latest_entities', []), own_team, 'outpost')
+        return own_outpost is not None and own_outpost.is_alive()
 
     def _normalize_angle_diff(self, angle_diff):
         while angle_diff > 180:
@@ -637,6 +646,10 @@ class RulesEngine:
         clearance = float(self.rules['shooting'].get('los_clearance_m', 0.02))
         endpoint_guard = min(0.12, 0.5 / max(steps, 1))
 
+        target_pitch_rad = math.atan2(target_height - shooter_height, max(distance, 1e-6))
+        pitch_margin_deg = float(self.rules['shooting'].get('los_pitch_margin_deg', 0.8))
+        pitch_margin_rad = math.radians(max(0.0, pitch_margin_deg))
+
         for index in range(1, steps):
             progress = index / steps
             if progress <= endpoint_guard or progress >= 1.0 - endpoint_guard:
@@ -646,6 +659,10 @@ class RulesEngine:
             sample = map_manager.sample_raster_layers(sample_x, sample_y)
             obstacle_height = max(float(sample.get('height_m', 0.0)), float(sample.get('vision_block_height_m', 0.0)))
             sight_height = shooter_height + (target_height - shooter_height) * progress
+            sample_distance = max(distance * progress, 1e-6)
+            obstacle_pitch_rad = math.atan2((obstacle_height + clearance) - shooter_height, sample_distance)
+            if obstacle_pitch_rad >= target_pitch_rad - pitch_margin_rad:
+                return False
             if obstacle_height >= sight_height - clearance:
                 return False
         return True
@@ -1849,6 +1866,8 @@ class RulesEngine:
     def calculate_hit_probability(self, shooter, target, distance=None):
         if getattr(target, 'invincible_timer', 0.0) > 0 or getattr(target, 'dynamic_invincible', False):
             return 0.0
+        if self.is_base_shielded(target):
+            return 0.0
 
         if distance is None:
             distance = math.hypot(
@@ -1970,6 +1989,8 @@ class RulesEngine:
 
     def calculate_damage(self, shooter, target):
         if getattr(target, 'invincible_timer', 0.0) > 0 or getattr(target, 'dynamic_invincible', False):
+            return 0.0
+        if self.is_base_shielded(target):
             return 0.0
 
         target_damage_table = self.damage_system.get(target.type, {})
