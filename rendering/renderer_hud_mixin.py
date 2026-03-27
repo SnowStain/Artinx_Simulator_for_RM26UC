@@ -132,25 +132,35 @@ class RendererHudMixin:
         if self.mouse_world is not None:
             lines.append(f'坐标: ({self.mouse_world[0]}, {self.mouse_world[1]})')
 
-        box = pygame.Surface((280, 24 + len(lines) * 18), pygame.SRCALPHA)
-        box.fill(self.colors['overlay_bg'])
-        for index, line in enumerate(lines):
-            text = self.tiny_font.render(line, True, self.colors['white'])
-            box.blit(text, (10, 8 + index * 18))
+        box_key = tuple(lines)
+        if self.overlay_status_box_key != box_key:
+            box = pygame.Surface((280, 24 + len(lines) * 18), pygame.SRCALPHA).convert_alpha()
+            box.fill(self.colors['overlay_bg'])
+            for index, line in enumerate(lines):
+                text = self.tiny_font.render(line, True, self.colors['white'])
+                box.blit(text, (10, 8 + index * 18))
+            self.overlay_status_box_surface = box
+            self.overlay_status_box_key = box_key
+        box = self.overlay_status_box_surface
         left_bottom_pos = (self.viewport['map_x'] + 8, self.viewport['map_y'] + self.viewport['map_height'] - box.get_height() - 8)
         self.screen.blit(box, left_bottom_pos)
 
         logs = game_engine.logs[-6:]
         if not logs:
             return
-        log_surface = pygame.Surface((460, 20 + len(logs) * 18), pygame.SRCALPHA)
-        log_surface.fill(self.colors['overlay_log_bg'])
-        for index, log in enumerate(logs):
-            color = self.colors['white']
-            if log['team'] == 'red':
-                color = self.colors['red']
-            elif log['team'] == 'blue':
-                color = self.colors['blue']
-            text = self.tiny_font.render(log['message'], True, color)
-            log_surface.blit(text, (10, 6 + index * 18))
+        log_key = tuple((log['team'], log['message']) for log in logs)
+        if self.overlay_status_log_key != log_key:
+            log_surface = pygame.Surface((460, 20 + len(logs) * 18), pygame.SRCALPHA).convert_alpha()
+            log_surface.fill(self.colors['overlay_log_bg'])
+            for index, log in enumerate(logs):
+                color = self.colors['white']
+                if log['team'] == 'red':
+                    color = self.colors['red']
+                elif log['team'] == 'blue':
+                    color = self.colors['blue']
+                text = self.tiny_font.render(log['message'], True, color)
+                log_surface.blit(text, (10, 6 + index * 18))
+            self.overlay_status_log_surface = log_surface
+            self.overlay_status_log_key = log_key
+        log_surface = self.overlay_status_log_surface
         self.screen.blit(log_surface, (self.viewport['map_x'] + self.viewport['map_width'] - log_surface.get_width() - 8, self.viewport['map_y'] + self.viewport['map_height'] - log_surface.get_height() - 8))

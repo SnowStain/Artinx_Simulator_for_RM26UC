@@ -131,8 +131,13 @@ class RulesEngine:
                 'armor_center_height_m': 0.15,
                 'turret_axis_height_m': 0.45,
                 'camera_height_m': 0.45,
+                'max_pitch_up_deg': 35.0,
+                'max_pitch_down_deg': 25.0,
                 'los_sample_step_m': 0.25,
                 'los_clearance_m': 0.02,
+                'los_pitch_margin_deg': 0.8,
+                'los_pitch_probe_distance_m': 0.45,
+                'los_terrain_pitch_margin_deg': 1.2,
                 'auto_aim_max_distance_m': 8.0,
                 'auto_aim_fov_deg': 50.0,
                 'auto_aim_track_speed_deg_per_sec': 180.0,
@@ -496,6 +501,42 @@ class RulesEngine:
         self.collision_damage_cooldowns = {}
         self.game_time = 0.0
         self.game_duration = float(self.rules.get('game_duration', 420.0))
+        self._frame_cache_token = None
+        self._auto_aim_eval_cache = {}
+        self._line_of_sight_cache = {}
+        self._facility_update_accumulator = 0.0
+        self._facility_update_interval = 0.04
+
+    def start_frame(self, frame_token):
+        if frame_token == self._frame_cache_token:
+            return
+        self._frame_cache_token = frame_token
+        self._auto_aim_eval_cache.clear()
+        self._line_of_sight_cache.clear()
+
+    def _entity_pose_cache_key(self, entity, include_turret=False):
+        key = (
+            getattr(entity, 'id', None),
+            round(float(entity.position['x']), 2),
+            round(float(entity.position['y']), 2),
+            round(float(getattr(entity, 'angle', 0.0)), 2),
+        )
+        if include_turret:
+            key += (round(float(getattr(entity, 'turret_angle', getattr(entity, 'angle', 0.0))), 2),)
+        return key
+
+    def _line_of_sight_cache_key(self, shooter, target):
+        map_manager = self._map_manager()
+        raster_version = getattr(map_manager, 'raster_version', 0)
+        return (self._entity_pose_cache_key(shooter), self._entity_pose_cache_key(target), raster_version)
+
+    def _auto_aim_cache_key(self, shooter, target, distance, require_fov):
+        return (
+            self._entity_pose_cache_key(shooter, include_turret=True),
+            self._entity_pose_cache_key(target),
+            round(float(distance), 2),
+            bool(require_fov),
+        )
 
     def load_damage_system(self):
         return deepcopy(self.rules['damage'])
@@ -532,6 +573,8 @@ class RulesEngine:
             'armor_center_height_m': float(shooting['armor_center_height_m']),
             'turret_axis_height_m': float(shooting.get('turret_axis_height_m', shooting.get('camera_height_m', 0.45))),
             'camera_height_m': float(shooting['camera_height_m']),
+            'max_pitch_up_deg': float(shooting.get('max_pitch_up_deg', 35.0)),
+            'max_pitch_down_deg': float(shooting.get('max_pitch_down_deg', 25.0)),
             'auto_aim_max_distance_m': float(shooting['auto_aim_max_distance_m']),
             'auto_aim_max_distance_world': float(self.auto_aim_max_distance),
             'auto_aim_fov_deg': float(shooting['auto_aim_fov_deg']),
@@ -598,10 +641,40 @@ class RulesEngine:
         return float(map_manager.get_terrain_height_m(entity.position['x'], entity.position['y']))
 
     def _shooter_view_height_m(self, shooter):
-        return self._entity_ground_height_m(shooter) + 0.45
+        shooting_rules = self.rules.get('shooting', {})
+        view_height = float(shooting_rules.get('turret_axis_height_m', shooting_rules.get('camera_height_m', 0.45)))
+        return self._entity_ground_height_m(shooter) + view_height
 
     def _target_armor_height_m(self, target):
-        return self._entity_ground_height_m(target) + 0.15
+        armor_height = float(self.rules.get('shooting', {}).get('armor_center_height_m', 0.15))
+        return self._entity_ground_height_m(target) + armor_height
+
+    def _estimate_local_terrain_pitch_rad(self, map_manager, start_x, start_y, end_x, end_y):
+        distance = math.hypot(end_x - start_x, end_y - start_y)
+        if distance <= 1e-6:
+            return 0.0
+
+        sample_distance = max(
+            map_manager.meters_to_world_units(self.rules.get('shooting', {}).get('los_pitch_probe_distance_m', 0.45)),
+            1.0,
+        )
+        sample_distance = min(sample_distance, max(distance * 0.45, 1.0))
+        if sample_distance <= 1e-6:
+            return 0.0
+
+        dir_x = (end_x - start_x) / distance
+        dir_y = (end_y - start_y) / distance
+        probe_x = start_x + dir_x * sample_distance
+        probe_y = start_y + dir_y * sample_distance
+        start_height = float(map_manager.get_terrain_height_m(start_x, start_y))
+        probe_height = float(map_manager.get_terrain_height_m(probe_x, probe_y))
+        meters_per_world_unit = max(float(map_manager.meters_to_world_units(1.0)), 1e-6)
+        sample_distance_m = sample_distance / meters_per_world_unit
+        return math.atan2(probe_height - start_height, max(sample_distance_m, 1e-6))
+
+    def _estimate_target_side_pitch_rad(self, map_manager, start_x, start_y, end_x, end_y):
+        # Probe from the target back toward the shooter to catch see-saw terrain near the target.
+        return self._estimate_local_terrain_pitch_rad(map_manager, end_x, end_y, start_x, start_y)
 
     def is_base_shielded(self, base_entity):
         if base_entity is None or getattr(base_entity, 'type', None) != 'base':
@@ -631,12 +704,18 @@ class RulesEngine:
         if map_manager is None:
             return True
 
+        cache_key = self._line_of_sight_cache_key(shooter, target)
+        cached_result = self._line_of_sight_cache.get(cache_key)
+        if cached_result is not None:
+            return cached_result
+
         start_x = float(shooter.position['x'])
         start_y = float(shooter.position['y'])
         end_x = float(target.position['x'])
         end_y = float(target.position['y'])
         distance = math.hypot(end_x - start_x, end_y - start_y)
         if distance <= 1e-6:
+            self._line_of_sight_cache[cache_key] = True
             return True
 
         shooter_height = self._shooter_view_height_m(shooter)
@@ -646,9 +725,29 @@ class RulesEngine:
         clearance = float(self.rules['shooting'].get('los_clearance_m', 0.02))
         endpoint_guard = min(0.12, 0.5 / max(steps, 1))
 
-        target_pitch_rad = math.atan2(target_height - shooter_height, max(distance, 1e-6))
+        meters_per_world_unit = max(float(map_manager.meters_to_world_units(1.0)), 1e-6)
+        distance_m = distance / meters_per_world_unit
+        target_pitch_rad = math.atan2(target_height - shooter_height, max(distance_m, 1e-6))
+        target_pitch_deg = math.degrees(target_pitch_rad)
+        max_pitch_up_deg = float(self.rules['shooting'].get('max_pitch_up_deg', 35.0))
+        max_pitch_down_deg = float(self.rules['shooting'].get('max_pitch_down_deg', 25.0))
+        if target_pitch_deg > max_pitch_up_deg or target_pitch_deg < -max_pitch_down_deg:
+            self._line_of_sight_cache[cache_key] = False
+            return False
+
         pitch_margin_deg = float(self.rules['shooting'].get('los_pitch_margin_deg', 0.8))
         pitch_margin_rad = math.radians(max(0.0, pitch_margin_deg))
+        terrain_pitch_rad = self._estimate_local_terrain_pitch_rad(map_manager, start_x, start_y, end_x, end_y)
+        reverse_pitch_rad = self._estimate_target_side_pitch_rad(map_manager, start_x, start_y, end_x, end_y)
+        terrain_pitch_margin_deg = float(self.rules['shooting'].get('los_terrain_pitch_margin_deg', 1.2))
+        terrain_pitch_margin_rad = math.radians(max(0.0, terrain_pitch_margin_deg))
+
+        if target_pitch_rad + terrain_pitch_margin_rad < terrain_pitch_rad:
+            self._line_of_sight_cache[cache_key] = False
+            return False
+        if target_pitch_rad + terrain_pitch_margin_rad < reverse_pitch_rad:
+            self._line_of_sight_cache[cache_key] = False
+            return False
 
         for index in range(1, steps):
             progress = index / steps
@@ -659,12 +758,15 @@ class RulesEngine:
             sample = map_manager.sample_raster_layers(sample_x, sample_y)
             obstacle_height = max(float(sample.get('height_m', 0.0)), float(sample.get('vision_block_height_m', 0.0)))
             sight_height = shooter_height + (target_height - shooter_height) * progress
-            sample_distance = max(distance * progress, 1e-6)
+            sample_distance = max(distance_m * progress, 1e-6)
             obstacle_pitch_rad = math.atan2((obstacle_height + clearance) - shooter_height, sample_distance)
             if obstacle_pitch_rad >= target_pitch_rad - pitch_margin_rad:
+                self._line_of_sight_cache[cache_key] = False
                 return False
             if obstacle_height >= sight_height - clearance:
+                self._line_of_sight_cache[cache_key] = False
                 return False
+        self._line_of_sight_cache[cache_key] = True
         return True
 
     def evaluate_auto_aim_target(self, shooter, target, distance=None, require_fov=True):
@@ -682,6 +784,11 @@ class RulesEngine:
 
         if distance is None:
             distance = math.hypot(target.position['x'] - shooter.position['x'], target.position['y'] - shooter.position['y'])
+        cache_key = self._auto_aim_cache_key(shooter, target, distance, require_fov)
+        cached_assessment = self._auto_aim_eval_cache.get(cache_key)
+        if cached_assessment is not None:
+            return cached_assessment
+
         max_distance = self.get_range(shooter.type)
         in_range = distance <= max_distance
         line_of_sight = in_range and self.has_line_of_sight(shooter, target)
@@ -692,7 +799,7 @@ class RulesEngine:
         within_fov = abs(angle_diff) <= half_fov
         can_track = in_range and line_of_sight
         can_auto_aim = can_track and (within_fov if require_fov else True)
-        return {
+        assessment = {
             'valid': True,
             'distance': distance,
             'in_range': in_range,
@@ -703,6 +810,8 @@ class RulesEngine:
             'can_track': can_track,
             'can_auto_aim': can_auto_aim,
         }
+        self._auto_aim_eval_cache[cache_key] = assessment
+        return assessment
 
     def can_auto_aim_target(self, shooter, target, distance=None):
         return self.evaluate_auto_aim_target(shooter, target, distance=distance, require_fov=True).get('can_auto_aim', False)
@@ -724,10 +833,14 @@ class RulesEngine:
         self._update_sentry_posture_and_heat(entities, dt)
 
         if map_manager is not None:
-            self._update_occupied_facilities(entities, map_manager)
-            self._update_facility_effects(entities, map_manager, dt)
-            self._update_energy_mechanism_control(entities, map_manager, dt)
-            self._update_radar_marks(entities, map_manager)
+            self._facility_update_accumulator += dt
+            if self._facility_update_accumulator + 1e-9 >= self._facility_update_interval:
+                facility_dt = self._facility_update_accumulator
+                self._facility_update_accumulator = 0.0
+                self._update_occupied_facilities(entities, map_manager)
+                self._update_facility_effects(entities, map_manager, facility_dt)
+                self._update_energy_mechanism_control(entities, map_manager, facility_dt)
+                self._update_radar_marks(entities, map_manager, facility_dt)
 
         self.check_damage(entities)
         self.check_health(entities)
@@ -1735,9 +1848,9 @@ class RulesEngine:
             entity.terrain_buff_timer = self.rules['terrain_cross']['duration']
             self._log(f'{entity.id} 完整通过 {state["facility_type"]}，获得地形增益', entity.team)
 
-    def _update_radar_marks(self, entities, map_manager):
+    def _update_radar_marks(self, entities, map_manager, dt):
         for entity_id in list(self.radar_marks.keys()):
-            decay = self.rules['radar']['mark_decay_per_sec'] * self.dt
+            decay = self.rules['radar']['mark_decay_per_sec'] * dt
             self.radar_marks[entity_id] = max(0.0, self.radar_marks.get(entity_id, 0.0) - decay)
 
         for entity in entities:
@@ -1751,7 +1864,7 @@ class RulesEngine:
 
                 distance = math.hypot(target.position['x'] - entity.position['x'], target.position['y'] - entity.position['y'])
                 if distance < self.rules['radar']['range']:
-                    gain = self.rules['radar']['mark_gain_per_sec'] * self.dt
+                    gain = self.rules['radar']['mark_gain_per_sec'] * dt
                     self.radar_marks[target.id] = min(1.0, self.radar_marks.get(target.id, 0.0) + gain)
 
     def check_damage(self, entities):

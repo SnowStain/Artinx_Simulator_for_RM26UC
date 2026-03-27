@@ -19,7 +19,13 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
 
         self.window_width = config.get('simulator', {}).get('window_width', 1200)
         self.window_height = config.get('simulator', {}).get('window_height', 800)
-        self.screen = pygame.display.set_mode((self.window_width, self.window_height))
+        display_flags = pygame.DOUBLEBUF
+        if hasattr(pygame, 'HWSURFACE'):
+            display_flags |= pygame.HWSURFACE
+        try:
+            self.screen = pygame.display.set_mode((self.window_width, self.window_height), display_flags, vsync=1)
+        except TypeError:
+            self.screen = pygame.display.set_mode((self.window_width, self.window_height), display_flags)
         pygame.display.set_caption('RM26 Artinx-Asoul模拟器')
 
         self.toolbar_height = 54
@@ -149,6 +155,9 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.facility_draw_shape = 'rect'
         self.map_cache_size = None
         self.map_cache_surface = None
+        self.facility_overlay_surface = None
+        self.facility_overlay_cache_key = None
+        self.facility_overlay_size = None
         self.ai_navigation_overlay_surface = None
         self.ai_navigation_overlay_size = None
         self.terrain_3d_window = None
@@ -174,8 +183,14 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.terrain_shape_mode = 'circle'
         self.selected_hud_entity_id = None
         self.robot_detail_rect = None
-        self.show_facilities = config.get('simulator', {}).get('show_facilities', True)
-        self.show_aim_fov = config.get('simulator', {}).get('show_aim_fov', True)
+        self.show_facilities = config.get('simulator', {}).get('show_facilities', False)
+        self.show_aim_fov = config.get('simulator', {}).get('show_aim_fov', False)
+        self.render_interval = max(1, int(config.get('simulator', {}).get('render_interval', 1)))
+        self.overlay_status_refresh_ms = int(max(33, config.get('simulator', {}).get('overlay_status_refresh_ms', 120)))
+        self.overlay_status_box_surface = None
+        self.overlay_status_box_key = None
+        self.overlay_status_log_surface = None
+        self.overlay_status_log_key = None
 
         self.colors = {
             'bg': (231, 233, 237),
@@ -304,6 +319,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             self.rule_scroll = 0
 
     def render(self, game_engine):
+        if self.render_interval > 1 and (game_engine._frame_index % self.render_interval) != 0:
+            return
         self._refresh_editor_state(game_engine)
         self.screen.fill(self.colors['bg'])
         self.toolbar_actions = []
@@ -320,6 +337,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.render_overlay_status(game_engine)
         self.render_sidebar(game_engine)
         self.render_robot_detail_popup(game_engine)
+        self.render_perf_overlay(game_engine)
         self.render_terrain_3d_window(game_engine)
         pygame.display.flip()
 
@@ -336,6 +354,43 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             and self.active_numeric_input.get('type') == input_type
             and self.active_numeric_input.get('facility_id') == facility_id
         )
+
+    def render_perf_overlay(self, game_engine):
+        if not getattr(game_engine, 'show_perf_overlay', False):
+            return
+        stats = game_engine.get_perf_overlay_stats()
+        if not stats:
+            return
+        lines = [
+            f'目标帧率 {int(game_engine.fps)} FPS',
+            f'帧 平均 {stats["frame_avg_ms"]:.1f}ms | p95 {stats["frame_p95_ms"]:.1f}ms',
+            f'事件 平均 {stats.get("event_avg_ms", 0.0):.1f}ms | p95 {stats.get("event_p95_ms", 0.0):.1f}ms',
+            f'更新 平均 {stats["update_avg_ms"]:.1f}ms | p95 {stats["update_p95_ms"]:.1f}ms',
+            f'渲染 平均 {stats["render_avg_ms"]:.1f}ms | p95 {stats["render_p95_ms"]:.1f}ms',
+        ]
+        breakdown = stats.get('breakdown') if isinstance(stats, dict) else None
+        if breakdown:
+            lines.append(
+                '更新拆分 ent {entity_ms:.1f} | ctrl {controller_ms:.1f} | phys {physics_ms:.1f} | aim {auto_aim_ms:.1f} | rule {rules_ms:.1f}'.format(
+                    entity_ms=breakdown.get('entity_ms', 0.0),
+                    controller_ms=breakdown.get('controller_ms', 0.0),
+                    physics_ms=breakdown.get('physics_ms', 0.0),
+                    auto_aim_ms=breakdown.get('auto_aim_ms', 0.0),
+                    rules_ms=breakdown.get('rules_ms', 0.0),
+                )
+            )
+        padding = 8
+        line_height = self.tiny_font.get_linesize()
+        box_width = max(self.tiny_font.size(line)[0] for line in lines) + padding * 2
+        box_height = line_height * len(lines) + padding * 2
+        surface = pygame.Surface((box_width, box_height), pygame.SRCALPHA)
+        surface.fill((18, 24, 30, 170))
+        for idx, line in enumerate(lines):
+            text = self.tiny_font.render(line, True, self.colors['white'])
+            surface.blit(text, (padding, padding + idx * line_height))
+        dest_x = self.content_padding
+        dest_y = self.toolbar_height + self.hud_height + self.content_padding
+        self.screen.blit(surface, (dest_x, dest_y))
 
     def _cancel_numeric_input(self):
         self.active_numeric_input = None
@@ -677,13 +732,37 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         if source is None:
             return None
         if self.map_cache_surface is None or self.map_cache_size != size:
-            self.map_cache_surface = pygame.transform.smoothscale(source, size)
+            self.map_cache_surface = pygame.transform.smoothscale(source, size).convert()
             self.map_cache_size = size
         return self.map_cache_surface
 
     def render_facility_overlay(self, map_manager):
         if self.viewport is None or not self.show_facilities:
             return
+        interactive = self._facility_edit_active() or self._terrain_brush_active()
+        if not interactive:
+            viewport_key = (
+                int(self.viewport['map_x']),
+                int(self.viewport['map_y']),
+                int(self.viewport['map_width']),
+                int(self.viewport['map_height']),
+                round(float(self.viewport['scale']), 4),
+                getattr(map_manager, 'raster_version', 0),
+            )
+            size = (self.window_width, self.window_height)
+            if self.facility_overlay_surface is None or self.facility_overlay_size != size:
+                self.facility_overlay_surface = pygame.Surface(size, pygame.SRCALPHA).convert_alpha()
+                self.facility_overlay_size = size
+                self.facility_overlay_cache_key = None
+            if self.facility_overlay_cache_key != viewport_key:
+                self.facility_overlay_surface.fill((0, 0, 0, 0))
+                self._draw_facility_overlay(self.facility_overlay_surface, map_manager, interactive=False)
+                self.facility_overlay_cache_key = viewport_key
+            self.screen.blit(self.facility_overlay_surface, (0, 0))
+            return
+        self._draw_facility_overlay(self.screen, map_manager, interactive=True)
+
+    def _draw_facility_overlay(self, target_surface, map_manager, interactive=False):
         color_map = {
             'base': (255, 80, 80),
             'outpost': (80, 160, 255),
@@ -732,13 +811,13 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 x1, y1 = self.world_to_screen(region['x1'], region['y1'])
                 x2, y2 = self.world_to_screen(region['x2'], region['y2'])
                 thickness = max(2, int(region.get('thickness', 12) * self.viewport['scale']))
-                pygame.draw.line(self.screen, color, (x1, y1), (x2, y2), thickness)
-                if self._facility_edit_active() and self.selected_wall_id == region.get('id'):
-                    pygame.draw.line(self.screen, self.colors['yellow'], (x1, y1), (x2, y2), max(1, thickness // 3))
-                    pygame.draw.circle(self.screen, self.colors['yellow'], (x1, y1), 5)
-                    pygame.draw.circle(self.screen, self.colors['yellow'], (x2, y2), 5)
+                pygame.draw.line(target_surface, color, (x1, y1), (x2, y2), thickness)
+                if interactive and self.selected_wall_id == region.get('id'):
+                    pygame.draw.line(target_surface, self.colors['yellow'], (x1, y1), (x2, y2), max(1, thickness // 3))
+                    pygame.draw.circle(target_surface, self.colors['yellow'], (x1, y1), 5)
+                    pygame.draw.circle(target_surface, self.colors['yellow'], (x2, y2), 5)
                 tag = self.tiny_font.render(str(region.get('id', facility_type)), True, color)
-                self.screen.blit(tag, (x1 + 4, y1 + 4))
+                target_surface.blit(tag, (x1 + 4, y1 + 4))
                 continue
 
             if region.get('shape') == 'polygon':
@@ -746,13 +825,13 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 points = [self.world_to_screen(point[0], point[1]) for point in region.get('points', [])]
                 if len(points) < 3:
                     continue
-                pygame.draw.polygon(self.screen, color, points, 2 if self._facility_edit_active() else 1)
-                if self._facility_edit_active() and self.selected_terrain_id == region.get('id'):
-                    pygame.draw.polygon(self.screen, self.colors['yellow'], points, 2)
+                pygame.draw.polygon(target_surface, color, points, 2 if interactive else 1)
+                if interactive and self.selected_terrain_id == region.get('id'):
+                    pygame.draw.polygon(target_surface, self.colors['yellow'], points, 2)
                     for point in points:
-                        pygame.draw.circle(self.screen, self.colors['yellow'], point, 4)
+                        pygame.draw.circle(target_surface, self.colors['yellow'], point, 4)
                 tag = self.tiny_font.render(str(region.get('id', facility_type)), True, color)
-                self.screen.blit(tag, (points[0][0] + 2, points[0][1] + 2))
+                target_surface.blit(tag, (points[0][0] + 2, points[0][1] + 2))
                 continue
 
             if region.get('shape') != 'rect':
@@ -765,15 +844,15 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 center_x = rect.x + rect.width // 2
                 center_y = rect.y + rect.height // 2
                 radius = max(10, min(rect.width, rect.height) // 2)
-                pygame.draw.circle(self.screen, color, (center_x, center_y), radius, 3)
-                pygame.draw.circle(self.screen, color, (center_x, center_y), max(6, radius - 7), 1)
+                pygame.draw.circle(target_surface, color, (center_x, center_y), radius, 3)
+                pygame.draw.circle(target_surface, color, (center_x, center_y), max(6, radius - 7), 1)
             else:
-                pygame.draw.rect(self.screen, color, rect, 2 if self._facility_edit_active() else 1)
-            if self._facility_edit_active() and self.selected_terrain_id == region.get('id'):
-                pygame.draw.rect(self.screen, self.colors['yellow'], rect, 2)
+                pygame.draw.rect(target_surface, color, rect, 2 if interactive else 1)
+            if interactive and self.selected_terrain_id == region.get('id'):
+                pygame.draw.rect(target_surface, self.colors['yellow'], rect, 2)
             if facility_type != 'boundary':
                 tag = self.tiny_font.render(str(region.get('id', facility_type)), True, color)
-                self.screen.blit(tag, (rect.x + 2, rect.y + 2))
+                target_surface.blit(tag, (rect.x + 2, rect.y + 2))
 
     def render_drag_preview(self):
         if self.viewport is None or (not self._facility_edit_active() and not self._terrain_brush_active()):
@@ -970,7 +1049,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             velocity = getattr(entity, 'ai_navigation_velocity', (0.0, 0.0))
             if navigation_target is None and movement_target is None and waypoint is None and not path_preview:
                 continue
-            if not path_valid and waypoint is None and len(path_preview) < 2:
+            if not path_valid and waypoint is None and len(path_preview) < 2 and navigation_target is None and movement_target is None:
                 continue
 
             if overlay is None:
@@ -993,26 +1072,29 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                     pygame.draw.circle(overlay, (*color_rgb, 110), point, 3)
 
             marker_target = navigation_target or movement_target or waypoint
-            if path_valid and marker_target is not None:
+            if marker_target is not None:
+                marker_alpha = 90 if path_valid else 64
+                marker_outline_alpha = 178 if path_valid else 124
                 marker_pos = self.world_to_screen(marker_target[0], marker_target[1])
-                pygame.draw.circle(overlay, (*color_rgb, 90), marker_pos, 11)
-                pygame.draw.circle(overlay, arrow_color, marker_pos, 11, 2)
-                pygame.draw.line(overlay, arrow_color, (marker_pos[0] - 6, marker_pos[1]), (marker_pos[0] + 6, marker_pos[1]), 2)
-                pygame.draw.line(overlay, arrow_color, (marker_pos[0], marker_pos[1] - 6), (marker_pos[0], marker_pos[1] + 6), 2)
+                pygame.draw.circle(overlay, (*color_rgb, marker_alpha), marker_pos, 11)
+                pygame.draw.circle(overlay, (*color_rgb, marker_outline_alpha), marker_pos, 11, 2)
+                pygame.draw.line(overlay, (*color_rgb, marker_outline_alpha), (marker_pos[0] - 6, marker_pos[1]), (marker_pos[0] + 6, marker_pos[1]), 2)
+                pygame.draw.line(overlay, (*color_rgb, marker_outline_alpha), (marker_pos[0], marker_pos[1] - 6), (marker_pos[0], marker_pos[1] + 6), 2)
 
             arrow_dx = float(velocity[0])
             arrow_dy = float(velocity[1])
-            if abs(arrow_dx) <= 1e-6 and abs(arrow_dy) <= 1e-6 and path_valid and marker_target is not None:
+            if abs(arrow_dx) <= 1e-6 and abs(arrow_dy) <= 1e-6 and marker_target is not None:
                 arrow_dx = marker_target[0] - entity.position['x']
                 arrow_dy = marker_target[1] - entity.position['y']
             arrow_len = math.hypot(arrow_dx, arrow_dy)
-            if path_valid and arrow_len > 1e-6:
+            if arrow_len > 1e-6:
+                arrow_alpha = 178 if path_valid else 128
                 scale = min(56.0, max(28.0, arrow_len * self.viewport['scale'] * 0.35)) / arrow_len
                 end_pos = (
                     center[0] + arrow_dx * scale,
                     center[1] + arrow_dy * scale,
                 )
-                pygame.draw.line(overlay, arrow_color, center, end_pos, 4)
+                pygame.draw.line(overlay, (*color_rgb, arrow_alpha), center, end_pos, 4)
                 heading = math.atan2(end_pos[1] - center[1], end_pos[0] - center[0])
                 head_size = 10.0
                 left = (
@@ -1023,7 +1105,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                     end_pos[0] - math.cos(heading + math.pi / 6.0) * head_size,
                     end_pos[1] - math.sin(heading + math.pi / 6.0) * head_size,
                 )
-                pygame.draw.polygon(overlay, arrow_color, [end_pos, left, right])
+                pygame.draw.polygon(overlay, (*color_rgb, arrow_alpha), [end_pos, left, right])
         if overlay is not None:
             self.screen.blit(overlay, (0, 0))
 
@@ -1054,8 +1136,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
 
     def render_robot(self, entity, x, y, color):
         radius = self._entity_draw_radius(entity)
-        chassis_rect = pygame.Rect(x - radius, y - radius + 2, radius * 2, radius + 6)
-        pygame.draw.rect(self.screen, color, chassis_rect, border_radius=5)
+        self._render_chassis_with_armor(entity, x, y, radius, color, style='robot')
         self._render_wheels(entity, x, y, radius)
         if entity.robot_type == '工程':
             self.render_engineer_arm(entity, x, y, radius)
@@ -1099,14 +1180,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
 
     def render_sentry(self, entity, x, y, color):
         radius = self._entity_draw_radius(entity)
-        chassis = [
-            (x - radius, y + radius // 2),
-            (x - radius // 2, y - radius + 2),
-            (x + radius // 2, y - radius + 2),
-            (x + radius, y + radius // 2),
-            (x, y + radius),
-        ]
-        pygame.draw.polygon(self.screen, color, chassis)
+        self._render_chassis_with_armor(entity, x, y, radius, color, style='sentry')
         self._render_wheels(entity, x, y, radius)
         turret_angle = math.radians(getattr(entity, 'turret_angle', entity.angle))
         turret_center = (x, y - 2)
@@ -1119,6 +1193,81 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
     def _entity_draw_radius(self, entity):
         fallback = self.entity_radius['sentry'] if entity.type == 'sentry' else self.entity_radius['robot']
         return int(max(8.0, float(getattr(entity, 'collision_radius', fallback)) * 0.55))
+
+    def _render_chassis_with_armor(self, entity, x, y, radius, color, style='robot'):
+        body_angle = math.radians(getattr(entity, 'angle', 0.0))
+        body_color = (168, 176, 184)
+        body_outline = (78, 84, 92)
+        armor_color = (224, 229, 234)
+        team_light_color = (232, 72, 72) if entity.team == 'red' else (72, 148, 255)
+        if style == 'sentry':
+            body_local = [
+                (-radius, radius * 0.45),
+                (-radius * 0.55, -radius + 2),
+                (radius * 0.55, -radius + 2),
+                (radius, radius * 0.45),
+                (0.0, radius),
+            ]
+        else:
+            top = -radius + 2
+            bottom = radius * 0.6
+            body_local = [
+                (-radius, top),
+                (radius, top),
+                (radius, bottom),
+                (-radius, bottom),
+            ]
+
+        body = self._rotate_local_polygon(body_local, x, y, body_angle)
+        pygame.draw.polygon(self.screen, body_color, body)
+        pygame.draw.polygon(self.screen, body_outline, body, 1)
+
+        plate_long = max(6.0, radius * 0.54)
+        plate_short = max(3.0, radius * 0.16)
+        plate_offset = radius * 1.03
+        heading_x = math.cos(body_angle)
+        heading_y = math.sin(body_angle)
+        side_x = -heading_y
+        side_y = heading_x
+        plate_centers = [
+            (x + heading_x * plate_offset, y + heading_y * plate_offset),
+            (x - heading_x * plate_offset, y - heading_y * plate_offset),
+            (x + side_x * plate_offset, y + side_y * plate_offset),
+            (x - side_x * plate_offset, y - side_y * plate_offset),
+        ]
+        plate_angles = [body_angle + math.pi / 2.0, body_angle + math.pi / 2.0, body_angle, body_angle]
+        for center, plate_angle in zip(plate_centers, plate_angles):
+            plate_local = [
+                (-plate_long * 0.5, -plate_short * 0.5),
+                (plate_long * 0.5, -plate_short * 0.5),
+                (plate_long * 0.5, plate_short * 0.5),
+                (-plate_long * 0.5, plate_short * 0.5),
+            ]
+            plate_poly = self._rotate_local_polygon(plate_local, center[0], center[1], plate_angle)
+            pygame.draw.polygon(self.screen, armor_color, plate_poly)
+            pygame.draw.polygon(self.screen, body_outline, plate_poly, 1)
+
+            light_half = max(2.0, plate_long * 0.12)
+            light_thickness = max(2.0, plate_short * 0.7)
+            for light_center_x in (-plate_long * 0.36, plate_long * 0.36):
+                light_local = [
+                    (light_center_x - light_half, -light_thickness * 0.5),
+                    (light_center_x + light_half, -light_thickness * 0.5),
+                    (light_center_x + light_half, light_thickness * 0.5),
+                    (light_center_x - light_half, light_thickness * 0.5),
+                ]
+                light_poly = self._rotate_local_polygon(light_local, center[0], center[1], plate_angle)
+                pygame.draw.polygon(self.screen, team_light_color, light_poly)
+
+    def _rotate_local_polygon(self, local_points, center_x, center_y, angle_rad):
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        points = []
+        for local_x, local_y in local_points:
+            world_x = center_x + local_x * cos_a - local_y * sin_a
+            world_y = center_y + local_x * sin_a + local_y * cos_a
+            points.append((int(world_x), int(world_y)))
+        return points
 
     def _render_wheels(self, entity, x, y, radius):
         wheel_count = int(getattr(entity, 'wheel_count', 4))

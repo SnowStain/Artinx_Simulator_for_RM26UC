@@ -2,7 +2,13 @@
   "simulator": {
     "show_facilities": false,
     "show_aim_fov": false,
-    "enable_entity_movement": true
+    "enable_entity_movement": true,
+    "show_perf_overlay": true,
+    "enable_perf_logging": true,
+    "enable_perf_breakdown": true,
+    "enable_perf_file_logging": true,
+    "perf_sample_window": 20000,
+    "perf_log_interval_sec": 5.0
   },
   "map": {
     "preset": "blank_map"
@@ -24,8 +30,7 @@
         },
         "robot_4": {
           "x": 97,
-          "y": 489,
-          "height": 1.0
+          "y": 489
         },
         "robot_7": {
           "x": 239,
@@ -35,30 +40,29 @@
       },
       "blue": {
         "robot_1": {
-          "x": 1426,
-          "y": 522,
+          "x": 1362,
+          "y": 386,
           "angle": 180.0
         },
         "robot_2": {
-          "x": 1474,
-          "y": 493,
+          "x": 1413,
+          "y": 509,
           "angle": 180.0
         },
         "robot_3": {
-          "x": 1369,
-          "y": 384,
+          "x": 1423,
+          "y": 357,
           "angle": 180.0
         },
         "robot_4": {
-          "x": 1448,
-          "y": 373,
+          "x": 1478,
+          "y": 381,
           "angle": 180.0
         },
         "robot_7": {
           "x": 1342,
           "y": 463,
-          "angle": 212.83363780452223,
-          "height": 0.2
+          "angle": 212.83363780452223
         }
       }
     },
@@ -192,8 +196,13 @@
       "armor_center_height_m": 0.15,
       "turret_axis_height_m": 0.45,
       "camera_height_m": 0.5,
+      "max_pitch_up_deg": 35.0,
+      "max_pitch_down_deg": 25.0,
       "los_sample_step_m": 0.25,
       "los_clearance_m": 0.02,
+      "los_pitch_margin_deg": 0.8,
+      "los_pitch_probe_distance_m": 0.45,
+      "los_terrain_pitch_margin_deg": 1.2,
       "auto_aim_max_distance_m": 8.0,
       "auto_aim_fov_deg": 50.0,
       "auto_aim_track_speed_deg_per_sec": 180.0,

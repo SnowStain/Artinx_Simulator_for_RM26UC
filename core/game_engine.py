@@ -5,14 +5,19 @@ import math
 import pygame
 import time
 import threading
+
 import json
 import os
+import statistics
+from collections import deque
+from datetime import datetime
 from map.map_manager import MapManager
 from entities.entity_manager import EntityManager
 from physics.physics_engine import PhysicsEngine
 from rules.rules_engine import RulesEngine
 from control.controller import Controller
 from state_machine.sentry_state_machine import SentryStateMachine
+
 
 class GameEngine:
     def __init__(self, config, config_manager=None, config_path='config.json'):
@@ -24,17 +29,33 @@ class GameEngine:
         self.fps = config.get('simulator', {}).get('fps', 50)
         self.dt = 1.0 / self.fps
         self.config['rules'] = RulesEngine.build_rule_config(self.config.get('rules', {}))
-        
+
         # 初始化各系统
         self._create_systems()
-        
+
         # 初始化状态机
         self.sentry_state_machine = SentryStateMachine()
-        
+
         # 日志系统
         self.logs = []
         self.max_logs = 10
-        
+        self._auto_aim_update_interval = float(self.config.get('ai', {}).get('auto_aim_update_interval_sec', 0.08))
+        self._last_auto_aim_update = {}
+        self._frame_index = 0
+        perf_window = int(max(30, self.config.get('simulator', {}).get('perf_sample_window', 20000)))
+        self._perf_samples = deque(maxlen=perf_window)
+        self.show_perf_overlay = bool(self.config.get('simulator', {}).get('show_perf_overlay', True))
+        self.enable_perf_logging = bool(self.config.get('simulator', {}).get('enable_perf_logging', True))
+        self.enable_perf_breakdown = bool(self.config.get('simulator', {}).get('enable_perf_breakdown', True))
+        self.enable_perf_file_logging = bool(self.config.get('simulator', {}).get('enable_perf_file_logging', True))
+        self.perf_log_path = self.config.get('simulator', {}).get('perf_log_path', os.path.join('perf_logs', 'perf_stats.csv'))
+        self._perf_log_interval = float(self.config.get('simulator', {}).get('perf_log_interval_sec', 5.0))
+        self._perf_last_log = time.perf_counter()
+        self._perf_overlay_cache = {'ts': 0.0, 'stats': None}
+        self._last_update_breakdown = None
+        self._last_event_ms = 0.0
+        self._perf_log_session_id = None
+
         # 游戏状态
         self.game_time = 0
         self.game_duration = self.config.get('rules', {}).get('game_duration', 420)
@@ -44,6 +65,9 @@ class GameEngine:
         self._game_over_announced = False
 
     def _create_systems(self):
+        old_controller = getattr(self, 'controller', None)
+        if old_controller is not None and hasattr(old_controller, 'shutdown'):
+            old_controller.shutdown()
         self.map_manager = MapManager(self.config)
         self.entity_manager = EntityManager(self.config)
         self.physics_engine = PhysicsEngine(self.config)
@@ -59,6 +83,13 @@ class GameEngine:
         self.match_started = False
         self.logs = []
         self._game_over_announced = False
+        self._frame_index = 0
+        perf_window = int(max(30, self.config.get('simulator', {}).get('perf_sample_window', 20000)))
+        self._perf_samples = deque(maxlen=perf_window)
+        self._perf_overlay_cache = {'ts': 0.0, 'stats': None}
+        self._last_update_breakdown = None
+        self._last_event_ms = 0.0
+        self._perf_log_session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
     
     def initialize(self):
         """初始化游戏引擎"""
@@ -67,6 +98,7 @@ class GameEngine:
         
         # 创建实体
         self.entity_manager.create_entities()
+        self._stabilize_entity_positions()
         
         # 添加初始日志
         self.add_log('对局未开始，点击开始/重开进入 7 分钟对局。', 'system')
@@ -76,6 +108,7 @@ class GameEngine:
         self.config['rules'] = RulesEngine.build_rule_config(self.config.get('rules', {}))
         self._create_systems()
         self._reset_runtime_state()
+        self._perf_log_session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.initialize()
         self.game_duration = self.config.get('rules', {}).get('game_duration', 420)
         self.match_started = True
@@ -88,6 +121,7 @@ class GameEngine:
         self.rules_engine.stage = 'ended'
         self.paused = True
         self.match_started = False
+        self._flush_perf_samples_to_file('match_end')
         if not self._game_over_announced:
             self.add_log('对局已结束，可点击开始/重开重新开始。', 'system')
             self._game_over_announced = True
@@ -109,19 +143,173 @@ class GameEngine:
         # 限制日志数量
         if len(self.logs) > self.max_logs:
             self.logs.pop(0)
+
+    def _record_perf_sample(self, update_ms, render_ms, frame_ms, breakdown=None, game_time=0.0):
+        sample = {
+            'update_ms': float(update_ms),
+            'render_ms': float(render_ms),
+            'frame_ms': float(frame_ms),
+            'game_time': float(game_time),
+            'frame_index': int(self._frame_index),
+            'event_ms': float(self._last_event_ms),
+        }
+        if breakdown:
+            sample['breakdown'] = {k: float(v) for k, v in breakdown.items()}
+        self._perf_samples.append(sample)
+
+    def _compute_percentile(self, values, percentile):
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        rank = max(0, min(len(ordered) - 1, int(len(ordered) * percentile)))
+        return ordered[rank]
+
+    def _compute_perf_stats(self):
+        if not self._perf_samples:
+            return None
+        update_values = [s['update_ms'] for s in self._perf_samples]
+        render_values = [s['render_ms'] for s in self._perf_samples]
+        frame_values = [s['frame_ms'] for s in self._perf_samples]
+        event_values = [s.get('event_ms', 0.0) for s in self._perf_samples]
+        breakdown_samples = [s['breakdown'] for s in self._perf_samples if 'breakdown' in s]
+        breakdown_stats = None
+        if breakdown_samples:
+            keys = breakdown_samples[0].keys()
+            breakdown_stats = {k: statistics.mean([sample.get(k, 0.0) for sample in breakdown_samples]) for k in keys}
+        return {
+            'update_avg_ms': statistics.mean(update_values),
+            'render_avg_ms': statistics.mean(render_values),
+            'frame_avg_ms': statistics.mean(frame_values),
+            'event_avg_ms': statistics.mean(event_values),
+            'update_p95_ms': self._compute_percentile(update_values, 0.95),
+            'render_p95_ms': self._compute_percentile(render_values, 0.95),
+            'frame_p95_ms': self._compute_percentile(frame_values, 0.95),
+            'event_p95_ms': self._compute_percentile(event_values, 0.95),
+            'breakdown': breakdown_stats,
+        }
+
+    def _maybe_log_perf(self):
+        if not self.enable_perf_logging:
+            return
+        if self._perf_log_interval <= 0:
+            return
+        now = time.perf_counter()
+        if (now - self._perf_last_log) < self._perf_log_interval:
+            return
+        stats = self._compute_perf_stats()
+        if stats is None:
+            return
+        self.add_log(
+            f"性能: 帧 {stats['frame_avg_ms']:.1f}ms(p95 {stats['frame_p95_ms']:.1f}) | 事件 {stats['event_avg_ms']:.1f}ms | 更新 {stats['update_avg_ms']:.1f}ms | 渲染 {stats['render_avg_ms']:.1f}ms",
+            'system',
+        )
+        self._log_perf_to_file(stats)
+        self._perf_last_log = now
+
+    def _log_perf_to_file(self, stats):
+        if not self.enable_perf_file_logging:
+            return
+        if not stats:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.perf_log_path), exist_ok=True)
+            header = (
+                'timestamp,frame_index,fps,'
+                'event_avg_ms,event_p95_ms,'
+                'frame_avg_ms,frame_p95_ms,'
+                'update_avg_ms,update_p95_ms,'
+                'render_avg_ms,render_p95_ms,'
+                'entity_ms,controller_ms,physics_ms,auto_aim_ms,rules_ms,sentry_ms\n'
+            )
+            breakdown = stats.get('breakdown') or {}
+            line = (
+                f"{time.time():.3f},{self._frame_index},{self.fps},"
+                f"{stats['event_avg_ms']:.3f},{stats['event_p95_ms']:.3f},"
+                f"{stats['frame_avg_ms']:.3f},{stats['frame_p95_ms']:.3f},"
+                f"{stats['update_avg_ms']:.3f},{stats['update_p95_ms']:.3f},"
+                f"{stats['render_avg_ms']:.3f},{stats['render_p95_ms']:.3f},"
+                f"{breakdown.get('entity_ms', 0.0):.3f},{breakdown.get('controller_ms', 0.0):.3f},"
+                f"{breakdown.get('physics_ms', 0.0):.3f},{breakdown.get('auto_aim_ms', 0.0):.3f},"
+                f"{breakdown.get('rules_ms', 0.0):.3f},{breakdown.get('sentry_ms', 0.0):.3f}\n"
+            )
+            file_exists = os.path.exists(self.perf_log_path)
+            with open(self.perf_log_path, 'a', encoding='utf-8') as f:
+                if not file_exists:
+                    f.write(header)
+                f.write(line)
+        except Exception:
+            # 失败时静默，避免卡顿
+            return
+
+    def _flush_perf_samples_to_file(self, reason='match_end'):
+        if not self.enable_perf_file_logging:
+            return
+        if not self._perf_samples:
+            return
+        try:
+            folder = os.path.join('saves', 'perf_logs')
+            os.makedirs(folder, exist_ok=True)
+            session_id = self._perf_log_session_id or datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f'perf_{session_id}_{reason}.csv'
+            path = os.path.join(folder, filename)
+            header = (
+                'frame_index,game_time,event_ms,update_ms,render_ms,frame_ms,'
+                'entity_ms,controller_ms,physics_ms,auto_aim_ms,rules_ms,sentry_ms\n'
+            )
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(header)
+                for sample in list(self._perf_samples):
+                    breakdown = sample.get('breakdown') or {}
+                    f.write(
+                        f"{int(sample.get('frame_index', 0))},"
+                        f"{sample.get('game_time', 0.0):.3f},"
+                        f"{sample.get('event_ms', 0.0):.3f},"
+                        f"{sample.get('update_ms', 0.0):.3f},"
+                        f"{sample.get('render_ms', 0.0):.3f},"
+                        f"{sample.get('frame_ms', 0.0):.3f},"
+                        f"{breakdown.get('entity_ms', 0.0):.3f},"
+                        f"{breakdown.get('controller_ms', 0.0):.3f},"
+                        f"{breakdown.get('physics_ms', 0.0):.3f},"
+                        f"{breakdown.get('auto_aim_ms', 0.0):.3f},"
+                        f"{breakdown.get('rules_ms', 0.0):.3f},"
+                        f"{breakdown.get('sentry_ms', 0.0):.3f}\n"
+                    )
+            self.add_log(f'性能日志已保存: {path}', 'system')
+        except Exception:
+            return
+
+    def _should_measure_perf(self):
+        return True
+
+    def get_perf_overlay_stats(self):
+        if not self._perf_samples:
+            return None
+        now = time.perf_counter()
+        if (now - self._perf_overlay_cache['ts']) < 0.25 and self._perf_overlay_cache['stats'] is not None:
+            return self._perf_overlay_cache['stats']
+        stats = self._compute_perf_stats()
+        self._perf_overlay_cache = {'ts': now, 'stats': stats}
+        return stats
     
     def update(self):
         """更新游戏状态"""
         if self.paused or not self.match_started:
             return
 
+        measure_perf = self._should_measure_perf()
+
         # 更新时间
         self.game_time += self.dt
+        self._frame_index += 1
+        self.rules_engine.start_frame(self._frame_index)
         
         # 更新实体状态
+        entity_start = time.perf_counter() if measure_perf else 0.0
         self.entity_manager.update(self.dt)
+        entity_end = time.perf_counter() if measure_perf else 0.0
         
         # 控制处理
+        controller_start = time.perf_counter() if measure_perf else 0.0
         self.controller.update(
             self.entity_manager.entities,
             self.map_manager,
@@ -129,14 +317,20 @@ class GameEngine:
             self.game_time,
             self.game_duration,
         )
+        controller_end = time.perf_counter() if measure_perf else 0.0
 
         # 物理模拟
+        physics_start = time.perf_counter() if measure_perf else 0.0
         self.physics_engine.update(self.entity_manager.entities, self.map_manager, self.rules_engine, dt=self.dt)
+        physics_end = time.perf_counter() if measure_perf else 0.0
 
         # 通用自瞄：除工程外的战斗单位自动锁定最近敌人
+        auto_aim_start = time.perf_counter() if measure_perf else 0.0
         self._update_general_auto_aim()
+        auto_aim_end = time.perf_counter() if measure_perf else 0.0
 
         # 规则检查
+        rules_start = time.perf_counter() if measure_perf else 0.0
         self.rules_engine.update(
             self.entity_manager.entities,
             map_manager=self.map_manager,
@@ -144,11 +338,23 @@ class GameEngine:
             game_time=self.game_time,
             game_duration=self.game_duration,
         )
+        rules_end = time.perf_counter() if measure_perf else 0.0
         
         # 更新哨兵状态机
+        sentry_start = time.perf_counter() if measure_perf else 0.0
         for entity in self.entity_manager.entities:
             if entity.type == 'sentry':
                 self.sentry_state_machine.update(entity)
+        sentry_end = time.perf_counter() if measure_perf else 0.0
+
+        self._last_update_breakdown = {
+            'entity_ms': (entity_end - entity_start) * 1000.0,
+            'controller_ms': (controller_end - controller_start) * 1000.0,
+            'physics_ms': (physics_end - physics_start) * 1000.0,
+            'auto_aim_ms': (auto_aim_end - auto_aim_start) * 1000.0,
+            'rules_ms': (rules_end - rules_start) * 1000.0,
+            'sentry_ms': (sentry_end - sentry_start) * 1000.0,
+        }
 
     def entity_has_barrel(self, entity):
         if entity.type == 'sentry':
@@ -193,8 +399,14 @@ class GameEngine:
                 entity.ai_decision = '工程仅保留机械臂，不参与自动射击'
                 continue
             entity.auto_aim_track_speed_deg_per_sec = track_speed
-
-            target = self._select_auto_aim_target(entity, max_distance)
+            last_update = float(self._last_auto_aim_update.get(entity.id, -1e9))
+            cached_target = self._resolve_cached_target_entity(entity)
+            should_refresh_target = (self.game_time - last_update) >= self._auto_aim_update_interval
+            if should_refresh_target:
+                target = self._select_auto_aim_target(entity, max_distance)
+                self._last_auto_aim_update[entity.id] = self.game_time
+            else:
+                target = cached_target
             base_decision = getattr(entity, 'ai_decision', '')
             if target is None:
                 entity.target = None
@@ -230,6 +442,53 @@ class GameEngine:
                 lock_text = f'跟踪 {target.id}，角差 {assessment.get("angle_diff", 0.0):.1f}°'
             entity.ai_decision = f'{base_decision} | {lock_text}' if base_decision else lock_text
 
+    def _resolve_cached_target_entity(self, shooter):
+        target_state = getattr(shooter, 'target', None)
+        if not isinstance(target_state, dict):
+            return None
+        target_id = target_state.get('id')
+        if not target_id:
+            return None
+        target = self.entity_manager.get_entity(target_id)
+        if target is None or not target.is_alive() or target.team == shooter.team:
+            return None
+        distance = self._distance(shooter, target)
+        if distance > getattr(self.rules_engine, 'auto_aim_max_distance', 0.0):
+            return None
+        if not self.rules_engine.can_track_target(shooter, target, distance):
+            return None
+        return target
+
+    def _stabilize_entity_positions(self):
+        if self.map_manager is None:
+            return
+        for entity in self.entity_manager.entities:
+            if not getattr(entity, 'collidable', False):
+                continue
+            collision_radius = float(getattr(entity, 'collision_radius', 0.0))
+            if self.map_manager.is_position_valid_for_radius(entity.position['x'], entity.position['y'], collision_radius=collision_radius):
+                entity.position['z'] = self.map_manager.get_terrain_height_m(entity.position['x'], entity.position['y'])
+                entity.previous_position = dict(entity.position)
+                entity.last_valid_position = dict(entity.position)
+                entity.spawn_position = dict(entity.position)
+                entity.respawn_position = dict(entity.position)
+                continue
+            fallback = self.map_manager.find_nearest_passable_point(
+                (entity.position['x'], entity.position['y']),
+                collision_radius=collision_radius,
+                search_radius=max(96, int(collision_radius * 8.0)),
+                step=max(4, self.map_manager.terrain_grid_cell_size),
+            )
+            if fallback is None:
+                continue
+            entity.position['x'] = float(fallback[0])
+            entity.position['y'] = float(fallback[1])
+            entity.position['z'] = self.map_manager.get_terrain_height_m(fallback[0], fallback[1])
+            entity.previous_position = dict(entity.position)
+            entity.last_valid_position = dict(entity.position)
+            entity.spawn_position = dict(entity.position)
+            entity.respawn_position = dict(entity.position)
+
     def _select_auto_aim_target(self, shooter, max_distance):
         nearest = None
         nearest_distance = None
@@ -257,7 +516,9 @@ class GameEngine:
         clock = pygame.time.Clock()
         
         while self.running:
+            frame_start = time.perf_counter()
             # 处理事件
+            event_start = time.perf_counter()
             for event in pygame.event.get():
                 if hasattr(renderer, 'handle_event'):
                     if renderer.handle_event(event, self):
@@ -267,9 +528,14 @@ class GameEngine:
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         self.running = False
+            event_end = time.perf_counter()
+            self._last_event_ms = (event_end - event_start) * 1000.0
             
             # 更新游戏状态
+            update_start = time.perf_counter()
             self.update()
+            breakdown = self._last_update_breakdown if self._should_measure_perf() else None
+            update_end = time.perf_counter()
             
             # 检查游戏是否结束
             if self.rules_engine.game_over and not self._game_over_announced:
@@ -282,11 +548,18 @@ class GameEngine:
             
             # 渲染画面
             renderer.render(self)
+            frame_end = time.perf_counter()
+            update_ms = (update_end - update_start) * 1000.0
+            render_ms = (frame_end - update_end) * 1000.0
+            frame_ms = (frame_end - frame_start) * 1000.0
+            self._record_perf_sample(update_ms, render_ms, frame_ms, breakdown=breakdown, game_time=self.game_time)
+            self._maybe_log_perf()
             
             # 控制帧率
             clock.tick(self.fps)
         
         # 清理资源
+        self._flush_perf_samples_to_file('quit')
         pygame.quit()
 
     def save_match(self, save_path='saves/latest_match.json'):

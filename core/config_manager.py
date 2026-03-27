@@ -133,6 +133,12 @@ class ConfigManager:
                 'show_facilities': config.get('simulator', {}).get('show_facilities', True),
                 'show_aim_fov': config.get('simulator', {}).get('show_aim_fov', True),
                 'enable_entity_movement': config.get('simulator', {}).get('enable_entity_movement', False),
+                'show_perf_overlay': config.get('simulator', {}).get('show_perf_overlay', True),
+                'enable_perf_logging': config.get('simulator', {}).get('enable_perf_logging', True),
+                'enable_perf_breakdown': config.get('simulator', {}).get('enable_perf_breakdown', True),
+                'enable_perf_file_logging': config.get('simulator', {}).get('enable_perf_file_logging', True),
+                'perf_sample_window': config.get('simulator', {}).get('perf_sample_window', 20000),
+                'perf_log_interval_sec': config.get('simulator', {}).get('perf_log_interval_sec', 5.0),
             },
             'map': map_payload,
             'entities': {

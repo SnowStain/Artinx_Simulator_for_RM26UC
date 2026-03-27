@@ -5,6 +5,7 @@ from pygame_compat import pygame
 import math
 import numpy as np
 import os
+import time
 from heapq import heappop, heappush
 
 class MapManager:
@@ -77,12 +78,17 @@ class MapManager:
             'base',
         ]
         self.priority_rank = {terrain_type: index for index, terrain_type in enumerate(self.terrain_priority)}
+        self._region_query_default_rank = len(self.terrain_priority) + 32
+        self._regions_query_cache = {}
+        self._regions_query_cache_version = -1
         self._load_facilities_from_config()
         self._load_terrain_grid_from_config()
 
     def _mark_raster_dirty(self):
         self.raster_dirty = True
         self.raster_version += 1
+        self._regions_query_cache.clear()
+        self._regions_query_cache_version = self.raster_version
 
     def _terrain_cell_key(self, grid_x, grid_y):
         return f'{int(grid_x)},{int(grid_y)}'
@@ -987,9 +993,17 @@ class MapManager:
         return None
 
     def get_regions_at(self, x, y, region_types=None):
+        if self._regions_query_cache_version != self.raster_version:
+            self._regions_query_cache.clear()
+            self._regions_query_cache_version = self.raster_version
+
         requested_types = set(region_types) if region_types else None
-        type_rank = {facility_type: index for index, facility_type in enumerate(self.terrain_priority)}
-        default_rank = len(self.terrain_priority) + 32
+        requested_types_key = tuple(sorted(requested_types)) if requested_types else None
+        cache_key = (round(float(x), 2), round(float(y), 2), requested_types_key)
+        cached_hits = self._regions_query_cache.get(cache_key)
+        if cached_hits is not None:
+            return cached_hits
+
         hits = []
         for region in self.facilities:
             facility_type = region.get('type')
@@ -997,8 +1011,10 @@ class MapManager:
                 continue
             if self._region_contains_point(x, y, region):
                 hits.append(region)
-        hits.sort(key=lambda region: (type_rank.get(region.get('type'), default_rank), str(region.get('id', ''))))
-        return hits
+        hits.sort(key=lambda region: (self.priority_rank.get(region.get('type'), self._region_query_default_rank), str(region.get('id', ''))))
+        result = tuple(hits)
+        self._regions_query_cache[cache_key] = result
+        return result
 
     def get_facility_regions(self, facility_type=None):
         """获取设施区域列表，可按类型过滤。"""
@@ -1143,7 +1159,7 @@ class MapManager:
     def get_terrain_height_m(self, x, y):
         return self.sample_raster_layers(x, y)['height_m']
 
-    def find_path(self, start_point, end_point, max_height_delta_m=0.05, grid_step=None, traversal_profile=None):
+    def find_path(self, start_point, end_point, max_height_delta_m=0.05, grid_step=None, traversal_profile=None, max_iterations=None, max_runtime_sec=None):
         self._ensure_raster_layers()
         if start_point is None or end_point is None:
             return []
@@ -1167,54 +1183,91 @@ class MapManager:
                 return []
             goal_world = self._nav_cell_center(goal, step)
 
-        open_heap = []
-        heappush(open_heap, (0.0, start))
-        came_from = {}
-        g_score = {start: 0.0}
+        if start == goal:
+            return [start_point, end_point]
+
+        frontier_heap = []
+        heappush(frontier_heap, (self._nav_heuristic(start, goal, step), start))
+        parents = {}
+        seen = {start}
         closed = set()
         iteration_count = 0
-        max_iterations = 2500
+        iteration_limit = int(max_iterations) if max_iterations is not None else 2500
+        if iteration_limit <= 0:
+            iteration_limit = 1
+        deadline = None
+        if max_runtime_sec is not None:
+            runtime = float(max_runtime_sec)
+            if runtime > 0:
+                deadline = time.perf_counter() + runtime
 
-        while open_heap:
+        while frontier_heap:
             iteration_count += 1
-            if iteration_count > max_iterations:
+            if iteration_count > iteration_limit:
                 break
-            _, current = heappop(open_heap)
-            if current in closed:
-                continue
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
+            current = self._expand_greedy_frontier(
+                frontier_heap=frontier_heap,
+                parents=parents,
+                seen=seen,
+                closed=closed,
+                target_cell=goal,
+                step=step,
+                max_height_delta_m=max_height_delta_m,
+                traversal_profile=traversal_profile,
+            )
             if current == goal:
-                return self._reconstruct_nav_path(came_from, current, step, start_world, goal_world)
-            closed.add(current)
-
-            current_world = self._nav_cell_center(current, step)
-            current_height = self.get_terrain_height_m(current_world[0], current_world[1])
-            for neighbor in self._iter_nav_neighbors(current):
-                if neighbor in closed:
-                    continue
-                if not self._is_nav_cell_passable(neighbor, step, traversal_profile=traversal_profile):
-                    continue
-                if not self._is_nav_transition_passable(current, neighbor, step, traversal_profile=traversal_profile):
-                    continue
-                neighbor_world = self._nav_cell_center(neighbor, step)
-                neighbor_height = self.get_terrain_height_m(neighbor_world[0], neighbor_world[1])
-                transition = None
-                if abs(float(neighbor_height) - float(current_height)) > float(max_height_delta_m) + 1e-6:
-                    transition = self.get_step_transition(current_world[0], current_world[1], neighbor_world[0], neighbor_world[1])
-                    if transition is None or not traversal_profile.get('can_climb_steps', False):
-                        continue
-
-                step_cost = math.hypot(neighbor_world[0] - current_world[0], neighbor_world[1] - current_world[1])
-                if transition is not None:
-                    step_cost += float(traversal_profile.get('step_climb_duration_sec', 2.0)) * step * 3.0
-                tentative_g = g_score[current] + step_cost
-                if tentative_g >= g_score.get(neighbor, float('inf')):
-                    continue
-                came_from[neighbor] = current
-                g_score[neighbor] = tentative_g
-                heuristic = math.hypot(goal_world[0] - neighbor_world[0], goal_world[1] - neighbor_world[1])
-                heappush(open_heap, (tentative_g + heuristic, neighbor))
+                return self._reconstruct_nav_path(
+                    parents,
+                    current,
+                    step,
+                    start_world,
+                    goal_world,
+                )
 
         return []
+
+    def _nav_heuristic(self, cell, target_cell, step):
+        cell_world = self._nav_cell_center(cell, step)
+        target_world = self._nav_cell_center(target_cell, step)
+        return math.hypot(target_world[0] - cell_world[0], target_world[1] - cell_world[1])
+
+    def _expand_greedy_frontier(self, frontier_heap, parents, seen, closed, target_cell, step, max_height_delta_m, traversal_profile=None):
+        traversal_profile = traversal_profile or {}
+        current = None
+        while frontier_heap:
+            _, candidate = heappop(frontier_heap)
+            if candidate in closed:
+                continue
+            current = candidate
+            break
+        if current is None:
+            return None
+
+        closed.add(current)
+        if current == target_cell:
+            return current
+
+        current_world = self._nav_cell_center(current, step)
+        current_height = self.get_terrain_height_m(current_world[0], current_world[1])
+        for neighbor in self._iter_nav_neighbors(current):
+            if neighbor in closed or neighbor in seen:
+                continue
+            if not self._is_nav_cell_passable(neighbor, step, traversal_profile=traversal_profile):
+                continue
+            if not self._is_nav_transition_passable(current, neighbor, step, traversal_profile=traversal_profile):
+                continue
+            neighbor_world = self._nav_cell_center(neighbor, step)
+            neighbor_height = self.get_terrain_height_m(neighbor_world[0], neighbor_world[1])
+            if abs(float(neighbor_height) - float(current_height)) > float(max_height_delta_m) + 1e-6:
+                transition = self.get_step_transition(current_world[0], current_world[1], neighbor_world[0], neighbor_world[1])
+                if transition is None or not traversal_profile.get('can_climb_steps', False):
+                    continue
+            parents[neighbor] = current
+            seen.add(neighbor)
+            heappush(frontier_heap, (self._nav_heuristic(neighbor, target_cell, step), neighbor))
+        return None
 
     def _point_to_nav_cell(self, point, step):
         x = max(0, min(self.map_width - 1, int(point[0])))
@@ -1239,20 +1292,16 @@ class MapManager:
         probes = [(center[0], center[1])]
         if clearance_radius <= 1.0:
             return probes
-        offsets = [
-            (clearance_radius, 0.0),
-            (-clearance_radius, 0.0),
-            (0.0, clearance_radius),
-            (0.0, -clearance_radius),
-            (clearance_radius * 0.7, clearance_radius * 0.7),
-            (-clearance_radius * 0.7, clearance_radius * 0.7),
-            (clearance_radius * 0.7, -clearance_radius * 0.7),
-            (-clearance_radius * 0.7, -clearance_radius * 0.7),
-        ]
-        for offset_x, offset_y in offsets:
-            probe_x = min(max(0, int(round(center[0] + offset_x))), self.map_width - 1)
-            probe_y = min(max(0, int(round(center[1] + offset_y))), self.map_height - 1)
-            probes.append((probe_x, probe_y))
+        ring_scales = (1.0, 0.66, 0.33)
+        for scale in ring_scales:
+            radius = clearance_radius * scale
+            if radius <= 1.0:
+                continue
+            for angle_deg in range(0, 360, 45):
+                angle_rad = math.radians(angle_deg)
+                probe_x = min(max(0, int(round(center[0] + math.cos(angle_rad) * radius))), self.map_width - 1)
+                probe_y = min(max(0, int(round(center[1] + math.sin(angle_rad) * radius))), self.map_height - 1)
+                probes.append((probe_x, probe_y))
         return probes
 
     def _is_nav_cell_passable(self, cell, step, traversal_profile=None):
@@ -1263,7 +1312,7 @@ class MapManager:
         center = self._nav_cell_center(cell, step)
         traversal_profile = traversal_profile or {}
         collision_radius = max(0.0, float(traversal_profile.get('collision_radius', 0.0)))
-        clearance_radius = max(0.0, collision_radius - float(step) * 0.25)
+        clearance_radius = collision_radius
         for probe_x, probe_y in self._nav_cell_probe_points(center, clearance_radius):
             sample = self.sample_raster_layers(probe_x, probe_y)
             if sample['move_blocked']:
@@ -1562,7 +1611,7 @@ class MapManager:
         self._ensure_raster_layers()
         if not (0 <= int(x) < self.map_width and 0 <= int(y) < self.map_height):
             return False
-        clearance_radius = max(0.0, float(collision_radius) - float(self.terrain_grid_cell_size) * 0.25)
+        clearance_radius = max(0.0, float(collision_radius))
         for probe_x, probe_y in self._nav_cell_probe_points((int(x), int(y)), clearance_radius):
             sample = self.sample_raster_layers(probe_x, probe_y)
             if sample['move_blocked']:
@@ -1572,14 +1621,28 @@ class MapManager:
     def is_segment_valid_for_radius(self, from_x, from_y, to_x, to_y, collision_radius=0.0, sample_stride=None):
         self._ensure_raster_layers()
         distance = math.hypot(float(to_x) - float(from_x), float(to_y) - float(from_y))
-        stride = max(1.0, float(sample_stride or self.terrain_grid_cell_size * 0.45))
+        stride = max(1.0, float(sample_stride or self.terrain_grid_cell_size * 0.35))
         sample_count = max(1, int(math.ceil(distance / stride)))
+        radius = max(0.0, float(collision_radius))
+        normal_x = 0.0
+        normal_y = 0.0
+        if distance > 1e-6:
+            normal_x = -(float(to_y) - float(from_y)) / distance
+            normal_y = (float(to_x) - float(from_x)) / distance
         for sample_index in range(sample_count + 1):
             ratio = sample_index / sample_count
             sample_x = float(from_x) + (float(to_x) - float(from_x)) * ratio
             sample_y = float(from_y) + (float(to_y) - float(from_y)) * ratio
-            if not self.is_position_valid_for_radius(sample_x, sample_y, collision_radius=collision_radius):
+            if not self.is_position_valid_for_radius(sample_x, sample_y, collision_radius=radius):
                 return False
+            if radius > 1.0 and distance > 1e-6:
+                edge_points = (
+                    (sample_x + normal_x * radius, sample_y + normal_y * radius),
+                    (sample_x - normal_x * radius, sample_y - normal_y * radius),
+                )
+                for edge_x, edge_y in edge_points:
+                    if not self.is_position_valid_for_radius(edge_x, edge_y, collision_radius=0.0):
+                        return False
         return True
 
     def find_nearest_passable_point(self, point, collision_radius=0.0, search_radius=96, step=6):
