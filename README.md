@@ -1,0 +1,2 @@
+# Artinx_Simulator_for_RM26UC
+创建人Snowstain  仓库始于2026年3月27日，为了模拟RMUC真实对战环境，测试队内哨兵决策/队内战术合理性；使用pygame为基础vibecoding开发；项目实际效益待未来发掘，说不定功在千秋（doge）
