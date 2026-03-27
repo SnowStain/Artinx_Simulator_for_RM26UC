@@ -176,6 +176,11 @@ class GameEngine:
                 continue
             if entity.type not in {'robot', 'sentry'}:
                 continue
+            if getattr(entity, 'respawn_weak_active', False):
+                entity.target = None
+                entity.auto_aim_locked = False
+                entity.fire_control_state = 'idle'
+                continue
             if entity.type == 'sentry' and getattr(entity, 'front_gun_locked', False):
                 entity.target = None
                 entity.auto_aim_locked = False
@@ -399,6 +404,7 @@ class GameEngine:
                     'entity_id': entity.id,
                     'label': label_map.get(key, key),
                     'robot_type': entity.robot_type or '',
+                    'bt_node': str(getattr(entity, 'ai_behavior_node', '') or ''),
                     'hp': int(entity.health),
                     'max_hp': int(entity.max_health),
                     'level': int(getattr(entity, 'level', 1)),
@@ -451,6 +457,14 @@ class GameEngine:
         power_rule = power_system.get(rule_type_key, {})
         heat_rule = heat_system.get(rule_type_key, {})
         rule_snapshot = self.rules_engine.get_entity_rule_snapshot(entity)
+        max_speed_world = float(self.physics_engine._max_speed_world_units()) if hasattr(self.physics_engine, '_max_speed_world_units') else 1.0
+        current_speed = math.hypot(float(entity.velocity.get('vx', 0.0)), float(entity.velocity.get('vy', 0.0)))
+        if self.map_manager is not None and hasattr(self.map_manager, 'pixels_per_meter_x'):
+            pixels_per_meter = (float(self.map_manager.pixels_per_meter_x()) + float(self.map_manager.pixels_per_meter_y())) / 2.0
+        else:
+            pixels_per_meter = 1.0
+        current_speed_mps = current_speed / max(pixels_per_meter, 1e-6)
+        movement_power_ratio = 0.0 if max_speed_world <= 1e-6 else max(0.0, min(1.0, current_speed / max_speed_world))
         target = None
         if isinstance(getattr(entity, 'target', None), dict):
             target_id = entity.target.get('id')
@@ -484,15 +498,21 @@ class GameEngine:
             'team': entity.team,
             'label': label_map.get(short_id, short_id),
             'robot_type': entity.robot_type or ('哨兵' if entity.type == 'sentry' else entity.type),
+            'position_x': float(entity.position.get('x', 0.0)),
+            'position_y': float(entity.position.get('y', 0.0)),
+            'position_z': float(entity.position.get('z', 0.0)),
+            'is_hero': getattr(entity, 'robot_type', '') == '英雄',
             'sentry_mode': getattr(entity, 'sentry_mode', 'auto'),
             'state': entity.state,
             'alive': entity.is_alive(),
+            'is_engineer': getattr(entity, 'robot_type', '') == '工程',
             'has_barrel': self.entity_has_barrel(entity),
             'front_gun_locked': bool(getattr(entity, 'front_gun_locked', False)),
             'out_of_combat': self.rules_engine.is_out_of_combat(entity),
             'supports_drive_modes': self.entity_supports_drive_modes(entity),
             'mode_labels': mode_labels,
             'target_id': target.id if target is not None else None,
+            'chassis_state': getattr(entity, 'chassis_state', 'normal'),
             'health': float(entity.health),
             'max_health': float(entity.max_health),
             'ammo': int(getattr(entity, 'ammo', 0)),
@@ -501,7 +521,11 @@ class GameEngine:
             'power': float(getattr(entity, 'power', 0.0)),
             'max_power': float(getattr(entity, 'max_power', power_rule.get('max_power', 0.0))),
             'power_recovery_rate': float(getattr(entity, 'power_recovery_rate', power_rule.get('power_recovery_rate', 0.0))),
-            'power_limit': float(getattr(entity, 'max_power', power_rule.get('max_power', 0.0))),
+            'power_limit': float(getattr(entity, 'max_power', power_rule.get('max_power', 0.0))) * float(getattr(entity, 'dynamic_power_capacity_mult', 1.0)),
+            'movement_power_ratio': float(movement_power_ratio),
+            'movement_speed_world': float(current_speed),
+            'movement_speed_mps': float(current_speed_mps),
+            'movement_speed_ratio': float(movement_power_ratio),
             'chassis_mode': getattr(entity, 'chassis_mode', 'health_priority'),
             'heat': float(getattr(entity, 'heat', 0.0)),
             'max_heat': float(getattr(entity, 'max_heat', heat_rule.get('max_heat', 0.0))),
@@ -516,10 +540,20 @@ class GameEngine:
             'posture_cooldown': float(getattr(entity, 'posture_cooldown', 0.0)),
             'invincible_timer': float(getattr(entity, 'invincible_timer', 0.0)),
             'weak_timer': float(getattr(entity, 'weak_timer', 0.0)),
+            'respawn_invalid_timer': float(getattr(entity, 'respawn_invalid_timer', 0.0)),
+            'respawn_weak_active': bool(getattr(entity, 'respawn_weak_active', False)),
             'fort_buff_active': bool(getattr(entity, 'fort_buff_active', False)),
             'terrain_buff_timer': float(getattr(entity, 'terrain_buff_timer', 0.0)),
             'active_buff_labels': list(getattr(entity, 'active_buff_labels', [])),
             'carried_minerals': int(getattr(entity, 'carried_minerals', 0)),
+            'carried_mineral_type': getattr(entity, 'carried_mineral_type', None),
+            'mined_minerals_total': int(getattr(entity, 'mined_minerals_total', 0)),
+            'exchanged_minerals_total': int(getattr(entity, 'exchanged_minerals_total', 0)),
+            'exchanged_gold_total': float(getattr(entity, 'exchanged_gold_total', 0.0)),
+            'hero_deployment_active': bool(getattr(entity, 'hero_deployment_active', False)),
+            'hero_deployment_state': getattr(entity, 'hero_deployment_state', 'inactive'),
+            'hero_deployment_charge': float(getattr(entity, 'hero_deployment_charge', 0.0)),
+            'hero_deployment_delay': float(self.rules_engine.rules.get('buff_zones', {}).get('buff_hero_deployment', {}).get('activation_delay_sec', 2.0)),
             'fire_control_state': getattr(entity, 'fire_control_state', 'idle'),
             'fire_rate_hz': float(rule_snapshot['fire_rate_hz']),
             'effective_fire_rate_hz': float(rule_snapshot['effective_fire_rate_hz']),

@@ -7,12 +7,15 @@ from control.behavior_tree import Action, BehaviorContext, Condition, Selector, 
 
 
 class AIController:
+    EMPTY_PATH_PREVIEW = ()
+
     def __init__(self, config):
         self.config = config
         self.ai_strategy = config.get('ai', {}).get('strategy', {})
         self._patrol_index = {}
         self.enable_entity_movement = config.get('simulator', {}).get('enable_entity_movement', True)
         self._path_cache = {}
+        self._stuck_state = {}
         self._ai_update_interval = float(config.get('ai', {}).get('update_interval_sec', 0.12))
         self._path_replan_interval = float(config.get('ai', {}).get('path_replan_interval_sec', 0.35))
         self._last_ai_update_time = {}
@@ -22,43 +25,47 @@ class AIController:
     def _build_role_trees(self):
         sentry_tree = Selector(
             Sequence(Condition(lambda ctx: getattr(ctx.entity, 'front_gun_locked', False)), Action(self._action_return_to_supply_unlock)),
-            Sequence(Condition(lambda ctx: self._is_opening_phase(ctx) and self._can_sentry_exchange(ctx)), Action(self._action_sentry_opening_exchange)),
             Sequence(Condition(self._should_recover_after_respawn), Action(self._action_recover_after_respawn)),
             Sequence(Condition(self._is_critical_state), Action(self._action_emergency_retreat)),
+            Sequence(Condition(self._should_defend_own_outpost), Action(self._action_defend_own_outpost)),
+            Sequence(Condition(self._has_target), Action(self._action_pursue_enemy)),
             Sequence(Condition(self._should_protect_hero), Action(self._action_protect_hero)),
-            Sequence(Condition(self._should_intercept_enemy_engineer), Action(self._action_intercept_enemy_engineer)),
             Sequence(Condition(self._should_support_infantry_push), Action(self._action_support_infantry_push)),
-            Sequence(Condition(self._has_teamfight_window), Action(self._action_teamfight_cover)),
-            Sequence(Condition(self._has_target), Action(self._action_sentry_engage)),
-            Sequence(Condition(self._should_cross_terrain), Action(self._action_cross_terrain)),
+            Sequence(Condition(self._should_support_engineer), Action(self._action_support_engineer)),
+            Sequence(Condition(self._should_intercept_enemy_engineer), Action(self._action_intercept_enemy_engineer)),
             Sequence(Condition(self._should_push_outpost), Action(self._action_push_outpost)),
+            Sequence(Condition(self._has_teamfight_window), Action(self._action_teamfight_cover)),
             Sequence(Condition(self._should_push_base), Action(self._action_push_base)),
+            Sequence(Condition(self._should_cross_terrain), Action(self._action_cross_terrain)),
             Action(self._action_patrol_key_facilities),
         )
 
         infantry_tree = Selector(
-            Sequence(Condition(lambda ctx: self._is_opening_phase(ctx) and self._needs_supply(ctx)), Action(self._action_opening_supply)),
             Sequence(Condition(self._should_recover_after_respawn), Action(self._action_recover_after_respawn)),
             Sequence(Condition(self._is_critical_state), Action(self._action_emergency_retreat)),
-            Sequence(Condition(self._should_defend_outpost_from_hero), Action(self._action_defend_outpost_from_hero)),
-            Sequence(Condition(self._should_intercept_enemy_engineer), Action(self._action_intercept_enemy_engineer)),
+            Sequence(Condition(self._needs_supply), Action(self._action_opening_supply)),
+            Sequence(Condition(self._should_defend_own_outpost), Action(self._action_defend_own_outpost)),
+            Sequence(Condition(self._has_target), Action(self._action_pursue_enemy)),
             Sequence(Condition(self._should_activate_energy), Action(self._action_activate_energy)),
-            Sequence(Condition(self._should_cross_terrain), Action(self._action_cross_terrain)),
+            Sequence(Condition(self._should_intercept_enemy_engineer), Action(self._action_intercept_enemy_engineer)),
             Sequence(Condition(self._should_push_outpost), Action(self._action_push_outpost)),
             Sequence(Condition(self._has_teamfight_window), Action(self._action_teamfight_push)),
-            Sequence(Condition(self._has_target), Action(self._action_pursue_enemy)),
             Sequence(Condition(self._should_push_base), Action(self._action_push_base)),
+            Sequence(Condition(self._should_cross_terrain), Action(self._action_cross_terrain)),
             Action(self._action_patrol_key_facilities),
         )
 
         hero_tree = Selector(
-            Sequence(Condition(lambda ctx: self._is_opening_phase(ctx) and self._needs_supply(ctx)), Action(self._action_opening_supply)),
             Sequence(Condition(self._should_recover_after_respawn), Action(self._action_recover_after_respawn)),
+            Sequence(Condition(self._needs_supply), Action(self._action_opening_supply)),
+            Sequence(Condition(self._should_defend_own_outpost), Action(self._action_defend_own_outpost)),
             Sequence(Condition(self._should_hero_seek_cover), Action(self._action_hero_seek_cover)),
+            Sequence(Condition(self._should_hero_opening_highground), Action(self._action_hero_opening_highground)),
+            Sequence(Condition(self._has_target), Action(self._action_pursue_enemy)),
+            Sequence(Condition(self._should_activate_energy), Action(self._action_activate_energy)),
             Sequence(Condition(self._should_hero_lob_outpost), Action(self._action_hero_lob_outpost)),
             Sequence(Condition(self._should_hero_lob_base), Action(self._action_hero_lob_base)),
             Sequence(Condition(self._should_cross_terrain), Action(self._action_cross_terrain)),
-            Sequence(Condition(self._has_target), Action(self._action_pursue_enemy)),
             Sequence(Condition(self._should_push_base), Action(self._action_push_base)),
             Action(self._action_patrol_key_facilities),
         )
@@ -67,10 +74,8 @@ class AIController:
             Sequence(Condition(self._should_recover_after_respawn), Action(self._action_recover_after_respawn)),
             Sequence(Condition(self._is_critical_state), Action(self._action_emergency_retreat)),
             Sequence(Condition(self._needs_mining_cycle), Action(self._action_engineer_mining_cycle)),
-            Sequence(Condition(self._should_activate_energy), Action(self._action_activate_energy)),
-            Sequence(Condition(self._should_cross_terrain), Action(self._action_cross_terrain)),
             Sequence(Condition(self._needs_structure_support), Action(self._action_support_structures)),
-            Sequence(Condition(self._has_teamfight_window), Action(self._action_teamfight_cover)),
+            Sequence(Condition(self._should_cross_terrain), Action(self._action_cross_terrain)),
             Action(self._action_support_sentry_screen),
         )
 
@@ -92,6 +97,41 @@ class AIController:
         pixels_per_meter_y = map_height / max(field_width_m, 1e-6)
         return meters * ((pixels_per_meter_x + pixels_per_meter_y) / 2.0)
 
+    def _arrival_tolerance_world_units(self, map_manager=None):
+        tolerance_m = float(self.config.get('ai', {}).get('target_arrival_tolerance_m', 0.3))
+        return max(6.0, self._meters_to_world_units(tolerance_m, map_manager))
+
+    def _is_target_reached(self, entity, target_point, map_manager=None):
+        if target_point is None:
+            return True
+        return self._distance_to_point(entity, target_point) <= self._arrival_tolerance_world_units(map_manager)
+
+    def _resolve_navigation_target(self, target_point, map_manager):
+        if target_point is None or map_manager is None:
+            return target_point
+        resolved = (float(target_point[0]), float(target_point[1]))
+        if map_manager.is_position_valid_for_radius(resolved[0], resolved[1], collision_radius=16.0):
+            return resolved
+        return map_manager.find_nearest_passable_point(
+            resolved,
+            collision_radius=16.0,
+            search_radius=max(int(self._arrival_tolerance_world_units(map_manager) * 6.0), 72),
+            step=max(4, map_manager.terrain_grid_cell_size),
+        )
+
+    def _set_navigation_overlay_state(self, entity, waypoint=None, preview=None, path_valid=None):
+        entity.ai_navigation_waypoint = waypoint
+        if preview:
+            entity.ai_path_preview = tuple(preview)
+        else:
+            entity.ai_path_preview = self.EMPTY_PATH_PREVIEW
+        if path_valid is None:
+            path_valid = waypoint is not None or bool(entity.ai_path_preview)
+        entity.ai_navigation_path_valid = bool(path_valid)
+
+    def _clear_navigation_overlay_state(self, entity):
+        self._set_navigation_overlay_state(entity, waypoint=None, preview=self.EMPTY_PATH_PREVIEW, path_valid=False)
+
     def update(self, entities, map_manager=None, rules_engine=None, game_time=0.0, game_duration=0.0):
         for entity in entities:
             if not self._should_control_entity(entity):
@@ -110,6 +150,8 @@ class AIController:
             decision = context.data.get('decision')
             if result == FAILURE or decision is None:
                 decision = self._idle_decision(entity, '行为树未命中有效分支，原地待命')
+            bt_node = str(context.data.get('bt_action_node', ''))
+            decision['bt_node'] = bt_node
             self._apply_decision(entity, decision, rules_engine)
 
     def _should_control_entity(self, entity):
@@ -135,9 +177,11 @@ class AIController:
         allied_sentry = self._find_entity(entities, entity.team, 'sentry')
         allied_hero = self._find_entity_by_role(entities, entity.team, 'hero')
         allied_infantry = self._find_entity_by_role(entities, entity.team, 'infantry', exclude_id=entity.id)
+        allied_engineer = self._find_entity_by_role(entities, entity.team, 'engineer')
         enemy_hero = self._find_entity_by_role(entities, enemy_team, 'hero')
         enemy_engineer = self._find_entity_by_role(entities, enemy_team, 'engineer')
-        energy_anchor = self.get_energy_anchor(map_manager)
+        energy_anchor = self.get_energy_anchor(entity.team, map_manager)
+        energy_snapshot = rules_engine.get_energy_mechanism_snapshot(entity.team) if rules_engine is not None and hasattr(rules_engine, 'get_energy_mechanism_snapshot') else {'can_activate': False, 'state': 'inactive'}
         mining_anchor = self.get_mining_anchor(entity, map_manager)
         exchange_anchor = self.get_exchange_anchor(entity, map_manager)
         map_center = self.get_map_center(map_manager)
@@ -160,9 +204,12 @@ class AIController:
             'allied_sentry': allied_sentry,
             'allied_hero': allied_hero,
             'allied_infantry': allied_infantry,
+            'allied_engineer': allied_engineer,
             'enemy_hero': enemy_hero,
             'enemy_engineer': enemy_engineer,
             'energy_anchor': energy_anchor,
+            'energy_can_activate': bool(energy_snapshot.get('can_activate', False)),
+            'energy_state': energy_snapshot.get('state', 'inactive'),
             'mining_anchor': mining_anchor,
             'exchange_anchor': exchange_anchor,
             'map_center': map_center,
@@ -179,7 +226,12 @@ class AIController:
             'teamfight_ready': len(nearby_allies) >= 1 and len(nearby_enemies) >= 1,
             'transit_anchor': None,
             'carried_minerals': int(getattr(entity, 'carried_minerals', 0)),
-            'energy_buff_active': any(float(getattr(other, 'timed_buffs', {}).get('energy_mechanism_boost', 0.0)) > 0.0 for other in [entity] + allies),
+            'energy_buff_active': any(
+                float(getattr(other, 'timed_buffs', {}).get('energy_mechanism_boost', 0.0)) > 0.0
+                or float(getattr(other, 'energy_small_buff_timer', 0.0)) > 0.0
+                or float(getattr(other, 'energy_large_buff_timer', 0.0)) > 0.0
+                for other in [entity] + allies
+            ),
         }
         return BehaviorContext(self, entity, entities, map_manager, rules_engine, game_time, game_duration, data)
 
@@ -212,9 +264,12 @@ class AIController:
 
     def _apply_decision(self, entity, decision, rules_engine):
         entity.ai_decision = decision.get('summary', '')
+        entity.ai_behavior_node = decision.get('bt_node', '')
         entity.target = decision.get('target')
         entity.ai_navigation_target = decision.get('navigation_target')
         entity.ai_movement_target = decision.get('movement_target')
+        if entity.ai_navigation_target is None and entity.ai_movement_target is None:
+            self._clear_navigation_overlay_state(entity)
         entity.fire_control_state = decision.get('fire_control_state', 'idle')
         entity.chassis_state = decision.get('chassis_state', 'normal')
         entity.turret_state = decision.get('turret_state', 'searching')
@@ -222,6 +277,11 @@ class AIController:
         entity.ai_navigation_velocity = (move_x, move_y)
         entity.set_velocity(move_x, move_y)
         entity.angular_velocity = decision.get('angular_velocity', 0.0)
+        if float(getattr(entity, 'evasive_spin_timer', 0.0)) > 0.0:
+            entity.chassis_state = 'fast_spin'
+            spin_direction = float(getattr(entity, 'evasive_spin_direction', 1.0)) or 1.0
+            spin_rate = float(getattr(entity, 'evasive_spin_rate_deg', 420.0))
+            entity.angular_velocity = spin_direction * spin_rate
         aim_point = decision.get('aim_point')
         if aim_point is not None:
             dx = aim_point[0] - entity.position['x']
@@ -243,14 +303,19 @@ class AIController:
 
     def _needs_supply(self, context):
         entity = context.entity
+        opening_need = False
         if self._is_opening_phase(context):
             opening_target = self._opening_ammo_target(context)
             if opening_target > 0 and getattr(entity, 'ammo', 0) < opening_target:
-                return True
-        if getattr(entity, 'ammo', 0) > context.data.get('low_ammo_threshold', 20):
+                opening_need = True
+                if getattr(entity, 'ammo', 0) <= 0:
+                    return True
+        if not opening_need and getattr(entity, 'ammo', 0) > context.data.get('low_ammo_threshold', 20):
             return False
         if context.data.get('supply_candidate_id') != entity.id:
             return False
+        if opening_need:
+            return True
         claimable = context.data.get('supply_claimable', 0)
         eta = context.data.get('supply_eta', 999.0)
         return claimable > 0 or eta <= 10.0
@@ -260,9 +325,9 @@ class AIController:
         purchase_rules = context.rules_engine.rules.get('ammo_purchase', {}) if context.rules_engine is not None else {}
         opening_targets = purchase_rules.get('opening_targets', {})
         if getattr(entity, 'ammo_type', None) == '42mm':
-            return int(opening_targets.get('hero_42mm', 4))
+            return max(10, int(opening_targets.get('hero_42mm', 10)))
         if getattr(entity, 'ammo_type', None) == '17mm' and entity.type == 'robot':
-            return int(opening_targets.get('infantry_17mm', 40))
+            return max(100, int(opening_targets.get('infantry_17mm', 100)))
         return 0
 
     def _is_critical_state(self, context):
@@ -283,15 +348,15 @@ class AIController:
 
     def _should_activate_energy(self, context):
         role_key = context.data.get('role_key')
-        if role_key not in {'engineer', 'infantry'}:
+        if role_key not in {'hero', 'infantry'}:
             return False
         if context.data.get('energy_anchor') is None or context.data.get('energy_buff_active'):
             return False
-        if role_key == 'engineer' and context.data.get('carried_minerals', 0) > 0:
+        if not context.data.get('energy_can_activate', False):
             return False
         if role_key == 'infantry' and context.data.get('outnumbered', False):
             return False
-        return 30.0 <= context.game_time <= max(45.0, context.game_duration - 75.0)
+        return True
 
     def _should_cross_terrain(self, context):
         return getattr(context.entity, 'terrain_buff_timer', 0.0) <= 0.25
@@ -300,16 +365,50 @@ class AIController:
         entity = context.entity
         if getattr(entity, 'front_gun_locked', False):
             return True
-        return getattr(entity, 'respawn_recovery_timer', 0.0) > 0.0
+        if getattr(entity, 'respawn_weak_active', False):
+            return True
+        return getattr(entity, 'respawn_invalid_timer', 0.0) > 0.0 or getattr(entity, 'respawn_recovery_timer', 0.0) > 0.0
 
-    def _should_defend_outpost_from_hero(self, context):
-        if context.data.get('role_key') != 'infantry':
+    def _should_defend_own_outpost(self, context):
+        if context.data.get('role_key') not in {'hero', 'infantry', 'sentry'}:
             return False
         own_outpost = context.data.get('own_outpost')
-        enemy_hero = context.data.get('enemy_hero')
-        if own_outpost is None or enemy_hero is None or not own_outpost.is_alive() or not enemy_hero.is_alive():
+        if own_outpost is None or not own_outpost.is_alive():
             return False
-        return self._distance(own_outpost, enemy_hero) <= self._meters_to_world_units(8.0, context.map_manager)
+        if not self._is_designated_outpost_defender(context):
+            return False
+        threat = self._nearest_enemy_by_roles(
+            context.entities,
+            context.entity.team,
+            (own_outpost.position['x'], own_outpost.position['y']),
+            {'hero', 'infantry', 'engineer', 'sentry'},
+        )
+        if threat is not None and threat['distance'] <= self._meters_to_world_units(5.5, context.map_manager):
+            return True
+        return own_outpost.health < own_outpost.max_health * 0.85
+
+    def _is_designated_outpost_defender(self, context):
+        own_outpost = context.data.get('own_outpost')
+        if own_outpost is None:
+            return False
+        candidates = []
+        for other in context.entities:
+            if other.team != context.entity.team or not other.is_alive():
+                continue
+            role_key = self._role_key(other)
+            if role_key not in {'hero', 'infantry', 'sentry'}:
+                continue
+            distance = math.hypot(
+                float(other.position['x']) - float(own_outpost.position['x']),
+                float(other.position['y']) - float(own_outpost.position['y']),
+            )
+            role_priority = 2 if role_key == 'sentry' else (1 if role_key == 'hero' else 0)
+            stable_id = sum(ord(char) for char in str(getattr(other, 'id', '')))
+            candidates.append((distance, -role_priority, stable_id, other.id))
+        if not candidates:
+            return False
+        candidates.sort()
+        return candidates[0][3] == context.entity.id
 
     def _should_intercept_enemy_engineer(self, context):
         if context.data.get('role_key') not in {'infantry', 'sentry'}:
@@ -342,11 +441,30 @@ class AIController:
             return False
         return allied_infantry.is_alive() and enemy_outpost.is_alive()
 
+    def _should_support_engineer(self, context):
+        if context.data.get('role_key') != 'sentry':
+            return False
+        allied_engineer = context.data.get('allied_engineer')
+        if allied_engineer is None or not allied_engineer.is_alive():
+            return False
+        if getattr(allied_engineer, 'carried_minerals', 0) > 0:
+            return True
+        mining_anchor = context.data.get('mining_anchor')
+        if mining_anchor is None:
+            return False
+        return self._distance_to_point(allied_engineer, mining_anchor) <= self._meters_to_world_units(5.0, context.map_manager)
+
     def _should_hero_seek_cover(self, context):
         if context.data.get('role_key') != 'hero':
             return False
         threat = self._nearest_enemy_by_roles(context.entities, context.entity.team, (context.entity.position['x'], context.entity.position['y']), {'infantry', 'sentry'})
         return threat is not None and threat['distance'] <= self._meters_to_world_units(6.0, context.map_manager)
+
+    def _should_hero_opening_highground(self, context):
+        return context.data.get('role_key') == 'hero' and self._is_opening_phase(context)
+
+    def _should_sentry_opening_highground(self, context):
+        return False
 
     def _should_hero_lob_outpost(self, context):
         if context.data.get('role_key') != 'hero':
@@ -380,7 +498,11 @@ class AIController:
         enemy_outpost = context.data.get('enemy_outpost')
         if enemy_outpost is None or not enemy_outpost.is_alive():
             return False
-        return context.game_time >= 40.0 and not context.data.get('outnumbered', False)
+        if context.data.get('target') is not None:
+            return False
+        if context.data.get('role_key') in {'infantry', 'sentry'}:
+            return not context.data.get('outnumbered', False)
+        return context.game_time >= 30.0 and not context.data.get('outnumbered', False)
 
     def _should_push_base(self, context):
         enemy_base = context.data.get('enemy_base')
@@ -414,27 +536,35 @@ class AIController:
 
     def _set_decision(self, context, summary, target=None, target_point=None, speed=None, posture=None, preferred_route=None, fire_control='idle', chassis_state='normal', turret_state='searching', angular_velocity=0.0, orbit=False):
         entity = context.entity
+        if target is not None and chassis_state == 'normal':
+            chassis_state = 'spin'
+            if abs(float(angular_velocity)) <= 1e-6:
+                angular_velocity = 120.0
         move_target = target_point
+        strategic_target = target_point
         if preferred_route is not None:
             transit_destination = preferred_route.get('target') if isinstance(preferred_route, dict) else preferred_route
             transit_anchor = self.choose_transit_anchor(entity, transit_destination, context.map_manager, context.rules_engine)
             if transit_anchor is not None:
                 move_target = transit_anchor
+                strategic_target = transit_destination
+        staged_target = self._stage_short_term_goal(entity, move_target, context.map_manager)
         velocity = (0.0, 0.0)
-        if move_target is not None and speed is not None:
+        if staged_target is not None and speed is not None:
             if orbit and target is not None:
-                velocity = self.maintain_distance(entity, target, preferred_route.get('distance', 0.0), speed)
+                orbit_distance = preferred_route.get('distance', 0.0) if isinstance(preferred_route, dict) else 0.0
+                velocity = self.maintain_distance(entity, target, orbit_distance, speed)
             else:
-                velocity = self.navigate_towards(entity, move_target, speed, context.map_manager)
-        velocity = self._apply_local_avoidance(entity, velocity, context.entities, move_target)
+                velocity = self.navigate_towards(entity, staged_target, speed, context.map_manager)
+        velocity = self._apply_local_avoidance(entity, velocity, context.entities, staged_target)
         decision_target = target
         aim_point = target_point if target is None else (target['x'], target['y'])
         context.data['decision'] = {
             'summary': summary,
             'target': decision_target,
             'aim_point': aim_point,
-            'navigation_target': target_point,
-            'movement_target': move_target,
+            'navigation_target': strategic_target,
+            'movement_target': staged_target,
             'velocity': velocity,
             'fire_control_state': fire_control,
             'chassis_state': chassis_state,
@@ -443,6 +573,22 @@ class AIController:
             'posture': posture,
         }
         return SUCCESS
+
+    def _stage_short_term_goal(self, entity, target_point, map_manager):
+        if target_point is None:
+            return None
+        distance = self._distance_to_point(entity, target_point)
+        horizon = self._meters_to_world_units(float(self.config.get('ai', {}).get('short_term_goal_m', 3.0)), map_manager)
+        if distance <= horizon:
+            return target_point
+        dx = target_point[0] - entity.position['x']
+        dy = target_point[1] - entity.position['y']
+        norm = max(math.hypot(dx, dy), 1e-6)
+        staged = (
+            entity.position['x'] + dx / norm * horizon,
+            entity.position['y'] + dy / norm * horizon,
+        )
+        return staged
 
     def _action_return_to_supply_unlock(self, context):
         retreat_point = self.get_supply_slot(context.entity, context.map_manager)
@@ -474,6 +620,69 @@ class AIController:
                 return FAILURE
         return self._set_decision(context, summary, target_point=supply, speed=speed)
 
+    def _action_hero_opening_highground(self, context):
+        hero_anchor = self._find_nearest_facility_center(
+            context.map_manager,
+            context.entity,
+            ['buff_trapezoid_highland', 'second_step', 'fly_slope'],
+        )
+        if hero_anchor is None:
+            return FAILURE
+        target_entity = context.data.get('enemy_outpost') or context.data.get('target')
+        target = self.entity_to_target(target_entity, context.entity) if getattr(target_entity, 'position', None) is not None else context.data.get('target')
+        speed = self._meters_to_world_units(2.0, context.map_manager)
+        if self._distance_to_point(context.entity, hero_anchor) > self._meters_to_world_units(0.9, context.map_manager):
+            return self._set_decision(
+                context,
+                '英雄开局抢占梯形高地吊射位',
+                target=target,
+                target_point=(target_entity.position['x'], target_entity.position['y']) if getattr(target_entity, 'position', None) is not None else hero_anchor,
+                speed=speed,
+                preferred_route={
+                    'target': hero_anchor,
+                    'strategic_target': (target_entity.position['x'], target_entity.position['y']) if getattr(target_entity, 'position', None) is not None else hero_anchor,
+                },
+                turret_state='aiming' if target is not None else 'searching',
+            )
+        if target is None:
+            return self._set_decision(context, '英雄开局据守梯形高地，等待目标暴露', target_point=hero_anchor, speed=speed * 0.5)
+        context.data['decision'] = {
+            'summary': '英雄占据梯形高地执行开局吊射',
+            'target': target,
+            'aim_point': (target['x'], target['y']),
+            'navigation_target': hero_anchor,
+            'movement_target': hero_anchor,
+            'velocity': self.maintain_distance(context.entity, target, self._meters_to_world_units(7.2, context.map_manager), speed * 0.45, map_manager=context.map_manager),
+            'fire_control_state': 'idle',
+            'chassis_state': 'normal',
+            'turret_state': 'aiming',
+            'angular_velocity': 0.0,
+            'posture': None,
+        }
+        return SUCCESS
+
+    def _action_sentry_opening_highground(self, context):
+        opening_anchor = self._find_nearest_facility_center(
+            context.map_manager,
+            context.entity,
+            ['second_step', 'first_step', 'fly_slope', 'buff_central_highland', 'buff_trapezoid_highland'],
+        )
+        if opening_anchor is None:
+            return FAILURE
+        target_entity = context.data.get('enemy_outpost')
+        target = self.entity_to_target(target_entity, context.entity) if target_entity is not None else context.data.get('target')
+        speed = self._meters_to_world_units(1.85, context.map_manager)
+        return self._set_decision(
+            context,
+            '哨兵开局直上台阶前往高地压制，不强制补给',
+            target=target,
+            target_point=opening_anchor,
+            speed=speed,
+            preferred_route={'target': opening_anchor},
+            posture='attack',
+            turret_state='aiming' if target is not None else 'searching',
+        )
+
     def _action_emergency_retreat(self, context):
         retreat_point = self.choose_retreat_anchor(context.entity, context.map_manager, prefer_supply=context.data.get('ammo_low', False))
         speed = self._meters_to_world_units(2.0, context.map_manager)
@@ -501,7 +710,7 @@ class AIController:
         if anchor is None:
             return FAILURE
         speed = self._meters_to_world_units(1.6, context.map_manager)
-        return self._set_decision(context, '转入中央能量机关正面激活位，争取团队增益', target=context.data.get('target'), target_point=anchor, speed=speed, turret_state='aiming' if context.data.get('target') else 'searching')
+        return self._set_decision(context, '转入中央能量机关队伍激活位，保持激活窗口直至完成小/大能量机关', target=context.data.get('target'), target_point=anchor, speed=speed, turret_state='aiming' if context.data.get('target') else 'searching')
 
     def _action_cross_terrain(self, context):
         facility = self._find_best_buff_anchor(context, terrain_only=True)
@@ -521,14 +730,23 @@ class AIController:
         point = (support_target.position['x'], support_target.position['y'])
         return self._set_decision(context, f'工程位回防 {support_target.id}，保持修复/掩护链', target_point=point, speed=speed, preferred_route={'target': point})
 
-    def _action_defend_outpost_from_hero(self, context):
-        enemy_hero = context.data.get('enemy_hero')
+    def _action_defend_own_outpost(self, context):
         own_outpost = context.data.get('own_outpost')
-        if enemy_hero is None or own_outpost is None:
+        if own_outpost is None:
             return FAILURE
+        threat = self._nearest_enemy_by_roles(
+            context.entities,
+            context.entity.team,
+            (own_outpost.position['x'], own_outpost.position['y']),
+            {'hero', 'infantry', 'engineer', 'sentry'},
+        )
         speed = self._meters_to_world_units(1.9, context.map_manager)
+        if threat is not None and threat['distance'] <= self._meters_to_world_units(8.5, context.map_manager):
+            attacker = threat['entity']
+            point = self._escort_anchor(own_outpost, attacker, context.map_manager)
+            return self._set_decision(context, '己方前哨站受压，优先拦截正在进攻的敌方机器人', target=self.entity_to_target(attacker, context.entity), target_point=point, speed=speed, preferred_route={'target': point}, turret_state='aiming')
         point = (own_outpost.position['x'], own_outpost.position['y'])
-        return self._set_decision(context, '步兵回防前哨站，阻止敌方英雄吊射', target=self.entity_to_target(enemy_hero, context.entity), target_point=point, speed=speed, preferred_route={'target': point}, turret_state='aiming')
+        return self._set_decision(context, '己方前哨站受击，回防并建立掩护阵位', target=context.data.get('target'), target_point=point, speed=speed, preferred_route={'target': point}, turret_state='aiming' if context.data.get('target') else 'searching')
 
     def _action_intercept_enemy_engineer(self, context):
         enemy_engineer = context.data.get('enemy_engineer')
@@ -560,16 +778,27 @@ class AIController:
         decision_target = self.entity_to_target(anchor_target, context.entity) if anchor_target is not None and anchor_target is not allied_infantry else context.data.get('target')
         return self._set_decision(context, '哨兵与步兵协同压前哨站，顺带封堵对方回防线', target=decision_target, target_point=point, speed=speed, preferred_route={'target': point}, posture='attack', turret_state='aiming' if decision_target else 'searching')
 
+    def _action_support_engineer(self, context):
+        allied_engineer = context.data.get('allied_engineer')
+        if allied_engineer is None:
+            return FAILURE
+        threat = self._nearest_enemy_by_roles(context.entities, context.entity.team, (allied_engineer.position['x'], allied_engineer.position['y']), {'infantry', 'hero', 'sentry'})
+        threat_entity = threat['entity'] if threat is not None else None
+        point = self._escort_anchor(allied_engineer, threat_entity, context.map_manager)
+        speed = self._meters_to_world_units(1.55, context.map_manager)
+        decision_target = self.entity_to_target(threat_entity, context.entity) if threat_entity is not None else context.data.get('target')
+        return self._set_decision(context, '哨兵贴近工程巡航掩护，保障采矿与兑矿路线安全', target=decision_target, target_point=point, speed=speed, preferred_route={'target': point}, posture='attack', turret_state='aiming' if decision_target else 'searching')
+
     def _action_engineer_mining_cycle(self, context):
         carried = context.data.get('carried_minerals', 0)
         target_point = context.data.get('exchange_anchor') if carried > 0 else context.data.get('mining_anchor')
         if target_point is None:
             return FAILURE
-        speed = self._meters_to_world_units(1.85, context.map_manager)
+        speed = self._meters_to_world_units(2.15 if carried > 0 else 2.0, context.map_manager)
         if carried > 0:
-            summary = f'工程携带 {carried} 单位矿物，前往兑矿区变现为队伍金币'
+            summary = f'工程携带 {carried} 单位矿物，快速兑矿并优先保命'
         else:
-            summary = '工程前往取矿区执行经济闭环，为队友购买弹药提供金币'
+            summary = '工程优先取矿并尽快回兑，避免无效缠斗和阵亡'
         return self._set_decision(context, summary, target_point=target_point, speed=speed, preferred_route={'target': target_point})
 
     def _action_support_sentry_screen(self, context):
@@ -717,7 +946,7 @@ class AIController:
         target_entity = context.data.get('enemy_outpost')
         if target_entity is None:
             return FAILURE
-        point = (target_entity.position['x'], target_entity.position['y'])
+        point = self._assault_anchor(context.entity, target_entity, context.map_manager, preferred_distance_m=2.8)
         speed = self._meters_to_world_units(1.9, context.map_manager)
         summary = '推进敌方前哨站，压缩防守纵深'
         return self._set_decision(context, summary, target=self.entity_to_target(target_entity, context.entity), target_point=point, speed=speed, preferred_route={'target': point}, turret_state='aiming')
@@ -726,13 +955,13 @@ class AIController:
         target_entity = context.data.get('enemy_base')
         if target_entity is None:
             return FAILURE
-        point = (target_entity.position['x'], target_entity.position['y'])
+        point = self._assault_anchor(context.entity, target_entity, context.map_manager, preferred_distance_m=3.5)
         speed = self._meters_to_world_units(2.0, context.map_manager)
         summary = '转入基地推进阶段，集中火力终结比赛'
         return self._set_decision(context, summary, target=self.entity_to_target(target_entity, context.entity), target_point=point, speed=speed, preferred_route={'target': point}, turret_state='aiming')
 
     def _action_patrol_key_facilities(self, context):
-        patrol_points = self.get_patrol_points(context.entity.team, context.map_manager)
+        patrol_points = self.get_patrol_points(context.entity, context.map_manager)
         patrol_target = self.next_patrol_point(context.entity, patrol_points)
         speed = self._meters_to_world_units(1.4, context.map_manager)
         return self._set_decision(context, '沿关键设施轮巡，保持阵型与视野', target=context.data.get('target'), target_point=patrol_target, speed=speed, turret_state='aiming' if context.data.get('target') else 'searching', angular_velocity=12.0)
@@ -740,9 +969,23 @@ class AIController:
     def select_priority_target(self, entity, enemies, strategy, rules_engine=None, max_distance=None):
         priority_targets = strategy.get('priority_targets', ['sentry', 'robot', 'outpost', 'base'])
         priority_map = {target_type: len(priority_targets) - index for index, target_type in enumerate(priority_targets)}
+        visible_combat_target_exists = False
+        if rules_engine is not None and entity.type in {'robot', 'sentry'}:
+            for other in enemies:
+                if other.type not in {'robot', 'sentry'}:
+                    continue
+                distance = self._distance(entity, other)
+                if max_distance is not None and distance > max_distance:
+                    continue
+                assessment = rules_engine.evaluate_auto_aim_target(entity, other, distance=distance, require_fov=False)
+                if assessment.get('can_track', False):
+                    visible_combat_target_exists = True
+                    break
         best_target = None
         best_score = None
         for other in enemies:
+            if visible_combat_target_exists and other.type in {'outpost', 'base'}:
+                continue
             distance = self._distance(entity, other)
             if max_distance is not None and distance > max_distance:
                 continue
@@ -786,20 +1029,20 @@ class AIController:
     def _distance_to_point(self, entity, point):
         return math.hypot(point[0] - entity.position['x'], point[1] - entity.position['y'])
 
-    def get_team_anchor(self, team, anchor_type, map_manager):
+    def get_team_anchor(self, team, anchor_type, map_manager, entity=None):
         if map_manager is None:
             return None
-        for facility in map_manager.get_facility_regions(anchor_type):
-            if facility.get('team') == team:
-                return self.facility_center(facility)
-        return None
+        facility = self._find_team_facility(map_manager, team, anchor_type)
+        if facility is None:
+            return None
+        return self._facility_anchor_point(facility, map_manager, entity=entity)
 
-    def get_energy_anchor(self, map_manager):
+    def get_energy_anchor(self, team, map_manager):
         if map_manager is None:
             return None
         facilities = map_manager.get_facility_regions('energy_mechanism')
         if facilities:
-            return self._energy_activation_anchor(facilities[0], map_manager)
+            return self._energy_activation_anchor(team, facilities[0], map_manager)
         return self.get_map_center(map_manager)
 
     def get_mining_anchor(self, entity, map_manager):
@@ -813,26 +1056,38 @@ class AIController:
         height = getattr(map_manager, 'map_height', None) or self.config.get('map', {}).get('height', 873)
         return int(width / 2), int(height / 2)
 
-    def get_patrol_points(self, team, map_manager):
+    def get_patrol_points(self, entity, map_manager):
         if map_manager is None:
             return []
-        facility_ids = [
-            f'{team}_fort',
-            f'{team}_outpost',
-            f'{team}_supply',
-            f'{team}_undulating_road',
-            f'{team}_fly_slope',
-            f'{team}_base',
-        ]
-        facility_map = {facility.get('id'): facility for facility in map_manager.get_facility_regions()}
-        return [self.facility_center(facility_map[facility_id]) for facility_id in facility_ids if facility_id in facility_map]
+        team = entity.team
+        enemy_team = 'blue' if team == 'red' else 'red'
+        role_key = self._role_key(entity)
+        if role_key in {'hero', 'infantry', 'sentry'}:
+            points = []
+            for target_team, facility_type in ((enemy_team, 'outpost'), (team, 'fort'), (enemy_team, 'fort'), (enemy_team, 'base')):
+                facility = self._find_team_facility(map_manager, target_team, facility_type)
+                if facility is not None:
+                    points.append(self._facility_anchor_point(facility, map_manager, entity=entity))
+            central_highland = self._nearest_region_center(entity, map_manager, ['buff_central_highland'])
+            if central_highland is not None:
+                points.insert(1, central_highland)
+            return points
+        points = []
+        mining_anchor = self.get_mining_anchor(entity, map_manager)
+        exchange_anchor = self.get_exchange_anchor(entity, map_manager)
+        supply_anchor = self.get_team_anchor(team, 'supply', map_manager, entity=entity)
+        base_anchor = self.get_team_anchor(team, 'base', map_manager, entity=entity)
+        for anchor in (mining_anchor, exchange_anchor, supply_anchor, base_anchor):
+            if anchor is not None:
+                points.append(anchor)
+        return points
 
     def choose_retreat_anchor(self, entity, map_manager, prefer_supply=False):
         if map_manager is None:
             return entity.position['x'], entity.position['y']
         facility_order = ['supply', 'fort', 'outpost', 'base'] if prefer_supply else ['fort', 'outpost', 'base', 'supply']
         for facility_type in facility_order:
-            anchor = self.get_team_anchor(entity.team, facility_type, map_manager)
+            anchor = self.get_team_anchor(entity.team, facility_type, map_manager, entity=entity)
             if anchor is not None:
                 return anchor
         return entity.position['x'], entity.position['y']
@@ -842,7 +1097,7 @@ class AIController:
             return entity.position['x'], entity.position['y']
         candidates = []
         for facility_type, weight in [('fort', 1.5), ('outpost', 1.25), ('supply', 0.9), ('base', 0.8)]:
-            anchor = self.get_team_anchor(entity.team, facility_type, map_manager)
+            anchor = self.get_team_anchor(entity.team, facility_type, map_manager, entity=entity)
             if anchor is None:
                 continue
             target_distance = math.hypot(target['x'] - anchor[0], target['y'] - anchor[1]) if target is not None else 0.0
@@ -1013,7 +1268,11 @@ class AIController:
             structure.position['y'] + dy / length * preferred_distance,
         )
 
-    def _energy_activation_anchor(self, facility, map_manager):
+    def _energy_activation_anchor(self, team, facility, map_manager):
+        if facility.get('type') == 'energy_mechanism' and facility.get('shape', 'rect') == 'rect':
+            if team == 'blue':
+                return 970.0, 770.0
+            return 579.0, 204.0
         center_x, center_y = self.facility_center(facility)
         points = list(facility.get('points', []))
         if len(points) >= 2:
@@ -1084,47 +1343,223 @@ class AIController:
             return 0.0, 0.0
         return (dx / distance) * speed, (dy / distance) * speed
 
+    def _max_speed_world_units(self):
+        physics = self.config.get('physics', {})
+        map_config = self.config.get('map', {})
+        field_length_m = float(map_config.get('field_length_m', 28.0))
+        field_width_m = float(map_config.get('field_width_m', 15.0))
+        map_width = float(map_config.get('width', 1576.0))
+        map_height = float(map_config.get('height', 873.0))
+        pixels_per_meter_x = map_width / max(field_length_m, 1e-6)
+        pixels_per_meter_y = map_height / max(field_width_m, 1e-6)
+        return float(physics.get('max_speed', 3.5)) * ((pixels_per_meter_x + pixels_per_meter_y) / 2.0)
+
+    def _resolved_navigation_speed(self, entity, requested_speed, target_point, map_manager):
+        if target_point is None:
+            return requested_speed
+        max_speed = self._max_speed_world_units() * 0.96
+        friction = float(self.config.get('physics', {}).get('friction', 0.1))
+        corrected_speed = requested_speed / max(0.45, 1.0 - friction)
+        distance = math.hypot(float(target_point[0]) - float(entity.position['x']), float(target_point[1]) - float(entity.position['y']))
+        if map_manager is not None and distance >= max(80.0, map_manager.terrain_grid_cell_size * 4.0):
+            start_height = float(map_manager.get_terrain_height_m(entity.position['x'], entity.position['y']))
+            end_height = float(map_manager.get_terrain_height_m(target_point[0], target_point[1]))
+            if abs(end_height - start_height) <= 0.03:
+                corrected_speed = max(corrected_speed, max_speed * 0.82)
+        effective_capacity = max(1e-6, float(getattr(entity, 'max_power', 0.0)) * float(getattr(entity, 'dynamic_power_capacity_mult', 1.0)))
+        power_ratio = float(getattr(entity, 'power', 0.0)) / effective_capacity
+        if power_ratio < 0.2:
+            corrected_speed *= 0.72
+        elif power_ratio < 0.4:
+            corrected_speed *= 0.86
+        return min(max_speed, corrected_speed)
+
+    def _build_escape_waypoint(self, entity, preferred_point, map_manager):
+        if map_manager is None:
+            return None
+        base_dx = float(preferred_point[0]) - float(entity.position['x']) if preferred_point is not None else 0.0
+        base_dy = float(preferred_point[1]) - float(entity.position['y']) if preferred_point is not None else 0.0
+        if abs(base_dx) <= 1e-6 and abs(base_dy) <= 1e-6:
+            heading = math.radians(float(getattr(entity, 'angle', 0.0)))
+        else:
+            heading = math.atan2(base_dy, base_dx)
+        base_radius = max(map_manager.terrain_grid_cell_size * 2.0, float(getattr(entity, 'collision_radius', 16.0)) * 2.4, 36.0)
+        for radius_mult in (1.0, 1.45, 1.9):
+            radius = base_radius * radius_mult
+            for offset_deg in (90, -90, 135, -135, 180, 45, -45):
+                candidate_heading = heading + math.radians(offset_deg)
+                candidate = (
+                    float(entity.position['x']) + math.cos(candidate_heading) * radius,
+                    float(entity.position['y']) + math.sin(candidate_heading) * radius,
+                )
+                if not map_manager.is_position_valid_for_radius(candidate[0], candidate[1], collision_radius=float(getattr(entity, 'collision_radius', 0.0))):
+                    continue
+                if not map_manager.is_segment_valid_for_radius(
+                    entity.position['x'],
+                    entity.position['y'],
+                    candidate[0],
+                    candidate[1],
+                    collision_radius=float(getattr(entity, 'collision_radius', 0.0)),
+                ):
+                    return candidate
+        return None
+
     def navigate_towards(self, entity, target_point, speed, map_manager):
         if not self.enable_entity_movement or target_point is None:
-            entity.ai_navigation_waypoint = None
-            entity.ai_path_preview = []
+            self._clear_navigation_overlay_state(entity)
+            return 0.0, 0.0
+        target_point = self._resolve_navigation_target(target_point, map_manager)
+        if self._is_target_reached(entity, target_point, map_manager):
+            self._clear_navigation_overlay_state(entity)
+            entity.ai_navigation_target = target_point
+            state = self._entity_path_state.get(entity.id)
+            if state is not None:
+                state['path'] = self.EMPTY_PATH_PREVIEW
             return 0.0, 0.0
         if map_manager is None:
-            entity.ai_navigation_waypoint = target_point
-            entity.ai_path_preview = [target_point]
-            return self.move_towards(entity, target_point, speed)
+            self._set_navigation_overlay_state(entity, waypoint=target_point, preview=(target_point,), path_valid=True)
+            return self.move_towards(entity, target_point, self._resolved_navigation_speed(entity, speed, target_point, map_manager))
         next_point = self._next_path_waypoint(entity, target_point, map_manager)
-        return self.move_towards(entity, next_point, speed)
+        desired_velocity = self.move_towards(entity, next_point, self._resolved_navigation_speed(entity, speed, next_point, map_manager))
+        return self._avoid_static_obstacles(entity, desired_velocity, map_manager)
+
+    def _avoid_static_obstacles(self, entity, desired_velocity, map_manager):
+        vx, vy = desired_velocity
+        speed = math.hypot(vx, vy)
+        if speed <= 1e-6 or map_manager is None:
+            return desired_velocity
+        collision_radius = float(getattr(entity, 'collision_radius', 0.0))
+        lookahead = max(map_manager.terrain_grid_cell_size * 2.0, speed * 0.25, 16.0)
+        nx, ny = vx / speed, vy / speed
+        probe_x = entity.position['x'] + nx * lookahead
+        probe_y = entity.position['y'] + ny * lookahead
+        if map_manager.is_segment_valid_for_radius(
+            entity.position['x'],
+            entity.position['y'],
+            probe_x,
+            probe_y,
+            collision_radius=collision_radius,
+        ):
+            return desired_velocity
+        best_velocity = (0.0, 0.0)
+        best_score = float('-inf')
+        angles = (20, -20, 35, -35, 55, -55, 80, -80, 110, -110, 145, -145)
+        heading = math.atan2(vy, vx)
+        for offset in angles:
+            candidate_heading = heading + math.radians(offset)
+            cand_vx = math.cos(candidate_heading) * speed
+            cand_vy = math.sin(candidate_heading) * speed
+            cand_probe_x = entity.position['x'] + math.cos(candidate_heading) * lookahead
+            cand_probe_y = entity.position['y'] + math.sin(candidate_heading) * lookahead
+            if not map_manager.is_segment_valid_for_radius(
+                entity.position['x'],
+                entity.position['y'],
+                cand_probe_x,
+                cand_probe_y,
+                collision_radius=collision_radius,
+            ):
+                continue
+            direction_score = (cand_vx * vx + cand_vy * vy) / max(speed * speed, 1e-6)
+            turn_penalty = abs(offset) / 180.0
+            score = direction_score - turn_penalty * 0.35
+            if score > best_score:
+                best_score = score
+                best_velocity = (cand_vx, cand_vy)
+        return best_velocity
 
     def _next_path_waypoint(self, entity, target_point, map_manager):
+        if self._is_target_reached(entity, target_point, map_manager):
+            self._clear_navigation_overlay_state(entity)
+            self._entity_path_state[entity.id] = {
+                'path': self.EMPTY_PATH_PREVIEW,
+                'index': 0,
+                'last_waypoint': None,
+            }
+            return float(entity.position['x']), float(entity.position['y'])
+
+        step_climb_state = getattr(entity, 'step_climb_state', None)
+        if step_climb_state:
+            forced = step_climb_state.get('end_point') or step_climb_state.get('top_point')
+            if forced is not None:
+                point = (float(forced[0]), float(forced[1]))
+                self._set_navigation_overlay_state(entity, waypoint=point, preview=(
+                    (float(entity.position['x']), float(entity.position['y'])),
+                    point,
+                    (float(target_point[0]), float(target_point[1])),
+                ), path_valid=True)
+                return point
+
         raster_version = getattr(map_manager, 'raster_version', 0)
         step_limit = float(getattr(entity, 'max_terrain_step_height_m', 0.05))
         traversal_profile = self._traversal_profile(entity)
         start_cell = self._path_cell(entity.position, map_manager)
         goal_cell = self._path_cell({'x': target_point[0], 'y': target_point[1]}, map_manager)
         state = self._entity_path_state.get(entity.id)
+        state_view = state or {}
         current_time = self._last_ai_update_time.get(entity.id, 0.0)
+        current_speed = math.hypot(float(getattr(entity, 'velocity', {}).get('vx', 0.0)), float(getattr(entity, 'velocity', {}).get('vy', 0.0)))
+        force_fresh_replan = False
         need_replan = state is None
         if not need_replan:
             need_replan = (
-                state.get('goal_cell') != goal_cell
-                or state.get('raster_version') != raster_version
-                or state.get('step_limit') != round(step_limit, 3)
-                or state.get('step_duration') != traversal_profile['step_climb_duration_sec']
-                or not state.get('path')
+                state_view.get('start_cell') != start_cell
+                or state_view.get('goal_cell') != goal_cell
+                or state_view.get('raster_version') != raster_version
+                or state_view.get('step_limit') != round(step_limit, 3)
+                or state_view.get('step_duration') != traversal_profile['step_climb_duration_sec']
+                or not state_view.get('path')
             )
+        if not need_replan:
+            planned_at = float(state_view.get('planned_at', current_time))
+            if current_time - planned_at >= max(0.08, self._path_replan_interval):
+                need_replan = True
+                force_fresh_replan = True
+        if not need_replan:
+            last_speed = float(state_view.get('last_speed', current_speed))
+            speed_delta = abs(current_speed - last_speed)
+            if speed_delta >= max(10.0, map_manager.terrain_grid_cell_size * 0.7):
+                need_replan = True
+                force_fresh_replan = True
+        if not need_replan:
+            waypoint = state_view.get('last_waypoint')
+            last_wp_distance = float(state_view.get('last_wp_distance', 0.0))
+            if waypoint is not None:
+                current_wp_distance = self._distance_to_point(entity, waypoint)
+                # 距离上个路点明显变大时，说明局部动态/避障已改变，需要重新 A* 优化。
+                if current_wp_distance > last_wp_distance + max(16.0, map_manager.terrain_grid_cell_size * 1.5):
+                    need_replan = True
+                    force_fresh_replan = True
+                if state is not None:
+                    state['last_wp_distance'] = current_wp_distance
+
+        stuck = self._stuck_state.get(entity.id)
+        if stuck is None:
+            stuck = {
+                'best_distance': float('inf'),
+                'last_progress_time': current_time,
+                'last_check_time': current_time,
+            }
+            self._stuck_state[entity.id] = stuck
+        if not need_replan:
+            active_index = max(1, min(int(state.get('index', 1)), max(len(state.get('path', [])) - 1, 1))) if state else 1
+            active_path = state.get('path', []) if state else []
+            if active_path:
+                probe_distance = self._distance_to_point(entity, active_path[active_index])
+                if probe_distance < float(stuck.get('best_distance', float('inf'))) - max(4.0, map_manager.terrain_grid_cell_size * 0.45):
+                    stuck['best_distance'] = probe_distance
+                    stuck['last_progress_time'] = current_time
+                elif current_time - float(stuck.get('last_progress_time', current_time)) >= 0.8:
+                    need_replan = True
+                    force_fresh_replan = True
+                    stuck['best_distance'] = probe_distance
+                    stuck['last_progress_time'] = current_time
+            stuck['last_check_time'] = current_time
 
         if need_replan:
-            cache_key = (start_cell, goal_cell, raster_version, round(step_limit, 3), traversal_profile['step_climb_duration_sec'])
-            path = self._path_cache.get(cache_key)
+            cache_key = (start_cell, goal_cell, raster_version, round(step_limit, 3), traversal_profile['step_climb_duration_sec'], round(traversal_profile.get('collision_radius', 0.0), 2))
+            path = None if force_fresh_replan else self._path_cache.get(cache_key)
             if path is None:
-                path = map_manager.find_path(
-                    (entity.position['x'], entity.position['y']),
-                    target_point,
-                    max_height_delta_m=step_limit,
-                    grid_step=max(map_manager.terrain_grid_cell_size * 3, 16),
-                    traversal_profile=traversal_profile,
-                )
+                path = self._search_navigation_path(entity, target_point, map_manager, step_limit, traversal_profile)
                 if len(self._path_cache) > 64:
                     self._path_cache.clear()
                 self._path_cache[cache_key] = path
@@ -1134,29 +1569,134 @@ class AIController:
                 'raster_version': raster_version,
                 'step_limit': round(step_limit, 3),
                 'step_duration': traversal_profile['step_climb_duration_sec'],
-                'path': list(path or []),
+                'path': tuple(path or self.EMPTY_PATH_PREVIEW),
                 'index': 1,
                 'planned_at': current_time,
+                'last_speed': current_speed,
+                'last_wp_distance': 0.0,
             }
             self._entity_path_state[entity.id] = state
+            self._stuck_state[entity.id] = {
+                'best_distance': float('inf'),
+                'last_progress_time': current_time,
+                'last_check_time': current_time,
+            }
+
+        if state is None:
+            self._clear_navigation_overlay_state(entity)
+            return float(entity.position['x']), float(entity.position['y'])
+
+        escape_waypoint = state.get('escape_waypoint') if state else None
+        escape_until = float(state.get('escape_until', 0.0)) if state else 0.0
+        if escape_waypoint is not None and current_time < escape_until:
+            self._set_navigation_overlay_state(entity, waypoint=escape_waypoint, preview=(
+                (float(entity.position['x']), float(entity.position['y'])),
+                (float(escape_waypoint[0]), float(escape_waypoint[1])),
+                (float(target_point[0]), float(target_point[1])),
+            ), path_valid=True)
+            return escape_waypoint
 
         path = state.get('path', [])
         if not path:
-            entity.ai_navigation_waypoint = None
-            entity.ai_path_preview = []
+            self._clear_navigation_overlay_state(entity)
+            self._stuck_state[entity.id] = {
+                'best_distance': float('inf'),
+                'last_progress_time': current_time,
+                'last_check_time': current_time,
+            }
             return entity.position['x'], entity.position['y']
         index = max(1, min(int(state.get('index', 1)), max(len(path) - 1, 1)))
-        advance_distance = max(10.0, map_manager.terrain_grid_cell_size * 1.5)
+        speed_lookahead = current_speed * max(0.08, self._ai_update_interval)
+        advance_distance = max(self._arrival_tolerance_world_units(map_manager), map_manager.terrain_grid_cell_size * 1.5 + speed_lookahead)
         while index < len(path) - 1 and self._distance_to_point(entity, path[index]) <= advance_distance:
             index += 1
+        direct_index = self._furthest_direct_path_index(entity, path, index, map_manager)
+        if direct_index > index:
+            index = direct_index
+        last_waypoint = state.get('last_waypoint')
+        if last_waypoint is not None and index < len(path):
+            if self._distance_to_point(entity, last_waypoint) > advance_distance * 0.65:
+                candidate_distance = math.hypot(path[index][0] - target_point[0], path[index][1] - target_point[1])
+                locked_distance = math.hypot(last_waypoint[0] - target_point[0], last_waypoint[1] - target_point[1])
+                if locked_distance <= candidate_distance + max(12.0, map_manager.terrain_grid_cell_size * 0.8):
+                    state['index'] = max(1, index - 1)
+                    index = state['index']
         state['index'] = index
-        preview = [
-            (float(entity.position['x']), float(entity.position['y']))
-        ]
-        preview.extend(path[index:min(len(path), index + 6)])
-        entity.ai_navigation_waypoint = path[index]
-        entity.ai_path_preview = preview
+        state['last_waypoint'] = path[index]
+        state['last_speed'] = current_speed
+        state['last_wp_distance'] = self._distance_to_point(entity, path[index])
+        if not self._can_directly_traverse(entity, path[index], map_manager):
+            refreshed_path = self._search_navigation_path(entity, target_point, map_manager, step_limit, traversal_profile)
+            state['path'] = tuple(refreshed_path or self.EMPTY_PATH_PREVIEW)
+            state['index'] = 1
+            state['planned_at'] = current_time
+            if not state['path']:
+                self._clear_navigation_overlay_state(entity)
+                return float(entity.position['x']), float(entity.position['y'])
+            path = state['path']
+            index = max(1, min(int(state.get('index', 1)), max(len(path) - 1, 1)))
+            state['last_waypoint'] = path[index]
+            state['last_wp_distance'] = self._distance_to_point(entity, path[index])
+        stuck = self._stuck_state.get(entity.id, {})
+        if current_time - float(stuck.get('last_progress_time', current_time)) >= 0.8:
+            escape_waypoint = self._build_escape_waypoint(entity, path[index], map_manager)
+            if escape_waypoint is not None:
+                state['escape_waypoint'] = escape_waypoint
+                state['escape_until'] = current_time + 0.55
+                self._set_navigation_overlay_state(entity, waypoint=escape_waypoint, preview=(
+                    (float(entity.position['x']), float(entity.position['y'])),
+                    (float(escape_waypoint[0]), float(escape_waypoint[1])),
+                    path[index],
+                ), path_valid=True)
+                return escape_waypoint
+        preview = ((float(entity.position['x']), float(entity.position['y'])),) + tuple(path[index:min(len(path), index + 6)])
+        self._set_navigation_overlay_state(entity, waypoint=path[index], preview=preview, path_valid=True)
         return path[index]
+
+    def _search_navigation_path(self, entity, target_point, map_manager, step_limit, traversal_profile):
+        base_steps = [max(map_manager.terrain_grid_cell_size * 4, 18), max(map_manager.terrain_grid_cell_size * 3, 14), max(map_manager.terrain_grid_cell_size * 2, 12)]
+        candidate_points = [target_point]
+        resolved_target = map_manager.find_nearest_passable_point(
+            target_point,
+            collision_radius=float(traversal_profile.get('collision_radius', 0.0)),
+            search_radius=max(72, map_manager.terrain_grid_cell_size * 10),
+            step=max(4, map_manager.terrain_grid_cell_size),
+        )
+        if resolved_target is not None and resolved_target != target_point:
+            candidate_points.append(resolved_target)
+        for candidate in candidate_points:
+            for grid_step in base_steps:
+                path = map_manager.find_path(
+                    (entity.position['x'], entity.position['y']),
+                    candidate,
+                    max_height_delta_m=step_limit,
+                    grid_step=grid_step,
+                    traversal_profile=traversal_profile,
+                )
+                if self._is_path_traversable(entity, path, map_manager):
+                    return tuple(path)
+        return self.EMPTY_PATH_PREVIEW
+
+    def _is_path_traversable(self, entity, path, map_manager):
+        if not path:
+            return False
+        previous_point = (float(entity.position['x']), float(entity.position['y']))
+        for point in path[1:]:
+            result = map_manager.evaluate_movement_path(
+                previous_point[0],
+                previous_point[1],
+                point[0],
+                point[1],
+                max_height_delta_m=float(getattr(entity, 'max_terrain_step_height_m', 0.05)),
+                collision_radius=float(getattr(entity, 'collision_radius', 0.0)),
+            )
+            if not result.get('ok'):
+                if result.get('reason') != 'height_delta' or not getattr(entity, 'can_climb_steps', False):
+                    return False
+                if map_manager.get_step_transition(previous_point[0], previous_point[1], point[0], point[1]) is None:
+                    return False
+            previous_point = (float(point[0]), float(point[1]))
+        return True
 
     def _path_cell(self, position, map_manager):
         step = max(map_manager.terrain_grid_cell_size * 2, 12)
@@ -1166,13 +1706,14 @@ class AIController:
         return {
             'can_climb_steps': bool(getattr(entity, 'can_climb_steps', False)),
             'step_climb_duration_sec': float(getattr(entity, 'step_climb_duration_sec', 2.0)),
+            'collision_radius': float(getattr(entity, 'collision_radius', 0.0)),
         }
 
     def _supply_claimable_ammo(self, entity, rules_engine, game_time):
         if rules_engine is None:
             return 0
         interval = float(rules_engine.rules.get('supply', {}).get('ammo_interval', 60.0))
-        ammo_gain = int(rules_engine.rules.get('supply', {}).get('ammo_gain', 100))
+        ammo_gain = int(rules_engine._supply_ammo_gain(entity)) if hasattr(rules_engine, '_supply_ammo_gain') else int(rules_engine.rules.get('supply', {}).get('ammo_gain', 100))
         if interval <= 0 or ammo_gain <= 0:
             return 0
         generated = int(game_time // interval) * ammo_gain
@@ -1200,9 +1741,10 @@ class AIController:
             ammo = getattr(member, 'ammo', 0)
             claimable = self._supply_claimable_ammo(member, rules_engine, game_time)
             heat_ratio = 0.0 if member.max_heat <= 0 else member.heat / max(member.max_heat, 1e-6)
-            return (claimable > 0, ammo <= 0, ammo < 20, heat_ratio < 0.8, -ammo)
-        candidates.sort(key=urgency, reverse=True)
-        return candidates[0]
+            ammo_kind_priority = 1 if getattr(member, 'ammo_type', '17mm') == '17mm' else 0
+            stable_id_priority = -sum(ord(char) for char in str(getattr(member, 'id', '')))
+            return (claimable > 0, ammo <= 0, ammo < 20, heat_ratio < 0.8, -ammo, ammo_kind_priority, stable_id_priority)
+        return max(candidates, key=urgency)
 
     def get_supply_slot(self, entity, map_manager):
         if map_manager is None:
@@ -1216,9 +1758,14 @@ class AIController:
             return None
         slots = self._facility_slots(facility)
         if not slots:
-            return self.facility_center(facility)
+            return self._facility_anchor_point(facility, map_manager, entity=entity)
         slot_index = self._stable_slot_index(entity.id, len(slots))
-        return slots[slot_index]
+        return map_manager.find_nearest_passable_point(
+            slots[slot_index],
+            collision_radius=float(getattr(entity, 'collision_radius', 0.0)),
+            search_radius=max(40, int(getattr(entity, 'collision_radius', 16.0) * 3.0)),
+            step=max(4, map_manager.terrain_grid_cell_size),
+        )
 
     def _facility_slots(self, facility):
         center_x, center_y = self.facility_center(facility)
@@ -1262,8 +1809,6 @@ class AIController:
         for other in entities:
             if other.id == entity.id or not other.is_alive() or not getattr(other, 'movable', True):
                 continue
-            if other.team != entity.team:
-                continue
 
             dx = entity.position['x'] - other.position['x']
             dy = entity.position['y'] - other.position['y']
@@ -1285,6 +1830,13 @@ class AIController:
                     lateral_x += (-dy / distance) * influence * side
                     lateral_y += (dx / distance) * influence * side
 
+        recovery_timer = float(getattr(entity, 'collision_recovery_timer', 0.0))
+        if recovery_timer > 0.0:
+            rec_x, rec_y = getattr(entity, 'collision_recovery_vector', (0.0, 0.0))
+            recovery_gain = min(1.0, recovery_timer / 0.5)
+            repulsion_x += rec_x * (0.9 + 0.6 * recovery_gain)
+            repulsion_y += rec_y * (0.9 + 0.6 * recovery_gain)
+
         adjusted_x = desired_x + repulsion_x * base_speed * 0.85 + lateral_x * base_speed * 0.45
         adjusted_y = desired_y + repulsion_y * base_speed * 0.85 + lateral_y * base_speed * 0.45
         adjusted_speed = math.hypot(adjusted_x, adjusted_y)
@@ -1305,5 +1857,78 @@ class AIController:
             return (-dx / distance) * speed, (-dy / distance) * speed
         return (-dy / distance) * (speed * 0.6), (dx / distance) * (speed * 0.6)
 
+    def _assault_anchor(self, entity, structure, map_manager, preferred_distance_m=3.0):
+        preferred_distance = self._meters_to_world_units(preferred_distance_m, map_manager)
+        dx = float(entity.position['x']) - float(structure.position['x'])
+        dy = float(entity.position['y']) - float(structure.position['y'])
+        length = math.hypot(dx, dy)
+        if length <= 1e-6:
+            dx, dy, length = 0.0, -1.0, 1.0
+        return (
+            float(structure.position['x']) + dx / length * preferred_distance,
+            float(structure.position['y']) + dy / length * preferred_distance,
+        )
+
+    def _furthest_direct_path_index(self, entity, path, current_index, map_manager):
+        if current_index >= len(path) - 1:
+            return current_index
+        furthest = current_index
+        for candidate_index in range(len(path) - 1, current_index, -1):
+            if self._can_directly_traverse(entity, path[candidate_index], map_manager):
+                furthest = candidate_index
+                break
+        return furthest
+
+    def _can_directly_traverse(self, entity, point, map_manager):
+        if map_manager is None or point is None:
+            return False
+        step_limit = float(getattr(entity, 'max_terrain_step_height_m', 0.05))
+        result = map_manager.evaluate_movement_path(
+            entity.position['x'],
+            entity.position['y'],
+            point[0],
+            point[1],
+            max_height_delta_m=step_limit,
+            collision_radius=float(getattr(entity, 'collision_radius', 0.0)),
+        )
+        if result.get('ok'):
+            return True
+        if result.get('reason') != 'height_delta' or not getattr(entity, 'can_climb_steps', False):
+            return False
+        return map_manager.get_step_transition(entity.position['x'], entity.position['y'], point[0], point[1]) is not None
+
+    def _find_team_facility(self, map_manager, team, facility_type):
+        if map_manager is None:
+            return None
+        for facility in map_manager.get_facility_regions(facility_type):
+            if facility.get('team') == team:
+                return facility
+        return None
+
+    def _facility_anchor_point(self, facility, map_manager, entity=None):
+        anchor = self.facility_center(facility)
+        if map_manager is None or anchor is None:
+            return anchor
+        collision_radius = float(getattr(entity, 'collision_radius', 0.0)) if entity is not None else 16.0
+        return map_manager.find_nearest_passable_point(
+            anchor,
+            collision_radius=collision_radius,
+            search_radius=max(48, int(collision_radius * 4.0)),
+            step=max(4, map_manager.terrain_grid_cell_size),
+        )
+
     def facility_center(self, facility):
+        points = facility.get('points', []) if isinstance(facility, dict) else []
+        if points:
+            sum_x = 0.0
+            sum_y = 0.0
+            valid_count = 0
+            for point in points:
+                if not isinstance(point, (list, tuple)) or len(point) < 2:
+                    continue
+                sum_x += float(point[0])
+                sum_y += float(point[1])
+                valid_count += 1
+            if valid_count > 0:
+                return int(round(sum_x / valid_count)), int(round(sum_y / valid_count))
         return int((facility['x1'] + facility['x2']) / 2), int((facility['y1'] + facility['y2']) / 2)

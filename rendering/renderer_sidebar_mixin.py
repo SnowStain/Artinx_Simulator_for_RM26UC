@@ -219,21 +219,18 @@ class RendererSidebarMixin:
         self.screen.blit(step_text, (panel_rect.x + 16, y + 4))
         y += 28
 
-        if self.terrain_workflow_mode == 'shape':
-            smooth_text = self.tiny_font.render(f'Smooth 强度: {self.terrain_smooth_strength}', True, self.colors['panel_text'])
-            self.screen.blit(smooth_text, (panel_rect.x + 16, y + 5))
-            smooth_minus_rect = pygame.Rect(panel_rect.x + 116, y + 1, 24, 22)
-            smooth_plus_rect = pygame.Rect(panel_rect.x + 146, y + 1, 24, 22)
-            smooth_apply_rect = pygame.Rect(panel_rect.x + 178, y, 88, 24)
-            pygame.draw.rect(self.screen, self.colors['toolbar_button'], smooth_minus_rect, border_radius=4)
-            pygame.draw.rect(self.screen, self.colors['toolbar_button'], smooth_plus_rect, border_radius=4)
-            self._draw_mode_button(smooth_apply_rect, 'Smooth', False)
-            self.screen.blit(self.tiny_font.render('-', True, self.colors['white']), (smooth_minus_rect.x + 8, smooth_minus_rect.y + 3))
-            self.screen.blit(self.tiny_font.render('+', True, self.colors['white']), (smooth_plus_rect.x + 7, smooth_plus_rect.y + 3))
-            self.panel_actions.append((smooth_minus_rect, 'terrain_smooth_strength:-1'))
-            self.panel_actions.append((smooth_plus_rect, 'terrain_smooth_strength:1'))
-            self.panel_actions.append((smooth_apply_rect, 'terrain_smooth_selected'))
-            y += 32
+        smooth_text = self.tiny_font.render('区域平滑: 先框选区域，再点 1-3', True, self.colors['panel_text'])
+        self.screen.blit(smooth_text, (panel_rect.x + 16, y + 5))
+        smooth_1_rect = pygame.Rect(panel_rect.x + 178, y, 28, 24)
+        smooth_2_rect = pygame.Rect(panel_rect.x + 212, y, 28, 24)
+        smooth_3_rect = pygame.Rect(panel_rect.x + 246, y, 28, 24)
+        self._draw_mode_button(smooth_1_rect, '1', self.terrain_smooth_strength == 1)
+        self._draw_mode_button(smooth_2_rect, '2', self.terrain_smooth_strength == 2)
+        self._draw_mode_button(smooth_3_rect, '3', self.terrain_smooth_strength == 3)
+        self.panel_actions.append((smooth_1_rect, 'terrain_smooth_apply:1'))
+        self.panel_actions.append((smooth_2_rect, 'terrain_smooth_apply:2'))
+        self.panel_actions.append((smooth_3_rect, 'terrain_smooth_apply:3'))
+        y += 32
 
         preview_height = 196
         preview_rect = pygame.Rect(panel_rect.x + 16, panel_rect.bottom - preview_height - 12, panel_rect.width - 32, preview_height)
@@ -242,7 +239,7 @@ class RendererSidebarMixin:
             '地形刷不再区分类型，只控制高度与半径。',
             '墙体、补给区、堡垒等特殊语义继续用上方“设施”工具编辑。',
             '刷出的统一地形默认可通行，用于快速塑形。',
-            '高级栏里的 Smooth 可拖框平滑已编辑格栅。',
+            '先用框选选中区域，再点 1/2/3 直接平滑。',
         ]
         for line in info_block:
             text = self.tiny_font.render(line, True, self.colors['panel_text'])
@@ -547,6 +544,7 @@ class RendererSidebarMixin:
             'buff_fort': (161, 129, 95),
             'buff_supply': (255, 229, 110),
             'buff_assembly': (255, 170, 66),
+            'buff_hero_deployment': (255, 122, 122),
             'buff_central_highland': (176, 132, 255),
             'buff_trapezoid_highland': (214, 130, 255),
             'buff_terrain_highland_red_start': (255, 168, 168),
@@ -666,6 +664,23 @@ class RendererSidebarMixin:
             self.screen.blit(text, (rect.x + 10, rect.y + 5))
             self.panel_actions.append((rect, f'entity:{index}'))
             y += 34
+
+        if 0 <= self.selected_entity_index < len(self.entity_keys):
+            team, key = self.entity_keys[self.selected_entity_index]
+            entity_id = f'{team}_{key}'
+            detail = game_engine.get_entity_detail_data(entity_id)
+            if detail is not None:
+                y += 10
+                title = self.small_font.render('当前实体状态', True, self.colors['panel_text'])
+                self.screen.blit(title, (panel_rect.x + 16, y))
+                y += 26
+                speed_text = f"实时速度: {detail.get('movement_speed_mps', 0.0):.2f} m/s"
+                hp_text = f"生命: {detail.get('health', 0.0):.0f}/{detail.get('max_health', 0.0):.0f}"
+                pos_text = f"位置: ({detail.get('position_x', 0.0):.0f}, {detail.get('position_y', 0.0):.0f})"
+                for line in (speed_text, hp_text, pos_text):
+                    text = self.tiny_font.render(line, True, self.colors['panel_text'])
+                    self.screen.blit(text, (panel_rect.x + 16, y))
+                    y += 18
 
     def render_rules_panel(self, game_engine, panel_rect):
         y = panel_rect.y + 56

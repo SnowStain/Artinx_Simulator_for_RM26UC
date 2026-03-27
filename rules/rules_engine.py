@@ -95,10 +95,12 @@ class RulesEngine:
                 'exchange': {
                     'ammo_cost': 10,
                     'interval_sec': 2.0,
-                    'remote_ammo_cost': 20,
+                    'remote_ammo_cost': 100,
                     'hp_cost': 20,
                     'remote_hp_cost': 30,
                     'revive_now_cost': 80,
+                    'auto_intervention_cost': 50,
+                    'semi_auto_intervention_cost': 0,
                     'local_17mm_unit': 10,
                     'local_42mm_unit': 1,
                     'remote_17mm_unit': 100,
@@ -152,6 +154,11 @@ class RulesEngine:
                 'range_falloff': 0.65,
                 'movement_penalty_factor': 0.04,
                 'aim_angle_penalty_deg': 90.0,
+                'autoaim_lock_duration': 0.6,
+                'fast_spin_hit_multiplier': 0.6,
+                'fast_spin_threshold_deg_per_sec': 300.0,
+                'evasive_spin_duration': 1.8,
+                'evasive_spin_rate_deg': 420.0,
             },
             'control_modes': {
                 'chassis': {
@@ -278,27 +285,39 @@ class RulesEngine:
             'energy_mechanism': {
                 'activation_distance_min_m': 4.0,
                 'activation_distance_max_m': 7.0,
+                'activation_anchor_radius_m': 2.2,
                 'activation_hold_sec': 10.0,
+                'activation_window_sec': 20.0,
                 'front_angle_deg': 55.0,
                 'buff_duration_sec': 45.0,
                 'damage_dealt_mult': 1.15,
                 'cooling_mult': 1.2,
                 'power_recovery_mult': 1.15,
-                'allowed_role_keys': ['engineer', 'infantry'],
+                'allowed_role_keys': ['hero', 'infantry', 'sentry'],
+                'small_opportunity_times_sec': [0.0, 90.0],
+                'large_opportunity_times_sec': [180.0, 255.0, 330.0],
+                'small_defense_mult': 0.75,
+                'small_buff_duration_sec': 45.0,
+                'large_duration_by_hits': {'5': 30.0, '6': 35.0, '7': 40.0, '8': 45.0, '9': 50.0, '10': 60.0},
+                'virtual_hits_per_sec': {'hero': 0.45, 'infantry': 0.36, 'sentry': 0.32},
             },
             'ammo_purchase': {
                 'purchase_interval_sec': 2.0,
-                '17mm_batch': 20,
-                '42mm_batch': 1,
-                '17mm_cost': 12.0,
-                '42mm_cost': 20.0,
+                '17mm_batch': 200,
+                '42mm_batch': 10,
+                '17mm_cost': 200.0,
+                '42mm_cost': 100.0,
+                'max_allowed_17mm': 200,
+                'max_allowed_42mm': 10,
                 'opening_targets': {
-                    'hero_42mm': 4,
-                    'infantry_17mm': 40,
+                    'hero_42mm': 10,
+                    'infantry_17mm': 100,
                 },
             },
             'supply': {
                     'ammo_gain': 100,
+                    'ammo_gain_17mm': 100,
+                    'ammo_gain_42mm': 10,
                     'ammo_interval': 60.0,
                     'heal_ratio_per_sec': 0.10,
                     'late_heal_ratio_per_sec': 0.25,
@@ -317,7 +336,19 @@ class RulesEngine:
                         'allow_enemy_capture_after_outpost_destroyed_sec': 300.0,
                         'enemy_allowed_role_keys': ['hero', 'engineer', 'infantry', 'sentry'],
                     },
-                    'buff_assembly': {'invincible': True, 'engineer_only': True, 'max_duration_sec': 180.0},
+                    'buff_assembly': {
+                        'team_locked': True,
+                        'engineer_only': True,
+                        'invincible': True,
+                        'max_duration_sec': 45.0,
+                    },
+                    'buff_hero_deployment': {
+                        'team_locked': True,
+                        'hero_only': True,
+                        'activation_delay_sec': 2.0,
+                        'damage_taken_mult': 0.75,
+                        'damage_dealt_mult': 1.5,
+                    },
                     'buff_terrain_highland_red_start': {'pair_role': 'start', 'pair_key': 'terrain_highland_red', 'team_locked': True, 'allowed_role_keys': ['hero', 'engineer', 'infantry', 'sentry'], 'sequence_timeout_sec': 5.0},
                     'buff_terrain_highland_red_end': {'pair_role': 'end', 'pair_key': 'terrain_highland_red', 'team_locked': True, 'allowed_role_keys': ['hero', 'engineer', 'infantry', 'sentry'], 'sequence_timeout_sec': 5.0, 'timed_effects': {'terrain_highland_defense': 30.0}},
                     'buff_terrain_highland_blue_start': {'pair_role': 'start', 'pair_key': 'terrain_highland_blue', 'team_locked': True, 'allowed_role_keys': ['hero', 'engineer', 'infantry', 'sentry'], 'sequence_timeout_sec': 5.0},
@@ -363,9 +394,16 @@ class RulesEngine:
             },
             'respawn': {
                 'robot_delay': 10.0,
-                'sentry_delay': 15.0,
+                'sentry_delay': 10.0,
                 'invincible_duration': 3.0,
-                'weaken_duration': 6.0,
+                'weaken_duration': 30.0,
+                'invalid_duration': 30.0,
+                'invalid_min_elapsed_before_release': 10.0,
+                'invalid_release_delay_after_safe_zone': 10.0,
+                'respawn_formula_remaining_time_threshold': 420.0,
+                'respawn_formula_remaining_time_divisor': 10.0,
+                'respawn_formula_instant_revive_addition': 20.0,
+                'fast_respawn_rate': 4.0,
                 'weaken_damage_taken_mult': 1.15,
                 'weaken_damage_dealt_mult': 0.7,
             },
@@ -445,7 +483,10 @@ class RulesEngine:
             },
         }
         self.radar_marks: Dict[str, float] = {}
-        self.energy_activation_progress = {}
+        self.energy_activation_progress = {
+            'red': self._make_energy_team_state(),
+            'blue': self._make_energy_team_state(),
+        }
         self.occupied_facilities = {
             'red': {'base': [], 'outpost': [], 'fly_slope': [], 'undulating_road': [], 'rugged_road': [], 'first_step': [], 'dog_hole': [], 'second_step': [], 'supply': [], 'fort': [], 'energy_mechanism': [], 'mining_area': [], 'mineral_exchange': []},
             'blue': {'base': [], 'outpost': [], 'fly_slope': [], 'undulating_road': [], 'rugged_road': [], 'first_step': [], 'dog_hole': [], 'second_step': [], 'supply': [], 'fort': [], 'energy_mechanism': [], 'mining_area': [], 'mineral_exchange': []},
@@ -454,6 +495,7 @@ class RulesEngine:
         self.auto_aim_max_distance = self._meters_to_world_units(self.rules['shooting']['auto_aim_max_distance_m'])
         self.collision_damage_cooldowns = {}
         self.game_time = 0.0
+        self.game_duration = float(self.rules.get('game_duration', 420.0))
 
     def load_damage_system(self):
         return deepcopy(self.rules['damage'])
@@ -654,6 +696,8 @@ class RulesEngine:
     def update(self, entities, map_manager=None, dt=0.02, game_time=0.0, game_duration=None):
         self.dt = dt
         self.game_time = game_time
+        if game_duration is not None:
+            self.game_duration = float(game_duration)
         self._latest_entities = list(entities)
         for entity in entities:
             if entity.type in {'robot', 'sentry'}:
@@ -719,11 +763,16 @@ class RulesEngine:
             entity.overheat_lock_timer = max(0.0, getattr(entity, 'overheat_lock_timer', 0.0) - dt)
             entity.invincible_timer = max(0.0, getattr(entity, 'invincible_timer', 0.0) - dt)
             entity.weak_timer = max(0.0, getattr(entity, 'weak_timer', 0.0) - dt)
+            if getattr(entity, 'respawn_invalid_timer', 0.0) > 0.0:
+                entity.respawn_invalid_timer = max(0.0, float(getattr(entity, 'respawn_invalid_timer', 0.0)) - dt)
+                entity.respawn_invalid_elapsed = float(getattr(entity, 'respawn_invalid_elapsed', 0.0)) + dt
             entity.terrain_buff_timer = max(0.0, getattr(entity, 'terrain_buff_timer', 0.0) - dt)
             entity.supply_cooldown = max(0.0, getattr(entity, 'supply_cooldown', 0.0) - dt)
             entity.exchange_cooldown = max(0.0, getattr(entity, 'exchange_cooldown', 0.0) - dt)
             entity.respawn_recovery_timer = max(0.0, getattr(entity, 'respawn_recovery_timer', 0.0) - dt)
             entity.role_purchase_cooldown = max(0.0, getattr(entity, 'role_purchase_cooldown', 0.0) - dt)
+            entity.energy_small_buff_timer = max(0.0, getattr(entity, 'energy_small_buff_timer', 0.0) - dt)
+            entity.energy_large_buff_timer = max(0.0, getattr(entity, 'energy_large_buff_timer', 0.0) - dt)
             entity.timed_buffs = {
                 key: max(0.0, float(value) - dt)
                 for key, value in dict(getattr(entity, 'timed_buffs', {})).items()
@@ -738,14 +787,15 @@ class RulesEngine:
             self._process_pending_rule_events(entity)
 
             if entity.state in {'respawning', 'destroyed'} and getattr(entity, 'respawn_timer', 0.0) > 0:
-                entity.respawn_timer = max(0.0, entity.respawn_timer - dt)
+                progress_rate = float(self.rules['respawn'].get('fast_respawn_rate', 4.0)) if self._is_fast_respawn_context(entity) else 1.0
+                entity.respawn_timer = max(0.0, entity.respawn_timer - dt * progress_rate)
                 if entity.respawn_timer <= 0:
                     self._respawn_entity(entity)
 
             if entity.state not in {'respawning', 'destroyed'}:
                 if entity.invincible_timer > 0:
                     entity.state = 'invincible'
-                elif entity.weak_timer > 0:
+                elif self._is_respawn_weak(entity):
                     entity.state = 'weak'
                 elif entity.state in {'invincible', 'weak'}:
                     entity.state = 'idle'
@@ -823,12 +873,19 @@ class RulesEngine:
         if self._primary_ammo_key(entity) is None:
             return 0
         interval = float(self.rules['supply'].get('ammo_interval', 60.0))
-        ammo_gain = int(self.rules['supply'].get('ammo_gain', 100))
+        ammo_gain = self._supply_ammo_gain(entity)
         if interval <= 0:
             return 0
         generated = int(self.game_time // interval) * ammo_gain
         claimed = int(getattr(entity, 'supply_ammo_claimed', 0))
         return max(0, generated - claimed)
+
+    def _supply_ammo_gain(self, entity):
+        supply_rules = self.rules.get('supply', {})
+        default_gain = int(supply_rules.get('ammo_gain', 100))
+        if getattr(entity, 'ammo_type', None) == '42mm':
+            return int(supply_rules.get('ammo_gain_42mm', max(1, default_gain // 10)))
+        return int(supply_rules.get('ammo_gain_17mm', default_gain))
 
     def _claim_supply_ammo(self, entity):
         claimable = self._supply_claimable_ammo(entity)
@@ -855,6 +912,7 @@ class RulesEngine:
         entity.dynamic_damage_dealt_mult = 1.0
         entity.dynamic_cooling_mult = 1.0
         entity.dynamic_power_recovery_mult = 1.0
+        entity.dynamic_power_capacity_mult = 1.0
         entity.dynamic_invincible = False
         entity.active_buff_labels = []
         self._expire_buff_path_progress(entity)
@@ -896,11 +954,116 @@ class RulesEngine:
             entity.dynamic_cooling_mult *= float(energy_rules.get('cooling_mult', 1.2))
             entity.dynamic_power_recovery_mult *= float(energy_rules.get('power_recovery_mult', 1.15))
             entity.active_buff_labels.append('中央能量机关增益')
+        if getattr(entity, 'energy_small_buff_timer', 0.0) > 0.0:
+            small_mult = float(self.rules.get('energy_mechanism', {}).get('small_defense_mult', 0.75))
+            entity.dynamic_damage_taken_mult *= small_mult
+            entity.active_buff_labels.append('小能量机关护甲增益')
+        if getattr(entity, 'energy_large_buff_timer', 0.0) > 0.0:
+            entity.dynamic_damage_dealt_mult *= float(getattr(entity, 'energy_large_damage_dealt_mult', 1.0))
+            entity.dynamic_damage_taken_mult *= float(getattr(entity, 'energy_large_damage_taken_mult', 1.0))
+            entity.dynamic_cooling_mult *= float(getattr(entity, 'energy_large_cooling_mult', 1.0))
+            entity.active_buff_labels.append('大能量机关增益')
+        if getattr(entity, 'hero_deployment_active', False):
+            entity.active_buff_labels.append('英雄部署模式')
+        if getattr(entity, 'respawn_invalid_timer', 0.0) > 0.0:
+            entity.active_buff_labels.append('复活无效态')
+        if self._is_respawn_weak(entity):
+            entity.active_buff_labels.append('复活虚弱态')
+
+    def _make_energy_team_state(self):
+        return {
+            'small_tokens': 0,
+            'large_tokens': 0,
+            'small_awarded': 0,
+            'large_awarded': 0,
+            'state': 'inactive',
+            'window_type': None,
+            'window_timer': 0.0,
+            'virtual_hits': 0.0,
+            'last_hit_count': 0,
+        }
+
+    def get_energy_mechanism_snapshot(self, team):
+        state = dict(self.energy_activation_progress.get(team, self._make_energy_team_state()))
+        state['can_activate'] = bool(state.get('small_tokens', 0) > 0 or state.get('large_tokens', 0) > 0 or state.get('state') == 'activating')
+        return state
+
+    def _energy_virtual_hits_per_sec(self, entity):
+        role_key = self._entity_role_key(entity)
+        rates = self.rules.get('energy_mechanism', {}).get('virtual_hits_per_sec', {})
+        return float(rates.get(role_key, rates.get('infantry', 0.36)))
+
+    def _energy_large_reward(self, hit_count):
+        hit_count = max(5, min(10, int(hit_count)))
+        if hit_count >= 9:
+            return {'damage_dealt_mult': 3.0, 'damage_taken_mult': 0.5, 'cooling_mult': 5.0}
+        if hit_count >= 8:
+            return {'damage_dealt_mult': 2.0, 'damage_taken_mult': 0.75, 'cooling_mult': 3.0}
+        if hit_count >= 7:
+            return {'damage_dealt_mult': 2.0, 'damage_taken_mult': 0.75, 'cooling_mult': 2.0}
+        return {'damage_dealt_mult': 1.5, 'damage_taken_mult': 0.75, 'cooling_mult': 2.0}
+
+    def _grant_small_energy_buff(self, entities, team):
+        duration = float(self.rules.get('energy_mechanism', {}).get('small_buff_duration_sec', 45.0))
+        for entity in entities:
+            if entity.team != team or entity.type not in {'robot', 'sentry'} or not entity.is_alive():
+                continue
+            entity.energy_small_buff_timer = max(float(getattr(entity, 'energy_small_buff_timer', 0.0)), duration)
+
+    def _grant_large_energy_buff(self, entities, team, hit_count):
+        duration_map = self.rules.get('energy_mechanism', {}).get('large_duration_by_hits', {})
+        duration = float(duration_map.get(str(int(hit_count)), duration_map.get('5', 30.0)))
+        reward = self._energy_large_reward(hit_count)
+        for entity in entities:
+            if entity.team != team or entity.type not in {'robot', 'sentry'} or not entity.is_alive():
+                continue
+            entity.energy_large_buff_timer = max(float(getattr(entity, 'energy_large_buff_timer', 0.0)), duration)
+            entity.energy_large_damage_dealt_mult = float(reward['damage_dealt_mult'])
+            entity.energy_large_damage_taken_mult = float(reward['damage_taken_mult'])
+            entity.energy_large_cooling_mult = float(reward['cooling_mult'])
 
     def _clear_negative_states(self, entity):
         entity.weak_timer = 0.0
+        entity.respawn_invalid_timer = 0.0
+        entity.respawn_invalid_elapsed = 0.0
+        entity.respawn_invalid_pending_release = False
+        entity.respawn_weak_active = False
+        entity.respawn_recovery_timer = 0.0
         if entity.state == 'weak':
             entity.state = 'idle'
+
+    def _is_respawn_weak(self, entity):
+        return bool(getattr(entity, 'respawn_weak_active', False) or getattr(entity, 'weak_timer', 0.0) > 0.0)
+
+    def _respawn_safe_zone_reached(self, entity, regions):
+        own_team = getattr(entity, 'team', None)
+        for region in regions:
+            if region.get('team') != own_team:
+                continue
+            if region.get('type') in {'supply', 'base'}:
+                return True
+            if region.get('type') == 'outpost' and self._structure_alive(own_team, 'outpost'):
+                return True
+        return False
+
+    def _is_fast_respawn_context(self, entity):
+        map_manager = self._map_manager()
+        if map_manager is not None and getattr(entity, 'respawn_position', None) is not None:
+            regions = map_manager.get_regions_at(entity.respawn_position['x'], entity.respawn_position['y'])
+            if any(region.get('type') == 'supply' and region.get('team') == entity.team for region in regions):
+                return True
+        own_base = self._find_entity(getattr(self, '_latest_entities', []), entity.team, 'base')
+        return own_base is not None and float(getattr(own_base, 'health', 0.0)) < 2000.0
+
+    def _calculate_respawn_read_duration(self, entity):
+        respawn_rules = self.rules['respawn']
+        base_delay = float(respawn_rules.get('robot_delay', 10.0))
+        remaining_time = max(0.0, float(getattr(self, 'game_duration', 0.0) or 0.0) - float(getattr(self, 'game_time', 0.0)))
+        remaining_threshold = float(respawn_rules.get('respawn_formula_remaining_time_threshold', 420.0))
+        remaining_divisor = max(float(respawn_rules.get('respawn_formula_remaining_time_divisor', 10.0)), 1e-6)
+        remaining_penalty = max(0.0, remaining_threshold - remaining_time) / remaining_divisor
+        instant_penalty = float(respawn_rules.get('respawn_formula_instant_revive_addition', 20.0)) * int(getattr(entity, 'instant_respawn_count', 0))
+        return max(base_delay, round(base_delay + remaining_penalty + instant_penalty))
 
     def _entity_role_key(self, entity):
         if entity.type == 'sentry':
@@ -943,6 +1106,9 @@ class RulesEngine:
         return True
 
     def _energy_front_descriptor(self, facility):
+        if facility.get('type') == 'energy_mechanism' and facility.get('shape', 'rect') == 'rect':
+            anchor_x, anchor_y = self._team_energy_anchor('red', facility)
+            return anchor_x, anchor_y, 0.0, 0.0
         center_x = (float(facility.get('x1', 0)) + float(facility.get('x2', 0))) / 2.0
         center_y = (float(facility.get('y1', 0)) + float(facility.get('y2', 0))) / 2.0
         points = list(facility.get('points', []))
@@ -972,14 +1138,27 @@ class RulesEngine:
         anchor_distance = self._meters_to_world_units(anchor_distance_m)
         return center_x + normal_x * anchor_distance, center_y + normal_y * anchor_distance
 
+    def _team_energy_anchor(self, team, facility):
+        if facility.get('type') == 'energy_mechanism' and facility.get('shape', 'rect') == 'rect':
+            if team == 'blue':
+                return 970.0, 770.0
+            return 579.0, 204.0
+        return self._energy_activation_anchor(facility)
+
     def _is_valid_energy_activator(self, entity, facility):
         if entity.type not in {'robot', 'sentry'} or not entity.is_alive():
+            return False
+        if entity.type == 'robot' and getattr(entity, 'robot_type', '') == '工程':
             return False
         energy_rules = self.rules.get('energy_mechanism', {})
         allowed_role_keys = set(energy_rules.get('allowed_role_keys', []))
         role_key = self._entity_role_key(entity)
         if allowed_role_keys and role_key not in allowed_role_keys:
             return False
+        if facility.get('type') == 'energy_mechanism' and facility.get('shape', 'rect') == 'rect':
+            anchor_x, anchor_y = self._team_energy_anchor(entity.team, facility)
+            radius = self._meters_to_world_units(float(energy_rules.get('activation_anchor_radius_m', 2.2)))
+            return math.hypot(float(entity.position['x']) - anchor_x, float(entity.position['y']) - anchor_y) <= radius
         center_x, center_y, normal_x, normal_y = self._energy_front_descriptor(facility)
         offset_x = float(entity.position['x']) - center_x
         offset_y = float(entity.position['y']) - center_y
@@ -993,37 +1172,80 @@ class RulesEngine:
         min_dot = math.cos(math.radians(float(energy_rules.get('front_angle_deg', 55.0))))
         return dot >= min_dot
 
-    def _grant_team_energy_buff(self, entities, team):
-        duration = float(self.rules.get('energy_mechanism', {}).get('buff_duration_sec', 45.0))
-        for entity in entities:
-            if entity.team != team or entity.type not in {'robot', 'sentry'} or not entity.is_alive():
-                continue
-            entity.timed_buffs['energy_mechanism_boost'] = max(float(entity.timed_buffs.get('energy_mechanism_boost', 0.0)), duration)
-
     def _update_energy_mechanism_control(self, entities, map_manager, dt):
         facilities = map_manager.get_facility_regions('energy_mechanism')
         if not facilities:
             return
-        hold_sec = float(self.rules.get('energy_mechanism', {}).get('activation_hold_sec', 10.0))
-        for facility in facilities:
-            facility_id = str(facility.get('id', 'energy_mechanism'))
-            progress = self.energy_activation_progress.setdefault(facility_id, {'red': 0.0, 'blue': 0.0})
-            active_teams = []
-            for team in ['red', 'blue']:
-                if any(self._is_valid_energy_activator(entity, facility) for entity in entities if entity.team == team):
-                    active_teams.append(team)
-            if len(active_teams) != 1:
-                progress['red'] = 0.0
-                progress['blue'] = 0.0
+        facility = facilities[0]
+        energy_rules = self.rules.get('energy_mechanism', {})
+        window_sec = float(energy_rules.get('activation_window_sec', 20.0))
+        small_times = list(energy_rules.get('small_opportunity_times_sec', [0.0, 90.0]))
+        large_times = list(energy_rules.get('large_opportunity_times_sec', [180.0, 255.0, 330.0]))
+        for team in ['red', 'blue']:
+            state = self.energy_activation_progress.setdefault(team, self._make_energy_team_state())
+            while state.get('small_awarded', 0) < len(small_times) and self.game_time >= float(small_times[state['small_awarded']]):
+                state['small_tokens'] = int(state.get('small_tokens', 0)) + 1
+                state['small_awarded'] = int(state.get('small_awarded', 0)) + 1
+            while state.get('large_awarded', 0) < len(large_times) and self.game_time >= float(large_times[state['large_awarded']]):
+                state['large_tokens'] = int(state.get('large_tokens', 0)) + 1
+                state['large_awarded'] = int(state.get('large_awarded', 0)) + 1
+
+            has_active_buff = any(
+                other.team == team and other.is_alive() and (
+                    float(getattr(other, 'energy_small_buff_timer', 0.0)) > 0.0
+                    or float(getattr(other, 'energy_large_buff_timer', 0.0)) > 0.0
+                )
+                for other in entities
+            )
+            if state.get('state') == 'activated' and not has_active_buff:
+                state['state'] = 'inactive'
+                state['window_type'] = None
+
+            valid_activators = [entity for entity in entities if entity.team == team and self._is_valid_energy_activator(entity, facility)]
+            if state.get('state') == 'inactive' and valid_activators:
+                window_type = None
+                if int(state.get('small_tokens', 0)) > 0:
+                    state['small_tokens'] -= 1
+                    window_type = 'small'
+                elif int(state.get('large_tokens', 0)) > 0:
+                    state['large_tokens'] -= 1
+                    window_type = 'large'
+                if window_type is not None:
+                    state['state'] = 'activating'
+                    state['window_type'] = window_type
+                    state['window_timer'] = window_sec
+                    state['virtual_hits'] = 0.0
+                    state['last_hit_count'] = 0
+                    self._log(f'{team} 方{ "小" if window_type == "small" else "大" }能量机关进入正在激活状态', team)
+
+            if state.get('state') != 'activating':
                 continue
-            active_team = active_teams[0]
-            other_team = 'blue' if active_team == 'red' else 'red'
-            progress[other_team] = 0.0
-            progress[active_team] = float(progress.get(active_team, 0.0)) + dt
-            if progress[active_team] >= hold_sec:
-                self._grant_team_energy_buff(entities, active_team)
-                self._log(f'{active_team} 方完成中央能量机关激活，获得团队增益', active_team)
-                progress[active_team] = 0.0
+
+            if valid_activators:
+                activator = valid_activators[0]
+                state['virtual_hits'] = float(state.get('virtual_hits', 0.0)) + self._energy_virtual_hits_per_sec(activator) * dt
+            state['window_timer'] = float(state.get('window_timer', 0.0)) - dt
+            if state['window_timer'] > 0.0:
+                continue
+
+            hit_count = max(0, min(10, int(round(float(state.get('virtual_hits', 0.0))))))
+            state['last_hit_count'] = hit_count
+            if state.get('window_type') == 'small' and hit_count >= 1:
+                self._grant_small_energy_buff(entities, team)
+                state['state'] = 'activated'
+                self._log(f'{team} 方完成小能量机关激活，获得全队防御增益', team)
+            elif state.get('window_type') == 'large' and hit_count >= 5:
+                self._grant_large_energy_buff(entities, team, hit_count)
+                state['state'] = 'activated'
+                self._log(f'{team} 方完成大能量机关激活，命中环数 {hit_count}', team)
+            else:
+                state['state'] = 'failed'
+                self._log(f'{team} 方能量机关激活失败，窗口结束', team)
+            state['window_type'] = None
+            state['window_timer'] = 0.0
+            state['virtual_hits'] = 0.0
+            if state['state'] == 'failed':
+                state['state'] = 'inactive'
 
     def _structure_alive(self, team, entity_type):
         for entity in getattr(self, '_latest_entities', []):
@@ -1076,6 +1298,8 @@ class RulesEngine:
         return inside
 
     def _buff_access_allowed(self, entity, region, buff_rules):
+        if self._is_respawn_weak(entity):
+            return False
         allowed_entity_types = set(buff_rules.get('allowed_entity_types', []))
         if allowed_entity_types and entity.type not in allowed_entity_types:
             return False
@@ -1156,10 +1380,13 @@ class RulesEngine:
         entity.mining_timer += dt
         if entity.mining_timer < max(0.1, entity.mining_target_duration):
             return
-        entity.carried_minerals += int(self.rules.get('mining', {}).get('minerals_per_trip', 1))
+        mined_amount = int(self.rules.get('mining', {}).get('minerals_per_trip', 1))
+        entity.carried_minerals += mined_amount
+        entity.carried_mineral_type = '标准矿石'
+        entity.mined_minerals_total = int(getattr(entity, 'mined_minerals_total', 0)) + mined_amount
         entity.mining_timer = 0.0
         entity.mining_target_duration = self._mining_duration(exchange=False)
-        self.team_minerals[entity.team] = self.team_minerals.get(entity.team, 0) + int(self.rules.get('mining', {}).get('minerals_per_trip', 1))
+        self.team_minerals[entity.team] = self.team_minerals.get(entity.team, 0) + mined_amount
         self._log(f'{entity.id} 在取矿区完成采矿，当前携带 {entity.carried_minerals} 单位矿物', entity.team)
 
     def _handle_exchange_zone(self, entity, region, dt):
@@ -1182,7 +1409,10 @@ class RulesEngine:
         self.team_gold[entity.team] += gold_gain
         entity.gold = self.team_gold[entity.team]
         self.team_minerals[entity.team] = max(0, self.team_minerals.get(entity.team, 0) - carried)
+        entity.exchanged_minerals_total = int(getattr(entity, 'exchanged_minerals_total', 0)) + carried
+        entity.exchanged_gold_total = float(getattr(entity, 'exchanged_gold_total', 0.0)) + gold_gain
         entity.carried_minerals = 0
+        entity.carried_mineral_type = None
         entity.exchange_timer = 0.0
         entity.exchange_target_duration = self._mining_duration(exchange=True)
         self._log(f'{entity.id} 在兑矿区完成兑矿，队伍获得 {gold_gain:.0f} 金币', entity.team)
@@ -1195,18 +1425,33 @@ class RulesEngine:
         purchase_rules = self.rules.get('ammo_purchase', {})
         ammo_type = getattr(entity, 'ammo_type', '17mm')
         if ammo_type == '42mm':
-            batch = int(purchase_rules.get('42mm_batch', 1))
-            cost = float(purchase_rules.get('42mm_cost', 20.0))
+            batch = int(purchase_rules.get('42mm_batch', 10))
+            batch_cost = float(purchase_rules.get('42mm_cost', 20.0))
+            max_allowed = int(purchase_rules.get('max_allowed_42mm', batch))
+            opening_cap = int(purchase_rules.get('opening_targets', {}).get('hero_42mm', max_allowed))
         else:
-            batch = int(purchase_rules.get('17mm_batch', 20))
-            cost = float(purchase_rules.get('17mm_cost', 12.0))
-        if batch <= 0 or self.team_gold.get(entity.team, 0.0) < cost:
+            batch = int(purchase_rules.get('17mm_batch', 200))
+            batch_cost = float(purchase_rules.get('17mm_cost', 12.0))
+            max_allowed = int(purchase_rules.get('max_allowed_17mm', batch))
+            opening_cap = int(purchase_rules.get('opening_targets', {}).get('infantry_17mm', max_allowed))
+        stock_cap = opening_cap if self.game_time <= 45.0 else max_allowed
+        current_stock = self._available_ammo(entity)
+        purchase_amount = min(batch, max(0, stock_cap - current_stock))
+        if batch <= 0 or purchase_amount <= 0:
             return 0
-        self.team_gold[entity.team] -= cost
+        unit_cost = batch_cost / max(batch, 1)
+        total_cost = unit_cost * purchase_amount
+        if self.team_gold.get(entity.team, 0.0) + 1e-6 < total_cost:
+            affordable_amount = int(self.team_gold.get(entity.team, 0.0) / max(unit_cost, 1e-6))
+            purchase_amount = min(purchase_amount, affordable_amount)
+            total_cost = unit_cost * purchase_amount
+        if purchase_amount <= 0:
+            return 0
+        self.team_gold[entity.team] -= total_cost
         entity.gold = self.team_gold[entity.team]
-        self._add_allowed_ammo(entity, batch, ammo_type)
+        self._add_allowed_ammo(entity, purchase_amount, ammo_type)
         entity.role_purchase_cooldown = float(purchase_rules.get('purchase_interval_sec', 2.0))
-        return batch
+        return purchase_amount
 
     def _apply_buff_region(self, entity, region, dt, active_regions=None):
         buff_rules = self.rules.get('buff_zones', {}).get(region.get('type'), {})
@@ -1217,7 +1462,8 @@ class RulesEngine:
             'buff_outpost': '前哨增益',
             'buff_fort': '堡垒增益点',
             'buff_supply': '补给增益点',
-            'buff_assembly': '装配增益点',
+            'buff_assembly': '工程装配区',
+            'buff_hero_deployment': '英雄部署区',
             'buff_central_highland': '中央高地',
             'buff_trapezoid_highland': '梯形高地',
             'buff_terrain_highland_red_start': '红方高地跨越起点',
@@ -1248,10 +1494,28 @@ class RulesEngine:
                     return
         if buff_rules.get('engineer_only') and getattr(entity, 'robot_type', '') != '工程':
             return
+        if buff_rules.get('hero_only') and getattr(entity, 'robot_type', '') != '英雄':
+            return
 
         label = label_map.get(region.get('type'))
         if label and label not in entity.active_buff_labels:
             entity.active_buff_labels.append(label)
+
+        if region.get('type') == 'buff_hero_deployment':
+            entity.hero_deployment_zone_active = True
+            delay_sec = float(buff_rules.get('activation_delay_sec', 2.0))
+            entity.hero_deployment_charge = min(delay_sec, float(getattr(entity, 'hero_deployment_charge', 0.0)) + dt)
+            if entity.hero_deployment_charge + 1e-6 < delay_sec:
+                entity.hero_deployment_active = False
+                entity.hero_deployment_state = 'deploying'
+                if '英雄部署准备' not in entity.active_buff_labels:
+                    entity.active_buff_labels.append('英雄部署准备')
+                return
+            entity.hero_deployment_active = True
+            entity.hero_deployment_state = 'deployed'
+            entity.dynamic_damage_taken_mult *= float(buff_rules.get('damage_taken_mult', 0.75))
+            entity.dynamic_damage_dealt_mult *= float(buff_rules.get('damage_dealt_mult', 1.5))
+            return
 
         if buff_rules.get('pair_role'):
             if not self._handle_paired_buff_region(entity, region, buff_rules):
@@ -1309,10 +1573,14 @@ class RulesEngine:
 
             posture_effect = self._resolve_posture_effect(entity)
             total_cooling_mult = posture_effect['cool_mult']
+            entity.dynamic_power_capacity_mult = float(posture_effect.get('power_mult', 1.0))
             if getattr(entity, 'fort_buff_active', False):
                 total_cooling_mult *= self.rules['fort']['cooling_mult']
             if getattr(entity, 'terrain_buff_timer', 0.0) > 0:
                 total_cooling_mult *= self.rules['terrain_cross']['cooling_mult']
+
+            effective_power_limit = max(0.0, float(getattr(entity, 'max_power', 0.0)) * float(getattr(entity, 'dynamic_power_capacity_mult', 1.0)))
+            entity.power = min(float(getattr(entity, 'power', 0.0)), effective_power_limit)
 
             base_cooling = entity.heat_dissipation_rate * dt
             desired_cooling = entity.heat_dissipation_rate * total_cooling_mult * dt
@@ -1326,6 +1594,8 @@ class RulesEngine:
         controllable_types = {'base', 'outpost', 'fly_slope', 'undulating_road', 'rugged_road', 'first_step', 'dog_hole', 'second_step', 'supply', 'fort', 'energy_mechanism', 'mining_area', 'mineral_exchange'}
         for entity in entities:
             if entity.type not in {'robot', 'sentry', 'engineer'} or not entity.is_alive():
+                continue
+            if self._is_respawn_weak(entity):
                 continue
 
             regions = map_manager.get_regions_at(entity.position['x'], entity.position['y'])
@@ -1348,6 +1618,11 @@ class RulesEngine:
 
             self._reset_dynamic_effects(entity)
             entity.fort_buff_active = False
+            entity.hero_deployment_zone_active = False
+            if getattr(entity, 'robot_type', '') != '英雄':
+                entity.hero_deployment_charge = 0.0
+                entity.hero_deployment_active = False
+                entity.hero_deployment_state = 'inactive'
 
             regions = map_manager.get_regions_at(entity.position['x'], entity.position['y'])
             facility = regions[0] if regions else None
@@ -1360,10 +1635,26 @@ class RulesEngine:
 
             for region in regions:
                 region_type = region.get('type')
+                if self._is_respawn_weak(entity) and self._respawn_safe_zone_reached(entity, regions):
+                    invalid_elapsed = float(getattr(entity, 'respawn_invalid_elapsed', 0.0))
+                    invalid_timer = float(getattr(entity, 'respawn_invalid_timer', 0.0))
+                    self._clear_negative_states(entity)
+                    min_elapsed = float(self.rules['respawn'].get('invalid_min_elapsed_before_release', 10.0))
+                    post_safe_delay = float(self.rules['respawn'].get('invalid_release_delay_after_safe_zone', 10.0))
+                    if invalid_elapsed >= min_elapsed:
+                        entity.respawn_invalid_timer = 0.0
+                    else:
+                        entity.respawn_invalid_timer = min(invalid_timer, post_safe_delay)
+                    entity.respawn_invalid_elapsed = invalid_elapsed
+                    entity.respawn_recovery_timer = entity.respawn_invalid_timer
+                    entity.state = 'idle'
+                    if entity.type == 'sentry':
+                        entity.front_gun_locked = False
+                    self._log(f'{entity.id} 到达己方安全区，解除复活虚弱', entity.team)
                 if region_type == 'fort' and region.get('team') == entity.team:
                     entity.fort_buff_active = True
                 if region_type == 'supply' and region.get('team') == entity.team:
-                    if entity.type == 'sentry' and getattr(entity, 'front_gun_locked', False):
+                    if entity.type == 'sentry' and getattr(entity, 'front_gun_locked', False) and not self._is_respawn_weak(entity):
                         entity.front_gun_locked = False
                         self._log(f'{entity.id} 返回己方补给区，前管重新解锁', entity.team)
                     heal_ratio = float(self.rules['supply'].get('heal_ratio_per_sec', 0.10))
@@ -1382,6 +1673,11 @@ class RulesEngine:
                     self._handle_exchange_zone(entity, region, dt)
                 elif region_type.startswith('buff_'):
                     self._apply_buff_region(entity, region, dt, regions)
+
+            if getattr(entity, 'robot_type', '') == '英雄' and not getattr(entity, 'hero_deployment_zone_active', False):
+                entity.hero_deployment_charge = 0.0
+                entity.hero_deployment_active = False
+                entity.hero_deployment_state = 'inactive'
 
             if facility and facility.get('type') in self.terrain_cross_types and self._terrain_access_allowed(entity, facility):
                 self._update_traversal_progress(entity, facility, dt)
@@ -1445,6 +1741,8 @@ class RulesEngine:
         for shooter in entities:
             if shooter.type not in {'robot', 'sentry'} or not shooter.is_alive():
                 continue
+            if self._is_respawn_weak(shooter):
+                continue
             if shooter.type == 'sentry' and getattr(shooter, 'front_gun_locked', False):
                 continue
             if getattr(shooter, 'fire_control_state', 'idle') != 'firing':
@@ -1469,9 +1767,13 @@ class RulesEngine:
                     self._mark_in_combat(shooter)
                     self._mark_in_combat(target)
                     target.take_damage(damage)
+                    self._trigger_evasive_spin(target, shooter)
 
     def _resolve_autoaim_target(self, shooter, entities):
         max_distance = self.get_range(shooter.type)
+        locked_target = self._get_locked_autoaim_target(shooter, entities, max_distance)
+        if locked_target is not None:
+            return locked_target
         target_id = None
         if isinstance(getattr(shooter, 'target', None), dict):
             target_id = shooter.target.get('id')
@@ -1481,6 +1783,8 @@ class RulesEngine:
                 if entity.id == target_id and entity.team != shooter.team and entity.is_alive():
                     distance = math.hypot(entity.position['x'] - shooter.position['x'], entity.position['y'] - shooter.position['y'])
                     if distance <= max_distance and self.can_track_target(shooter, entity, distance):
+                        shooter.autoaim_locked_target_id = entity.id
+                        shooter.autoaim_lock_timer = float(self.rules['shooting'].get('autoaim_lock_duration', 0.6))
                         return entity
 
         nearest = None
@@ -1496,7 +1800,25 @@ class RulesEngine:
             if nearest_distance is None or distance < nearest_distance:
                 nearest = entity
                 nearest_distance = distance
+        if nearest is not None:
+            shooter.autoaim_locked_target_id = nearest.id
+            shooter.autoaim_lock_timer = float(self.rules['shooting'].get('autoaim_lock_duration', 0.6))
         return nearest
+
+    def _get_locked_autoaim_target(self, shooter, entities, max_distance):
+        locked_target_id = getattr(shooter, 'autoaim_locked_target_id', None)
+        if locked_target_id is None or float(getattr(shooter, 'autoaim_lock_timer', 0.0)) <= 0.0:
+            return None
+        for entity in entities:
+            if entity.id != locked_target_id or entity.team == shooter.team or not entity.is_alive():
+                continue
+            distance = math.hypot(entity.position['x'] - shooter.position['x'], entity.position['y'] - shooter.position['y'])
+            if distance <= max_distance and self.can_track_target(shooter, entity, distance):
+                shooter.autoaim_lock_timer = float(self.rules['shooting'].get('autoaim_lock_duration', 0.6))
+                return entity
+        shooter.autoaim_locked_target_id = None
+        shooter.autoaim_lock_timer = 0.0
+        return None
 
     def _consume_shot(self, shooter):
         self._consume_allowed_ammo(shooter, getattr(shooter, 'ammo_per_shot', self.rules['shooting']['ammo_per_shot']))
@@ -1542,6 +1864,8 @@ class RulesEngine:
 
         probability = self._get_auto_aim_accuracy(distance, target)
         probability *= self._hit_probability_multiplier(shooter)
+        if self._is_fast_spinning_target(target):
+            probability *= float(self.rules['shooting'].get('fast_spin_hit_multiplier', 0.6))
         return max(0.0, min(1.0, probability))
 
     def _get_turret_angle_diff(self, shooter, target):
@@ -1592,6 +1916,40 @@ class RulesEngine:
             return 'translating_spin'
         return 'fixed'
 
+    def _is_fast_spinning_target(self, target):
+        if target is None:
+            return False
+        if float(getattr(target, 'evasive_spin_timer', 0.0)) > 0.0:
+            return True
+        if getattr(target, 'chassis_state', 'normal') == 'fast_spin':
+            return True
+        threshold = float(self.rules['shooting'].get('fast_spin_threshold_deg_per_sec', 300.0))
+        return abs(float(getattr(target, 'angular_velocity', 0.0))) >= threshold
+
+    def _trigger_evasive_spin(self, target, shooter):
+        if target is None or target.type not in {'robot', 'sentry'}:
+            return
+        ammo_type = getattr(shooter, 'ammo_type', '17mm') if shooter is not None else '17mm'
+        if ammo_type not in {'17mm', '42mm'}:
+            return
+        target.last_damage_source_id = getattr(shooter, 'id', None)
+        target.evasive_spin_timer = float(self.rules['shooting'].get('evasive_spin_duration', 1.8))
+        target.evasive_spin_rate_deg = float(self.rules['shooting'].get('evasive_spin_rate_deg', 420.0))
+        target_id = getattr(target, 'id', 0)
+        try:
+            parity_seed = int(target_id)
+        except (TypeError, ValueError):
+            parity_seed = sum(ord(char) for char in str(target_id))
+        direction = -1.0 if parity_seed % 2 == 0 else 1.0
+        if shooter is not None:
+            facing_rad = math.radians(float(getattr(target, 'angle', 0.0)))
+            relative_x = target.position['x'] - shooter.position['x']
+            relative_y = target.position['y'] - shooter.position['y']
+            cross = relative_x * math.sin(facing_rad) - relative_y * math.cos(facing_rad)
+            direction = 1.0 if cross >= 0.0 else -1.0
+        target.evasive_spin_direction = direction
+        target.chassis_state = 'fast_spin'
+
     def describe_target_motion(self, target):
         labels = {
             'fixed': '固定靶',
@@ -1606,7 +1964,7 @@ class RulesEngine:
             multiplier *= self.rules['fort']['hit_probability_mult']
         if getattr(shooter, 'terrain_buff_timer', 0.0) > 0:
             multiplier *= self.rules['terrain_cross']['hit_probability_mult']
-        if getattr(shooter, 'weak_timer', 0.0) > 0:
+        if self._is_respawn_weak(shooter):
             multiplier *= 0.75
         return multiplier
 
@@ -1655,7 +2013,7 @@ class RulesEngine:
         multiplier = float(getattr(shooter, 'dynamic_damage_dealt_mult', 1.0))
         if getattr(shooter, 'terrain_buff_timer', 0.0) > 0:
             multiplier *= self.rules['terrain_cross']['damage_dealt_mult']
-        if getattr(shooter, 'weak_timer', 0.0) > 0:
+        if self._is_respawn_weak(shooter):
             multiplier *= self.rules['respawn']['weaken_damage_dealt_mult']
         return multiplier
 
@@ -1669,7 +2027,7 @@ class RulesEngine:
             multiplier *= self.rules['fort']['damage_taken_mult']
         if getattr(target, 'terrain_buff_timer', 0.0) > 0:
             multiplier *= self.rules['terrain_cross']['damage_taken_mult']
-        if getattr(target, 'weak_timer', 0.0) > 0:
+        if self._is_respawn_weak(target):
             multiplier *= self.rules['respawn']['weaken_damage_taken_mult']
         if self.radar_marks.get(target.id, 0.0) >= 1.0:
             multiplier *= self.rules['radar']['vulnerability_mult']
@@ -1695,6 +2053,12 @@ class RulesEngine:
         entity.respawn_position = dict(getattr(entity, 'last_valid_position', entity.position))
         entity.invincible_timer = 0.0
         entity.weak_timer = 0.0
+        entity.respawn_invalid_timer = 0.0
+        entity.respawn_invalid_elapsed = 0.0
+        entity.respawn_invalid_pending_release = False
+        entity.respawn_weak_active = False
+        entity.respawn_mode = 'normal'
+        entity.respawn_recovery_timer = 0.0
         entity.fort_buff_active = False
         entity.terrain_buff_timer = 0.0
         entity.traversal_state = None
@@ -1703,6 +2067,15 @@ class RulesEngine:
         entity.timed_buffs = {}
         entity.buff_cooldowns = {}
         entity.buff_path_progress = {}
+        entity.energy_small_buff_timer = 0.0
+        entity.energy_large_buff_timer = 0.0
+        entity.energy_large_damage_dealt_mult = 1.0
+        entity.energy_large_damage_taken_mult = 1.0
+        entity.energy_large_cooling_mult = 1.0
+        entity.hero_deployment_charge = 0.0
+        entity.hero_deployment_active = False
+        entity.hero_deployment_zone_active = False
+        entity.hero_deployment_state = 'inactive'
         entity.carried_minerals = 0
         entity.mining_timer = 0.0
         entity.exchange_timer = 0.0
@@ -1715,8 +2088,7 @@ class RulesEngine:
             return
 
         if entity.type in {'robot', 'sentry'}:
-            delay_key = 'sentry_delay' if entity.type == 'sentry' else 'robot_delay'
-            entity.respawn_duration = self.rules['respawn'][delay_key]
+            entity.respawn_duration = self._calculate_respawn_read_duration(entity)
             entity.respawn_timer = entity.respawn_duration
             entity.state = 'respawning'
             if entity.type == 'sentry':
@@ -1727,7 +2099,7 @@ class RulesEngine:
         if entity.type == 'outpost':
             self._log(f'{entity.team}前哨站被摧毁！', entity.team)
 
-    def _respawn_entity(self, entity):
+    def _respawn_entity(self, entity, respawn_mode='normal'):
         respawn_position = dict(getattr(entity, 'respawn_position', entity.position))
         entity.position = respawn_position
         entity.previous_position = dict(respawn_position)
@@ -1743,22 +2115,47 @@ class RulesEngine:
         entity.angular_velocity = 0
         entity.respawn_timer = 0.0
         entity.respawn_duration = 0.0
-        entity.respawn_recovery_timer = float(self.rules['respawn']['weaken_duration'])
-        entity.invincible_timer = self.rules['respawn']['invincible_duration']
-        entity.weak_timer = self.rules['respawn']['weaken_duration']
+        entity.respawn_mode = respawn_mode
+        entity.respawn_invalid_elapsed = 0.0
+        entity.respawn_invalid_pending_release = False
+        entity.weak_timer = 0.0
+        if respawn_mode == 'instant':
+            entity.health = entity.max_health
+            entity.respawn_recovery_timer = 0.0
+            entity.invincible_timer = float(self.rules['respawn']['invincible_duration'])
+            entity.respawn_invalid_timer = 0.0
+            entity.respawn_weak_active = False
+        else:
+            entity.health = max(1.0, float(entity.max_health) * 0.10)
+            entity.respawn_recovery_timer = float(self.rules['respawn'].get('invalid_duration', 30.0))
+            entity.invincible_timer = 0.0
+            entity.respawn_invalid_timer = float(self.rules['respawn'].get('invalid_duration', 30.0))
+            entity.respawn_weak_active = True
         entity.death_handled = False
         entity.dynamic_invincible = False
         entity.active_buff_labels = []
         entity.timed_buffs = {}
         entity.buff_cooldowns = {}
         entity.buff_path_progress = {}
+        entity.energy_small_buff_timer = 0.0
+        entity.energy_large_buff_timer = 0.0
+        entity.energy_large_damage_dealt_mult = 1.0
+        entity.energy_large_damage_taken_mult = 1.0
+        entity.energy_large_cooling_mult = 1.0
+        entity.hero_deployment_charge = 0.0
+        entity.hero_deployment_active = False
+        entity.hero_deployment_zone_active = False
+        entity.hero_deployment_state = 'inactive'
         entity.carried_minerals = 0
         entity.mining_timer = 0.0
         entity.exchange_timer = 0.0
-        entity.state = 'invincible' if entity.invincible_timer > 0 else ('weak' if entity.weak_timer > 0 else 'idle')
+        entity.state = 'invincible' if entity.invincible_timer > 0 else ('weak' if self._is_respawn_weak(entity) else 'idle')
         if entity.type == 'sentry':
-            entity.front_gun_locked = True
-        self._log(f'{entity.id} 已在原地复活，开始回补给区恢复状态', entity.team)
+            entity.front_gun_locked = self._is_respawn_weak(entity)
+        if respawn_mode == 'instant':
+            self._log(f'{entity.id} 已立即复活，获得 3 秒无敌并恢复满血', entity.team)
+        else:
+            self._log(f'{entity.id} 已在原地复活，进入无效/虚弱阶段', entity.team)
 
     def get_initial_health(self, entity_type):
         if entity_type in self.health_system:
@@ -1778,10 +2175,19 @@ class RulesEngine:
         if getattr(sentry, 'posture_cooldown', 0.0) > 0:
             return {'ok': False, 'code': 'POSTURE_COOLDOWN'}
 
+        exchange = self.rules['sentry']['exchange']
+        intervention_key = 'semi_auto_intervention_cost' if getattr(sentry, 'sentry_mode', 'auto') == 'semi_auto' else 'auto_intervention_cost'
+        intervention_cost = float(exchange.get(intervention_key, 0.0))
+        if sentry.gold + 1e-6 < intervention_cost:
+            return {'ok': False, 'code': 'INSUFFICIENT_GOLD', 'need': intervention_cost, 'have': sentry.gold}
+        if intervention_cost > 0.0:
+            sentry.gold -= intervention_cost
+            self.team_gold[sentry.team] = sentry.gold
+
         sentry.posture = posture
         sentry.posture_cooldown = self.rules['sentry']['posture_cooldown']
         sentry.posture_active_time = 0.0
-        return {'ok': True, 'code': 'POSTURE_SWITCHED', 'posture': posture}
+        return {'ok': True, 'code': 'POSTURE_SWITCHED', 'posture': posture, 'cost': intervention_cost}
 
     def request_exchange(self, sentry, exchange_type, amount=1, target_entity=None):
         if sentry.type != 'sentry':
@@ -1811,7 +2217,9 @@ class RulesEngine:
             if not target_entity.is_alive():
                 return {'ok': False, 'code': 'TARGET_NOT_ALIVE'}
 
-        total_cost = costs[exchange_type] * amount
+        intervention_key = 'semi_auto_intervention_cost' if getattr(sentry, 'sentry_mode', 'auto') == 'semi_auto' else 'auto_intervention_cost'
+        intervention_cost = float(exchange.get(intervention_key, 0.0)) * amount
+        total_cost = intervention_cost
         if sentry.gold < total_cost:
             return {'ok': False, 'code': 'INSUFFICIENT_GOLD', 'need': total_cost, 'have': sentry.gold}
 
@@ -1848,7 +2256,8 @@ class RulesEngine:
             else:
                 sentry.heal(heal_amount)
         elif exchange_type == 'revive_now':
-            self._respawn_entity(sentry)
+            sentry.instant_respawn_count = int(getattr(sentry, 'instant_respawn_count', 0)) + 1
+            self._respawn_entity(sentry, respawn_mode='instant')
 
         return {
             'ok': True,
@@ -1866,8 +2275,17 @@ class RulesEngine:
         if getattr(sentry, 'respawn_timer', 0.0) > 0:
             return {'ok': False, 'code': 'RESPAWN_NOT_READY', 'time_left': sentry.respawn_timer}
 
+        exchange = self.rules['sentry']['exchange']
+        intervention_key = 'semi_auto_intervention_cost' if getattr(sentry, 'sentry_mode', 'auto') == 'semi_auto' else 'auto_intervention_cost'
+        intervention_cost = float(exchange.get(intervention_key, 0.0))
+        if sentry.gold + 1e-6 < intervention_cost:
+            return {'ok': False, 'code': 'INSUFFICIENT_GOLD', 'need': intervention_cost, 'have': sentry.gold}
+        if intervention_cost > 0.0:
+            sentry.gold -= intervention_cost
+            self.team_gold[sentry.team] = sentry.gold
+
         self._respawn_entity(sentry)
-        return {'ok': True, 'code': 'RESPAWN_CONFIRMED'}
+        return {'ok': True, 'code': 'RESPAWN_CONFIRMED', 'cost': intervention_cost}
 
     def get_referee_message(self, entities, map_manager, game_time, game_duration, focus_team='red'):
         sentry = self._find_entity(entities, focus_team, 'sentry')

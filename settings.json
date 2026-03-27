@@ -11,37 +11,37 @@
     "initial_positions": {
       "red": {
         "robot_1": {
-          "x": 143,
-          "y": 362
+          "x": 112,
+          "y": 379
         },
         "robot_2": {
-          "x": 200,
+          "x": 213,
           "y": 491
         },
         "robot_3": {
-          "x": 150,
-          "y": 521
+          "x": 162,
+          "y": 528
         },
         "robot_4": {
-          "x": 99,
-          "y": 475,
+          "x": 97,
+          "y": 489,
           "height": 1.0
         },
         "robot_7": {
-          "x": 233,
-          "y": 406,
+          "x": 239,
+          "y": 412,
           "angle": 67.63440000001025
         }
       },
       "blue": {
         "robot_1": {
-          "x": 1423,
-          "y": 513,
+          "x": 1426,
+          "y": 522,
           "angle": 180.0
         },
         "robot_2": {
-          "x": 1472,
-          "y": 487,
+          "x": 1474,
+          "y": 493,
           "angle": 180.0
         },
         "robot_3": {
@@ -156,10 +156,12 @@
       "exchange": {
         "ammo_cost": 10,
         "interval_sec": 2.0,
-        "remote_ammo_cost": 20,
+        "remote_ammo_cost": 100,
         "hp_cost": 20,
         "remote_hp_cost": 30,
         "revive_now_cost": 80,
+        "auto_intervention_cost": 50,
+        "semi_auto_intervention_cost": 0,
         "local_17mm_unit": 10,
         "local_42mm_unit": 1,
         "remote_17mm_unit": 100,
@@ -212,7 +214,12 @@
       "min_hit_probability": 0.1,
       "range_falloff": 0.65,
       "movement_penalty_factor": 0.04,
-      "aim_angle_penalty_deg": 90.0
+      "aim_angle_penalty_deg": 90.0,
+      "autoaim_lock_duration": 0.6,
+      "fast_spin_hit_multiplier": 0.6,
+      "fast_spin_threshold_deg_per_sec": 300.0,
+      "evasive_spin_duration": 1.8,
+      "evasive_spin_rate_deg": 420.0
     },
     "control_modes": {
       "chassis": {
@@ -639,30 +646,61 @@
     "energy_mechanism": {
       "activation_distance_min_m": 4.0,
       "activation_distance_max_m": 7.0,
+      "activation_anchor_radius_m": 2.2,
       "activation_hold_sec": 10.0,
+      "activation_window_sec": 20.0,
       "front_angle_deg": 55.0,
       "buff_duration_sec": 45.0,
       "damage_dealt_mult": 1.15,
       "cooling_mult": 1.2,
       "power_recovery_mult": 1.15,
       "allowed_role_keys": [
-        "engineer",
-        "infantry"
-      ]
+        "hero",
+        "infantry",
+        "sentry"
+      ],
+      "small_opportunity_times_sec": [
+        0.0,
+        90.0
+      ],
+      "large_opportunity_times_sec": [
+        180.0,
+        255.0,
+        330.0
+      ],
+      "small_defense_mult": 0.75,
+      "small_buff_duration_sec": 45.0,
+      "large_duration_by_hits": {
+        "5": 30.0,
+        "6": 35.0,
+        "7": 40.0,
+        "8": 45.0,
+        "9": 50.0,
+        "10": 60.0
+      },
+      "virtual_hits_per_sec": {
+        "hero": 0.45,
+        "infantry": 0.36,
+        "sentry": 0.32
+      }
     },
     "ammo_purchase": {
       "purchase_interval_sec": 2.0,
-      "17mm_batch": 20,
-      "42mm_batch": 1,
-      "17mm_cost": 12.0,
-      "42mm_cost": 20.0,
+      "17mm_batch": 200,
+      "42mm_batch": 10,
+      "17mm_cost": 200.0,
+      "42mm_cost": 100.0,
+      "max_allowed_17mm": 200,
+      "max_allowed_42mm": 10,
       "opening_targets": {
-        "hero_42mm": 4,
-        "infantry_17mm": 40
+        "hero_42mm": 10,
+        "infantry_17mm": 100
       }
     },
     "supply": {
       "ammo_gain": 100,
+      "ammo_gain_17mm": 100,
+      "ammo_gain_42mm": 10,
       "ammo_interval": 60.0,
       "heal_ratio_per_sec": 0.1,
       "late_heal_ratio_per_sec": 0.25,
@@ -713,9 +751,17 @@
         ]
       },
       "buff_assembly": {
-        "invincible": true,
+        "team_locked": true,
         "engineer_only": true,
-        "max_duration_sec": 180.0
+        "invincible": true,
+        "max_duration_sec": 45.0
+      },
+      "buff_hero_deployment": {
+        "team_locked": true,
+        "hero_only": true,
+        "activation_delay_sec": 2.0,
+        "damage_taken_mult": 0.75,
+        "damage_dealt_mult": 1.5
       },
       "buff_terrain_highland_red_start": {
         "pair_role": "start",
@@ -967,9 +1013,16 @@
     },
     "respawn": {
       "robot_delay": 10.0,
-      "sentry_delay": 15.0,
+      "sentry_delay": 10.0,
       "invincible_duration": 3.0,
-      "weaken_duration": 6.0,
+      "weaken_duration": 30.0,
+      "invalid_duration": 30.0,
+      "invalid_min_elapsed_before_release": 10.0,
+      "invalid_release_delay_after_safe_zone": 10.0,
+      "respawn_formula_remaining_time_threshold": 420.0,
+      "respawn_formula_remaining_time_divisor": 10.0,
+      "respawn_formula_instant_revive_addition": 20.0,
+      "fast_respawn_rate": 4.0,
       "weaken_damage_taken_mult": 1.15,
       "weaken_damage_dealt_mult": 0.7
     },
@@ -1049,7 +1102,9 @@
         "bullet_42mm": 200,
         "dart": 200,
         "collision": 2
-      }
+      },
+      "auto_intervention_cost": 50,
+      "semi_auto_intervention_cost": 0
     },
     "damage_system": "伤害机制.png",
     "health_system": "血量机制.png"

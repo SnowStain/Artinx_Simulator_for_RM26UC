@@ -20,8 +20,8 @@ class RendererDetailPopupMixin:
         overlay.fill((10, 14, 20, 120))
         self.screen.blit(overlay, (0, 0))
 
-        panel_width = min(540, self.window_width - 80)
-        panel_height = min(520, self.window_height - 80)
+        panel_width = min(560, self.window_width - 60)
+        panel_height = min(560, self.window_height - 60)
         panel_rect = pygame.Rect((self.window_width - panel_width) // 2, (self.window_height - panel_height) // 2, panel_width, panel_height)
         self.robot_detail_rect = panel_rect
         pygame.draw.rect(self.screen, self.colors['hud_panel'], panel_rect, border_radius=16)
@@ -40,12 +40,16 @@ class RendererDetailPopupMixin:
         status_items = [
             f"状态 {detail['state']}",
             '存活' if detail['alive'] else '已击毁',
-            '有枪管' if detail['has_barrel'] else '无枪管',
-            '前管锁定' if detail.get('front_gun_locked') else '前管可用',
-            f"火控 {detail['fire_control_state']}",
+            f"底盘 {self._format_chassis_state(detail.get('chassis_state', 'normal'))}",
         ]
+        if not detail.get('is_engineer'):
+            status_items.append('有枪管' if detail['has_barrel'] else '无枪管')
+            status_items.append('枪管锁定' if detail.get('front_gun_locked') else '枪管可用')
+            status_items.append(f"火控 {detail['fire_control_state']}")
         if detail.get('sentry_mode'):
             status_items.append(f"哨兵模式 {detail['sentry_mode']}")
+        if detail.get('is_hero'):
+            status_items.append(f"部署 {self._format_hero_deployment_state(detail.get('hero_deployment_state', 'inactive'))}")
         if detail['target_id']:
             status_items.append(f"目标 {detail['target_id']}")
         banner_rect = pygame.Rect(panel_rect.x + 20, panel_rect.y + 58, panel_rect.width - 40, 36)
@@ -83,64 +87,116 @@ class RendererDetailPopupMixin:
                 (gimbal_burst_rect, f"entity_mode:{detail['entity_id']}:gimbal_mode:{right_options[1][0]}"),
             ])
 
-        start_y = panel_rect.y + 136
-        row_gap = 24
-        left_lines = [
-            f"当前血量: {detail['health']:.0f} / {detail['max_health']:.0f}",
-            f"功率限制: {detail['power_limit']:.1f}",
-            f"当前功率: {detail['power']:.1f}",
-            f"功率恢复: {detail['power_recovery_rate']:.2f}/s",
-            f"底盘模式: {dict(detail.get('mode_labels', {}).get('left_options', [('health_priority', '血量优先'), ('power_priority', '功率优先')])).get(detail.get('chassis_mode'), detail.get('chassis_mode'))}",
-            f"热量限制: {detail['heat_limit']:.1f}",
-            f"当前热量: {detail['heat']:.1f}",
-            f"当前冷却速度: {detail['current_cooling_rate']:.2f}/s",
-            f"基础冷却速度: {detail['base_heat_dissipation_rate']:.2f}/s",
-        ]
-        right_lines = [
-            f"当前弹药: {detail['ammo']}",
-            f"17mm 发弹量: {detail.get('ammo_17mm', 0)}",
-            f"42mm 发弹量: {detail.get('ammo_42mm', 0)}",
-            f"规则射速: {detail['fire_rate_hz']:.2f} 发/s",
-            f"当前射速: {detail['effective_fire_rate_hz']:.2f} 发/s",
-            f"单发耗弹: {detail['ammo_per_shot']}",
-            f"单发功率: {detail['power_per_shot']:.1f}",
-            f"单发加热: {detail['heat_gain_per_shot']:.1f}",
-            f"模式二: {dict(detail.get('mode_labels', {}).get('right_options', [('cooling_priority', '冷却优先'), ('burst_priority', '爆发优先')])).get(detail.get('gimbal_mode'), detail.get('gimbal_mode'))}",
-            f"枪口冷却剩余: {detail['shot_cooldown']:.2f}s",
-            f"过热锁定剩余: {detail['overheat_lock_timer']:.2f}s",
-            f"自瞄距离: {detail['auto_aim_max_distance_m']:.2f}m",
-            f"自瞄视场: {detail['auto_aim_fov_deg']:.1f}°",
-        ]
-        extra_lines = [
+        bar_y = panel_rect.y + 142
+        bar_left = panel_rect.x + 24
+        bar_width = panel_rect.width - 48
+        self._draw_stat_bar(bar_left, bar_y, bar_width, '血量', detail['health'], detail['max_health'], (182, 67, 67))
+        self._draw_stat_bar(bar_left, bar_y + 34, bar_width, '热量', detail['heat'], detail['heat_limit'], (225, 145, 34))
+        self._draw_stat_bar(bar_left, bar_y + 68, bar_width, '功率', detail.get('movement_power_ratio', 0.0), 1.0, (70, 176, 220), value_text=f"{detail.get('movement_speed_ratio', 0.0) * 100:.0f}% 负载")
+
+        section_top = bar_y + 112
+        left_rect = pygame.Rect(panel_rect.x + 20, section_top, panel_rect.width // 2 - 26, panel_rect.bottom - section_top - 22)
+        right_rect = pygame.Rect(panel_rect.centerx + 6, section_top, panel_rect.width // 2 - 26, panel_rect.bottom - section_top - 22)
+
+        combat_lines = [
             f"姿态模式: {detail['posture']}",
+            f"底盘模式: {dict(detail.get('mode_labels', {}).get('left_options', [('health_priority', '血量优先'), ('power_priority', '功率优先')])).get(detail.get('chassis_mode'), detail.get('chassis_mode'))}",
+            f"冷却模式: {dict(detail.get('mode_labels', {}).get('right_options', [('cooling_priority', '冷却优先'), ('burst_priority', '爆发优先')])).get(detail.get('gimbal_mode'), detail.get('gimbal_mode'))}",
             f"脱战状态: {'是' if detail.get('out_of_combat') else '否'}",
-            f"姿态切换冷却: {detail['posture_cooldown']:.2f}s",
-            f"前管状态: {'锁定' if detail.get('front_gun_locked') else '解锁'}",
-            f"无敌剩余: {detail['invincible_timer']:.2f}s",
-            f"虚弱剩余: {detail['weak_timer']:.2f}s",
+            f"当前移速: {detail.get('movement_speed_mps', 0.0):.2f} m/s",
+            f"功率恢复: {detail['power_recovery_rate']:.2f}/s",
+            f"当前冷却: {detail['current_cooling_rate']:.2f}/s",
+            f"基础冷却: {detail['base_heat_dissipation_rate']:.2f}/s",
+            f"地形增益: {detail['terrain_buff_timer']:.2f}s",
             f"堡垒增益: {'是' if detail['fort_buff_active'] else '否'}",
-            f"地形增益剩余: {detail['terrain_buff_timer']:.2f}s",
-            f"携带矿物: {detail.get('carried_minerals', 0)}",
-            f"规则过热锁定时长: {detail['overheat_lock_duration']:.2f}s",
-            f"规则距离映射: {detail['auto_aim_max_distance_world']:.1f}单位",
         ]
-
-        for index, line in enumerate(left_lines):
-            text = self.small_font.render(line, True, self.colors['white'])
-            self.screen.blit(text, (left_x, start_y + index * row_gap))
-        for index, line in enumerate(right_lines):
-            text = self.small_font.render(line, True, self.colors['white'])
-            self.screen.blit(text, (right_x, start_y + index * row_gap))
-
-        extra_y = panel_rect.y + panel_rect.height - 108
-        for index, line in enumerate(extra_lines[:4]):
-            text = self.tiny_font.render(line, True, self.colors['white'])
-            self.screen.blit(text, (left_x, extra_y + index * 18))
-        for index, line in enumerate(extra_lines[4:]):
-            text = self.tiny_font.render(line, True, self.colors['white'])
-            self.screen.blit(text, (right_x, extra_y + index * 18))
+        if detail.get('is_hero'):
+            combat_lines.insert(3, f"部署状态: {self._format_hero_deployment_state(detail.get('hero_deployment_state', 'inactive'))}")
+            combat_lines.insert(4, f"部署进度: {detail.get('hero_deployment_charge', 0.0):.1f}/{detail.get('hero_deployment_delay', 2.0):.1f}s")
+        if detail.get('is_engineer'):
+            right_lines = [
+                f"携带矿物: {detail.get('carried_minerals', 0)}",
+                f"矿物类型: {detail.get('carried_mineral_type') or '无'}",
+                f"累计采矿: {detail.get('mined_minerals_total', 0)}",
+                f"累计兑矿: {detail.get('exchanged_minerals_total', 0)}",
+                f"累计金币: {detail.get('exchanged_gold_total', 0.0):.0f}",
+                f"目标: {detail.get('target_id') or '无'}",
+                f"无敌剩余: {detail['invincible_timer']:.2f}s",
+                f"无效剩余: {detail.get('respawn_invalid_timer', 0.0):.2f}s",
+                f"虚弱状态: {'是' if detail.get('respawn_weak_active') else '否'}",
+            ]
+            self._draw_info_section(left_rect, '机动状态', combat_lines)
+            self._draw_info_section(right_rect, '采矿状态', right_lines)
+        else:
+            weapon_lines = [
+                f"当前弹药: {detail['ammo']}",
+                f"17mm 弹量: {detail.get('ammo_17mm', 0)}",
+                f"42mm 弹量: {detail.get('ammo_42mm', 0)}",
+                f"枪管状态: {'锁定' if detail.get('front_gun_locked') else '可用'}",
+                f"规则射速: {detail['fire_rate_hz']:.2f} 发/s",
+                f"当前射速: {detail['effective_fire_rate_hz']:.2f} 发/s",
+                f"单发耗弹: {detail['ammo_per_shot']}",
+                f"单发功率: {detail['power_per_shot']:.1f}",
+                f"单发加热: {detail['heat_gain_per_shot']:.1f}",
+                f"枪口冷却: {detail['shot_cooldown']:.2f}s",
+                f"过热锁定: {detail['overheat_lock_timer']:.2f}s",
+                f"自瞄距离: {detail['auto_aim_max_distance_m']:.2f}m",
+                f"自瞄视场: {detail['auto_aim_fov_deg']:.1f}°",
+            ]
+            self._draw_info_section(left_rect, '机动状态', combat_lines)
+            self._draw_info_section(right_rect, '武器状态', weapon_lines)
 
         buff_labels = detail.get('active_buff_labels', [])
         if buff_labels:
-            buff_text = self.tiny_font.render('当前增益: ' + ' / '.join(buff_labels[:3]), True, self.colors['yellow'])
-            self.screen.blit(buff_text, (left_x, panel_rect.bottom - 22))
+            buff_text = self.tiny_font.render('当前增益: ' + ' / '.join(buff_labels[:4]), True, self.colors['yellow'])
+            self.screen.blit(buff_text, (panel_rect.x + 24, panel_rect.bottom - 18))
+
+    def _draw_stat_bar(self, x, y, width, label, value, maximum, color, value_text=None):
+        bar_rect = pygame.Rect(x, y + 16, width, 12)
+        ratio = 0.0
+        if isinstance(maximum, (int, float)) and maximum > 1e-6:
+            ratio = max(0.0, min(1.0, float(value) / float(maximum)))
+        label_text = self.small_font.render(label, True, self.colors['white'])
+        if value_text is None:
+            if isinstance(maximum, (int, float)) and maximum > 1e-6 and maximum != 1.0:
+                value_text = f"{float(value):.0f} / {float(maximum):.0f}"
+            else:
+                value_text = f"{ratio * 100:.0f}%"
+        value_surface = self.tiny_font.render(value_text, True, self.colors['white'])
+        self.screen.blit(label_text, (x, y))
+        self.screen.blit(value_surface, (x + width - value_surface.get_width(), y + 1))
+        pygame.draw.rect(self.screen, self.colors['toolbar_button'], bar_rect, border_radius=6)
+        fill_rect = pygame.Rect(bar_rect.x, bar_rect.y, max(6, int(bar_rect.width * ratio)) if ratio > 0.0 else 0, bar_rect.height)
+        if fill_rect.width > 0:
+            pygame.draw.rect(self.screen, color, fill_rect, border_radius=6)
+        pygame.draw.rect(self.screen, self.colors['panel_border'], bar_rect, 1, border_radius=6)
+
+    def _draw_info_section(self, rect, title, lines):
+        pygame.draw.rect(self.screen, self.colors['toolbar_button'], rect, border_radius=12)
+        pygame.draw.rect(self.screen, self.colors['panel_border'], rect, 1, border_radius=12)
+        title_surface = self.small_font.render(title, True, self.colors['white'])
+        self.screen.blit(title_surface, (rect.x + 12, rect.y + 10))
+        line_y = rect.y + 38
+        for line in lines:
+            if line_y + 18 > rect.bottom - 10:
+                break
+            text = self.tiny_font.render(line, True, self.colors['white'])
+            self.screen.blit(text, (rect.x + 12, line_y))
+            line_y += 18
+
+    def _format_chassis_state(self, state):
+        labels = {
+            'normal': '常规',
+            'spin': '小陀螺',
+            'fast_spin': '高速小陀螺',
+            'follow_turret': '跟随云台',
+        }
+        return labels.get(state, state)
+
+    def _format_hero_deployment_state(self, state):
+        labels = {
+            'inactive': '未部署',
+            'deploying': '部署中',
+            'deployed': '已部署',
+        }
+        return labels.get(state, state)

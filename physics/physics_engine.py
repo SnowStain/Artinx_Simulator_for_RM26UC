@@ -13,9 +13,11 @@ class PhysicsEngine:
         self.collision_damping = config.get('physics', {}).get('collision_damping', 0.8)
         self.step_height = config.get('physics', {}).get('step_height', 15)
         self.slope_limit = config.get('physics', {}).get('slope_limit', 30)
-        self.default_max_terrain_step_height_m = float(config.get('physics', {}).get('normal_max_terrain_step_height_m', 0.05))
+        self.default_max_terrain_step_height_m = float(config.get('physics', {}).get('normal_max_terrain_step_height_m', 0.23))
         self.default_step_climb_duration_sec = float(config.get('physics', {}).get('default_step_climb_duration_sec', 2.0))
-        self.infantry_step_climb_duration_sec = float(config.get('physics', {}).get('infantry_step_climb_duration_sec', 0.5))
+        self.infantry_step_climb_duration_sec = float(config.get('physics', {}).get('infantry_step_climb_duration_sec', 1.0))
+        self.max_collision_separation_m = float(config.get('physics', {}).get('max_collision_separation_m', 0.10))
+        self.collision_slop_m = float(config.get('physics', {}).get('collision_slop_m', 0.02))
 
     def _max_speed_world_units(self):
         field_length_m = float(self.config.get('map', {}).get('field_length_m', 28.0))
@@ -25,6 +27,15 @@ class PhysicsEngine:
         pixels_per_meter_x = map_width / max(field_length_m, 1e-6)
         pixels_per_meter_y = map_height / max(field_width_m, 1e-6)
         return self.max_speed * ((pixels_per_meter_x + pixels_per_meter_y) / 2.0)
+
+    def _meters_to_world_units(self, meters):
+        field_length_m = float(self.config.get('map', {}).get('field_length_m', 28.0))
+        field_width_m = float(self.config.get('map', {}).get('field_width_m', 15.0))
+        map_width = float(self.config.get('map', {}).get('width', 1576))
+        map_height = float(self.config.get('map', {}).get('height', 873))
+        pixels_per_meter_x = map_width / max(field_length_m, 1e-6)
+        pixels_per_meter_y = map_height / max(field_width_m, 1e-6)
+        return float(meters) * ((pixels_per_meter_x + pixels_per_meter_y) / 2.0)
     
     def update(self, entities, map_manager, rules_engine=None, dt=None):
         """更新物理状态"""
@@ -66,7 +77,11 @@ class PhysicsEngine:
         if not getattr(entity, 'collidable', True):
             return
         # 检查与地图的碰撞
-        if not map_manager.is_position_valid(entity.position['x'], entity.position['y']):
+        if not map_manager.is_position_valid_for_radius(
+            entity.position['x'],
+            entity.position['y'],
+            collision_radius=float(getattr(entity, 'collision_radius', 0.0)),
+        ):
             # 碰撞处理
             last_valid = dict(getattr(entity, 'last_valid_position', entity.position))
             entity.position['x'] = last_valid['x']
@@ -104,9 +119,9 @@ class PhysicsEngine:
             'dart': 5,
             'radar': 15
         }
-        
-        radius1 = radius_map.get(entity1.type, 10)
-        radius2 = radius_map.get(entity2.type, 10)
+
+        radius1 = float(getattr(entity1, 'collision_radius', radius_map.get(entity1.type, 10)))
+        radius2 = float(getattr(entity2, 'collision_radius', radius_map.get(entity2.type, 10)))
         
         return radius1 + radius2
     
@@ -130,19 +145,33 @@ class PhysicsEngine:
         
         # 计算重叠量
         overlap = min_distance - distance
+        separation_slop = self._meters_to_world_units(self.collision_slop_m)
+        max_separation = self._meters_to_world_units(self.max_collision_separation_m)
+        correction = min(max(0.0, overlap - separation_slop), max_separation)
+        if correction <= 1e-6:
+            correction = min(overlap, max_separation * 0.35)
         
         # 分离实体
         if entity1_movable and entity2_movable:
-            entity1.position['x'] -= nx * overlap * 0.5
-            entity1.position['y'] -= ny * overlap * 0.5
-            entity2.position['x'] += nx * overlap * 0.5
-            entity2.position['y'] += ny * overlap * 0.5
+            entity1.position['x'] -= nx * correction * 0.5
+            entity1.position['y'] -= ny * correction * 0.5
+            entity2.position['x'] += nx * correction * 0.5
+            entity2.position['y'] += ny * correction * 0.5
         elif entity1_movable:
-            entity1.position['x'] -= nx * overlap
-            entity1.position['y'] -= ny * overlap
+            entity1.position['x'] -= nx * correction
+            entity1.position['y'] -= ny * correction
         elif entity2_movable:
-            entity2.position['x'] += nx * overlap
-            entity2.position['y'] += ny * overlap
+            entity2.position['x'] += nx * correction
+            entity2.position['y'] += ny * correction
+
+        recover_scale = min(max(correction, 0.0) / max(min_distance, 1e-6), 0.18)
+        recover_timer = 0.22 + recover_scale * 0.28
+        if entity1_movable:
+            entity1.collision_recovery_timer = max(float(getattr(entity1, 'collision_recovery_timer', 0.0)), recover_timer)
+            entity1.collision_recovery_vector = (-nx * recover_scale, -ny * recover_scale)
+        if entity2_movable:
+            entity2.collision_recovery_timer = max(float(getattr(entity2, 'collision_recovery_timer', 0.0)), recover_timer)
+            entity2.collision_recovery_vector = (nx * recover_scale, ny * recover_scale)
         
         # 应用碰撞冲量
         vx1 = entity1.velocity['vx']
@@ -165,6 +194,8 @@ class PhysicsEngine:
         restitution = self.collision_damping
         j = -(1 + restitution) * v_rel_n
         j /= 1.0 + 1.0  # 假设质量相等
+        max_push_speed = self._meters_to_world_units(0.12)
+        j = min(j, max_push_speed)
         
         # 应用冲量
         if entity1_movable:
@@ -213,12 +244,26 @@ class PhysicsEngine:
         previous = dict(getattr(entity, 'previous_position', entity.position))
         current = entity.position
         step_limit = float(getattr(entity, 'max_terrain_step_height_m', self.default_max_terrain_step_height_m))
+        transition = None
+        if getattr(entity, 'can_climb_steps', False):
+            transition = map_manager.get_step_transition(
+                previous['x'],
+                previous['y'],
+                current['x'],
+                current['y'],
+                max_height_delta_m=step_limit,
+            )
+            if transition is not None:
+                self._begin_step_climb(entity, transition, map_manager, dt)
+                return
+
         path_result = map_manager.evaluate_movement_path(
             previous['x'],
             previous['y'],
             current['x'],
             current['y'],
             max_height_delta_m=step_limit,
+            collision_radius=float(getattr(entity, 'collision_radius', 0.0)),
         )
 
         if path_result.get('ok'):
@@ -226,8 +271,14 @@ class PhysicsEngine:
             entity.last_valid_position = dict(entity.position)
             return
 
-        if path_result.get('reason') == 'height_delta':
-            transition = map_manager.get_step_transition(previous['x'], previous['y'], current['x'], current['y'])
+        if path_result.get('reason') in {'height_delta', 'blocked'}:
+            transition = transition or map_manager.get_step_transition(
+                previous['x'],
+                previous['y'],
+                current['x'],
+                current['y'],
+                max_height_delta_m=step_limit,
+            )
             if transition is not None and getattr(entity, 'can_climb_steps', False):
                 self._begin_step_climb(entity, transition, map_manager, dt)
                 return
@@ -245,22 +296,37 @@ class PhysicsEngine:
             return float(getattr(entity, 'step_climb_duration_sec', self.infantry_step_climb_duration_sec))
         return float(getattr(entity, 'step_climb_duration_sec', self.default_step_climb_duration_sec))
 
+    def _normalize_angle_diff(self, angle_diff):
+        while angle_diff > 180.0:
+            angle_diff -= 360.0
+        while angle_diff < -180.0:
+            angle_diff += 360.0
+        return angle_diff
+
     def _begin_step_climb(self, entity, transition, map_manager, dt):
         state = getattr(entity, 'step_climb_state', None)
         if state is None or state.get('facility_id') != transition.get('facility_id'):
             start_point = (float(entity.previous_position['x']), float(entity.previous_position['y']))
             end_point = (float(transition.get('top_point')[0]), float(transition.get('top_point')[1]))
+            heading_dx = end_point[0] - start_point[0]
+            heading_dy = end_point[1] - start_point[1]
+            desired_heading_deg = math.degrees(math.atan2(heading_dy, heading_dx)) if abs(heading_dx) > 1e-6 or abs(heading_dy) > 1e-6 else float(getattr(entity, 'angle', 0.0))
+            requires_alignment = getattr(entity, 'robot_type', '') != '步兵'
             entity.step_climb_state = {
                 'facility_id': transition.get('facility_id'),
                 'facility_type': transition.get('facility_type'),
                 'progress': 0.0,
                 'duration': self._resolved_step_climb_duration(entity),
+                'phase': 'align' if requires_alignment else 'climb',
                 'start_point': start_point,
                 'approach_point': transition.get('approach_point'),
                 'top_point': transition.get('top_point'),
                 'end_point': end_point,
                 'start_height': map_manager.get_terrain_height_m(start_point[0], start_point[1]),
                 'end_height': map_manager.get_terrain_height_m(end_point[0], end_point[1]),
+                'desired_heading_deg': desired_heading_deg,
+                'align_tolerance_deg': 8.0,
+                'align_speed_deg_per_sec': 360.0,
             }
         self._update_step_climb(entity, map_manager, dt)
 
@@ -274,6 +340,28 @@ class PhysicsEngine:
         entity.velocity['vy'] = 0.0
         entity.velocity['vz'] = 0.0
         entity.angular_velocity = 0.0
+
+        phase = state.get('phase', 'climb')
+        desired_heading = float(state.get('desired_heading_deg', getattr(entity, 'angle', 0.0)))
+        if phase == 'align':
+            angle_diff = self._normalize_angle_diff(desired_heading - float(getattr(entity, 'angle', 0.0)))
+            tolerance = float(state.get('align_tolerance_deg', 8.0))
+            if abs(angle_diff) > tolerance:
+                turn_speed = float(state.get('align_speed_deg_per_sec', 360.0)) * float(dt)
+                turn_step = max(-turn_speed, min(turn_speed, angle_diff))
+                entity.angle = (float(getattr(entity, 'angle', 0.0)) + turn_step) % 360.0
+                entity.turret_angle = entity.angle
+                entity.position['x'] = start_point[0]
+                entity.position['y'] = start_point[1]
+                entity.position['z'] = float(state.get('start_height', map_manager.get_terrain_height_m(start_point[0], start_point[1])))
+                entity.last_valid_position = dict(entity.position)
+                entity.previous_position = dict(entity.position)
+                return True
+            state['phase'] = 'climb'
+            state['progress'] = 0.0
+            state['start_point'] = (float(entity.position['x']), float(entity.position['y']))
+            state['start_height'] = map_manager.get_terrain_height_m(entity.position['x'], entity.position['y'])
+
         state['progress'] = float(state.get('progress', 0.0)) + float(dt)
         duration = max(float(state.get('duration', self.default_step_climb_duration_sec)), 1e-6)
         ratio = max(0.0, min(1.0, state['progress'] / duration))
@@ -281,6 +369,8 @@ class PhysicsEngine:
         entity.position['x'] = start_point[0] + (end_point[0] - start_point[0]) * smooth_ratio
         entity.position['y'] = start_point[1] + (end_point[1] - start_point[1]) * smooth_ratio
         entity.position['z'] = float(state.get('start_height', 0.0)) + (float(state.get('end_height', 0.0)) - float(state.get('start_height', 0.0))) * smooth_ratio
+        entity.angle = desired_heading % 360.0
+        entity.turret_angle = entity.angle
         entity.last_valid_position = dict(entity.position)
         if ratio < 1.0:
             return True

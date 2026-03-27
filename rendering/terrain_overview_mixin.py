@@ -637,7 +637,7 @@ class TerrainOverviewMixin:
                 '滚轮改半径，Shift+滚轮改高度',
                 '高级模式保留圆形、矩形、多边形、直线、斜坡',
                 '斜坡: 先闭合区域，再左键两次设置坡向箭头',
-                'Smooth: 在高级栏选择后，拖框选中区域并执行平滑',
+                '平滑: 先框选区域，再点侧栏 1/2/3 直接平滑',
             ]
             for index, line in enumerate(lines):
                 font = self.small_font if index == 0 else self.tiny_font
@@ -844,7 +844,7 @@ class TerrainOverviewMixin:
             '框选: 左键拖框选择已编辑格栅',
             '刷子/橡皮擦: 左键连续涂抹；高级保留形状工具',
             '斜坡: 先闭合区域，再左键两次设置箭头方向',
-            'Smooth: 选择后拖框，对区域内已编辑格栅做平滑',
+            '平滑: 先框选区域，再点侧栏 1/2/3 直接平滑',
         ]):
             font = self.small_font if index == 0 else self.tiny_font
             surface.blit(font.render(line, True, self.colors['panel_text']), (rect.x + 10, y))
@@ -895,35 +895,19 @@ class TerrainOverviewMixin:
         surface.blit(self.tiny_font.render(f'分层步进: {self.height_layer_step_m:.2f}m', True, self.colors['panel_text']), (rect.x + 10, y + 2))
         y += 24
 
-        if self.terrain_workflow_mode == 'shape':
-            surface.blit(self.tiny_font.render(f'Smooth 强度: {self.terrain_smooth_strength}', True, self.colors['panel_text']), (rect.x + 10, y + 4))
-            smooth_minus_rect = pygame.Rect(rect.x + 98, y + 1, 22, 22)
-            smooth_plus_rect = pygame.Rect(rect.x + 126, y + 1, 22, 22)
-            smooth_apply_rect = pygame.Rect(rect.x + 154, y, 82, 24)
-            self._draw_surface_button(surface, smooth_minus_rect, '-', False)
-            self._draw_surface_button(surface, smooth_plus_rect, '+', False)
-            self._draw_surface_button(surface, smooth_apply_rect, 'Smooth', False)
-            self.terrain_overview_ui['buttons'].extend([
-                (smooth_minus_rect, 'terrain_smooth_strength:-1'),
-                (smooth_plus_rect, 'terrain_smooth_strength:1'),
-                (smooth_apply_rect, 'terrain_smooth_selected'),
-            ])
-            y += 30
-
-        if self.terrain_workflow_mode == 'shape':
-            surface.blit(self.tiny_font.render(f'Smooth 强度: {self.terrain_smooth_strength}', True, self.colors['panel_text']), (rect.x + 10, y + 4))
-            smooth_minus_rect = pygame.Rect(rect.x + 96, y + 1, 22, 22)
-            smooth_plus_rect = pygame.Rect(rect.x + 124, y + 1, 22, 22)
-            smooth_apply_rect = pygame.Rect(rect.x + 152, y, 82, 24)
-            self._draw_surface_button(surface, smooth_minus_rect, '-', False)
-            self._draw_surface_button(surface, smooth_plus_rect, '+', False)
-            self._draw_surface_button(surface, smooth_apply_rect, 'Smooth', False)
-            self.terrain_overview_ui['buttons'].extend([
-                (smooth_minus_rect, 'terrain_smooth_strength:-1'),
-                (smooth_plus_rect, 'terrain_smooth_strength:1'),
-                (smooth_apply_rect, 'terrain_smooth_selected'),
-            ])
-            y += 30
+        surface.blit(self.tiny_font.render('区域平滑: 先框选，再点 1-3', True, self.colors['panel_text']), (rect.x + 10, y + 4))
+        smooth_1_rect = pygame.Rect(rect.x + 152, y, 24, 24)
+        smooth_2_rect = pygame.Rect(rect.x + 180, y, 24, 24)
+        smooth_3_rect = pygame.Rect(rect.x + 208, y, 24, 24)
+        self._draw_surface_button(surface, smooth_1_rect, '1', self.terrain_smooth_strength == 1)
+        self._draw_surface_button(surface, smooth_2_rect, '2', self.terrain_smooth_strength == 2)
+        self._draw_surface_button(surface, smooth_3_rect, '3', self.terrain_smooth_strength == 3)
+        self.terrain_overview_ui['buttons'].extend([
+            (smooth_1_rect, 'terrain_smooth_apply:1'),
+            (smooth_2_rect, 'terrain_smooth_apply:2'),
+            (smooth_3_rect, 'terrain_smooth_apply:3'),
+        ])
+        y += 30
 
         for line in (
             '地形刷不再区分类型，只控制高度与半径。',

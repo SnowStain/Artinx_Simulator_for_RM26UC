@@ -25,6 +25,10 @@ class Entity:
         self.target = None
         self.movable = True
         self.collidable = True
+        self.collision_radius = 16.0
+        self.wheel_count = 4
+        self.collision_recovery_timer = 0.0
+        self.collision_recovery_vector = (0.0, 0.0)
         self.active_buff_labels = []
         
         # 底盘功率系统
@@ -57,22 +61,36 @@ class Entity:
         self.posture_cooldown = 0.0
         self.posture_active_time = 0.0
         self.ai_decision = ''
+        self.ai_behavior_node = ''
         self.ai_navigation_target = None
         self.ai_movement_target = None
         self.ai_navigation_waypoint = None
-        self.ai_path_preview = []
+        self.ai_path_preview = ()
+        self.ai_navigation_path_valid = False
         self.ai_navigation_velocity = (0.0, 0.0)
         self.search_angular_speed = 36.0
         self.fire_rate_hz = 8.0
         self.ammo_per_shot = 1
         self.power_per_shot = 6.0
+        self.autoaim_locked_target_id = None
+        self.autoaim_lock_timer = 0.0
         self.shot_cooldown = 0.0
         self.overheat_lock_timer = 0.0
+        self.evasive_spin_timer = 0.0
+        self.evasive_spin_direction = 1.0
+        self.evasive_spin_rate_deg = 420.0
+        self.last_damage_source_id = None
         self.respawn_timer = 0.0
         self.respawn_duration = 0.0
         self.respawn_recovery_timer = 0.0
         self.invincible_timer = 0.0
         self.weak_timer = 0.0
+        self.respawn_invalid_timer = 0.0
+        self.respawn_invalid_elapsed = 0.0
+        self.respawn_invalid_pending_release = False
+        self.respawn_weak_active = False
+        self.respawn_mode = 'normal'
+        self.instant_respawn_count = 0
         self.death_handled = False
         self.fort_buff_active = False
         self.terrain_buff_timer = 0.0
@@ -82,7 +100,7 @@ class Entity:
         self.last_combat_time = -1e9
         self.pending_rule_events = []
         self.traversal_state = None
-        self.max_terrain_step_height_m = 0.05
+        self.max_terrain_step_height_m = 0.23
         self.can_climb_steps = True
         self.step_climb_duration_sec = 2.0
         self.step_climb_state = None
@@ -90,12 +108,26 @@ class Entity:
         self.dynamic_damage_dealt_mult = 1.0
         self.dynamic_cooling_mult = 1.0
         self.dynamic_power_recovery_mult = 1.0
+        self.dynamic_power_capacity_mult = 1.0
         self.dynamic_invincible = False
         self.timed_buffs = {}
         self.buff_cooldowns = {}
         self.buff_path_progress = {}
+        self.energy_small_buff_timer = 0.0
+        self.energy_large_buff_timer = 0.0
+        self.energy_large_damage_dealt_mult = 1.0
+        self.energy_large_damage_taken_mult = 1.0
+        self.energy_large_cooling_mult = 1.0
         self.assembly_buff_time_used = 0.0
+        self.hero_deployment_charge = 0.0
+        self.hero_deployment_active = False
+        self.hero_deployment_zone_active = False
+        self.hero_deployment_state = 'inactive'
         self.carried_minerals = 0
+        self.carried_mineral_type = None
+        self.mined_minerals_total = 0
+        self.exchanged_minerals_total = 0
+        self.exchanged_gold_total = 0.0
         self.mining_timer = 0.0
         self.mining_target_duration = 0.0
         self.exchange_timer = 0.0
@@ -116,12 +148,23 @@ class Entity:
         # 更新角度
         self.angle += self.angular_velocity * dt
         self.angle %= 360
+
+        self.collision_recovery_timer = max(0.0, float(getattr(self, 'collision_recovery_timer', 0.0)) - dt)
+        if self.collision_recovery_timer <= 0.0:
+            self.collision_recovery_vector = (0.0, 0.0)
+
+        self.autoaim_lock_timer = max(0.0, float(getattr(self, 'autoaim_lock_timer', 0.0)) - dt)
+        if self.autoaim_lock_timer <= 0.0:
+            self.autoaim_locked_target_id = None
+
+        self.evasive_spin_timer = max(0.0, float(getattr(self, 'evasive_spin_timer', 0.0)) - dt)
         
         # 更新底盘功率（恢复）
         power_recovery_mult = max(0.0, float(getattr(self, 'dynamic_power_recovery_mult', 1.0)))
         self.power += self.power_recovery_rate * power_recovery_mult * dt
-        if self.power > self.max_power:
-            self.power = self.max_power
+        power_capacity = float(getattr(self, 'max_power', 0.0)) * max(0.0, float(getattr(self, 'dynamic_power_capacity_mult', 1.0)))
+        if self.power > power_capacity:
+            self.power = power_capacity
         
         # 更新枪管热量（消散）
         cooling_mult = max(0.0, float(getattr(self, 'dynamic_cooling_mult', 1.0)))

@@ -63,4 +63,6 @@ class Action(Node):
         self.handler = handler
 
     def tick(self, context):
+        if hasattr(context, 'data') and isinstance(context.data, dict):
+            context.data['bt_action_node'] = getattr(self.handler, '__name__', 'action')
         return self.handler(context)

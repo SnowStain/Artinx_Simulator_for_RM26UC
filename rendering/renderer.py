@@ -64,8 +64,10 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             {'id': 'buff_fort_blue', 'type': 'buff_fort', 'team': 'blue', 'label': '蓝方堡垒增益点'},
             {'id': 'buff_supply_red', 'type': 'buff_supply', 'team': 'red', 'label': '红方补给区增益点'},
             {'id': 'buff_supply_blue', 'type': 'buff_supply', 'team': 'blue', 'label': '蓝方补给区增益点'},
-            {'id': 'buff_assembly_red', 'type': 'buff_assembly', 'team': 'red', 'label': '红方装配区增益点'},
-            {'id': 'buff_assembly_blue', 'type': 'buff_assembly', 'team': 'blue', 'label': '蓝方装配区增益点'},
+            {'id': 'center_exchange_red', 'type': 'mineral_exchange', 'team': 'red', 'label': '红方中心兑矿区'},
+            {'id': 'center_exchange_blue', 'type': 'mineral_exchange', 'team': 'blue', 'label': '蓝方中心兑矿区'},
+            {'id': 'buff_hero_deployment_red', 'type': 'buff_hero_deployment', 'team': 'red', 'label': '红方英雄部署区'},
+            {'id': 'buff_hero_deployment_blue', 'type': 'buff_hero_deployment', 'team': 'blue', 'label': '蓝方英雄部署区'},
             {'id': 'buff_central_highland', 'type': 'buff_central_highland', 'team': 'neutral', 'label': '中央高地增益点'},
             {'id': 'buff_trapezoid_highland_red', 'type': 'buff_trapezoid_highland', 'team': 'red', 'label': '红方梯形高地增益点'},
             {'id': 'buff_trapezoid_highland_blue', 'type': 'buff_trapezoid_highland', 'team': 'blue', 'label': '蓝方梯形高地增益点'},
@@ -147,6 +149,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.facility_draw_shape = 'rect'
         self.map_cache_size = None
         self.map_cache_surface = None
+        self.ai_navigation_overlay_surface = None
+        self.ai_navigation_overlay_size = None
         self.terrain_3d_window = None
         self.terrain_3d_renderer = None
         self.terrain_3d_texture = None
@@ -563,6 +567,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             'mining_area': '取矿区',
             'mineral_exchange': '兑矿区',
             'energy_mechanism': '中央能量机关',
+            'buff_hero_deployment': '英雄部署区',
         }
         return fallback_map.get(region_type, region_id or region_type or '未知区域')
 
@@ -698,6 +703,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             'buff_fort': (161, 129, 95),
             'buff_supply': (255, 229, 110),
             'buff_assembly': (255, 170, 66),
+            'buff_hero_deployment': (255, 122, 122),
             'buff_central_highland': (176, 132, 255),
             'buff_trapezoid_highland': (214, 130, 255),
             'buff_terrain_highland_red_start': (255, 168, 168),
@@ -952,17 +958,28 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
     def render_ai_navigation_overlay(self, entities):
         if self.viewport is None:
             return
-        overlay = pygame.Surface((self.window_width, self.window_height), pygame.SRCALPHA)
+        overlay = None
         for entity in entities:
             if entity.type not in {'robot', 'sentry'} or not entity.is_alive():
                 continue
             navigation_target = getattr(entity, 'ai_navigation_target', None)
             movement_target = getattr(entity, 'ai_movement_target', None)
             waypoint = getattr(entity, 'ai_navigation_waypoint', None)
-            path_preview = list(getattr(entity, 'ai_path_preview', []))
+            path_preview = getattr(entity, 'ai_path_preview', ())
+            path_valid = bool(getattr(entity, 'ai_navigation_path_valid', False))
             velocity = getattr(entity, 'ai_navigation_velocity', (0.0, 0.0))
             if navigation_target is None and movement_target is None and waypoint is None and not path_preview:
                 continue
+            if not path_valid and waypoint is None and len(path_preview) < 2:
+                continue
+
+            if overlay is None:
+                size = (self.window_width, self.window_height)
+                if self.ai_navigation_overlay_surface is None or self.ai_navigation_overlay_size != size:
+                    self.ai_navigation_overlay_surface = pygame.Surface(size, pygame.SRCALPHA)
+                    self.ai_navigation_overlay_size = size
+                overlay = self.ai_navigation_overlay_surface
+                overlay.fill((0, 0, 0, 0))
 
             color_rgb = self.colors['red'] if entity.team == 'red' else self.colors['blue']
             arrow_color = (*color_rgb, 178)
@@ -976,7 +993,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                     pygame.draw.circle(overlay, (*color_rgb, 110), point, 3)
 
             marker_target = navigation_target or movement_target or waypoint
-            if marker_target is not None:
+            if path_valid and marker_target is not None:
                 marker_pos = self.world_to_screen(marker_target[0], marker_target[1])
                 pygame.draw.circle(overlay, (*color_rgb, 90), marker_pos, 11)
                 pygame.draw.circle(overlay, arrow_color, marker_pos, 11, 2)
@@ -985,11 +1002,11 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
 
             arrow_dx = float(velocity[0])
             arrow_dy = float(velocity[1])
-            if abs(arrow_dx) <= 1e-6 and abs(arrow_dy) <= 1e-6 and marker_target is not None:
+            if abs(arrow_dx) <= 1e-6 and abs(arrow_dy) <= 1e-6 and path_valid and marker_target is not None:
                 arrow_dx = marker_target[0] - entity.position['x']
                 arrow_dy = marker_target[1] - entity.position['y']
             arrow_len = math.hypot(arrow_dx, arrow_dy)
-            if arrow_len > 1e-6:
+            if path_valid and arrow_len > 1e-6:
                 scale = min(56.0, max(28.0, arrow_len * self.viewport['scale'] * 0.35)) / arrow_len
                 end_pos = (
                     center[0] + arrow_dx * scale,
@@ -1007,7 +1024,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                     end_pos[1] - math.sin(heading + math.pi / 6.0) * head_size,
                 )
                 pygame.draw.polygon(overlay, arrow_color, [end_pos, left, right])
-        self.screen.blit(overlay, (0, 0))
+        if overlay is not None:
+            self.screen.blit(overlay, (0, 0))
 
     def render_entity(self, entity):
         x, y = self.world_to_screen(entity.position['x'], entity.position['y'])
@@ -1035,9 +1053,10 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.render_entity_status(entity, x, y)
 
     def render_robot(self, entity, x, y, color):
-        radius = self.entity_radius['robot']
+        radius = self._entity_draw_radius(entity)
         chassis_rect = pygame.Rect(x - radius, y - radius + 2, radius * 2, radius + 6)
         pygame.draw.rect(self.screen, color, chassis_rect, border_radius=5)
+        self._render_wheels(entity, x, y, radius)
         if entity.robot_type == '工程':
             self.render_engineer_arm(entity, x, y, radius)
         else:
@@ -1079,7 +1098,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         pygame.draw.circle(self.screen, self.colors['white'], (x, y), radius // 2)
 
     def render_sentry(self, entity, x, y, color):
-        radius = self.entity_radius['sentry']
+        radius = self._entity_draw_radius(entity)
         chassis = [
             (x - radius, y + radius // 2),
             (x - radius // 2, y - radius + 2),
@@ -1088,6 +1107,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             (x, y + radius),
         ]
         pygame.draw.polygon(self.screen, color, chassis)
+        self._render_wheels(entity, x, y, radius)
         turret_angle = math.radians(getattr(entity, 'turret_angle', entity.angle))
         turret_center = (x, y - 2)
         pygame.draw.circle(self.screen, self.colors['white'], turret_center, radius // 2 + 2)
@@ -1095,6 +1115,38 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         end_y = turret_center[1] + math.sin(turret_angle) * (radius * 1.8)
         pygame.draw.line(self.screen, self.colors['black'], turret_center, (end_x, end_y), 3)
         pygame.draw.circle(self.screen, self.colors['black'], turret_center, 2)
+
+    def _entity_draw_radius(self, entity):
+        fallback = self.entity_radius['sentry'] if entity.type == 'sentry' else self.entity_radius['robot']
+        return int(max(8.0, float(getattr(entity, 'collision_radius', fallback)) * 0.55))
+
+    def _render_wheels(self, entity, x, y, radius):
+        wheel_count = int(getattr(entity, 'wheel_count', 4))
+        if wheel_count <= 0:
+            return
+        angle = math.radians(getattr(entity, 'angle', 0.0))
+        heading_x = math.cos(angle)
+        heading_y = math.sin(angle)
+        side_x = -heading_y
+        side_y = heading_x
+        wheel_radius = max(2, int(radius * 0.22))
+        wheel_color = (36, 36, 36)
+        if wheel_count <= 2:
+            offsets = [
+                (-side_x * radius * 0.95, -side_y * radius * 0.95),
+                (side_x * radius * 0.95, side_y * radius * 0.95),
+            ]
+        else:
+            front = radius * 0.65
+            side = radius * 0.9
+            offsets = [
+                (heading_x * front - side_x * side, heading_y * front - side_y * side),
+                (heading_x * front + side_x * side, heading_y * front + side_y * side),
+                (-heading_x * front - side_x * side, -heading_y * front - side_y * side),
+                (-heading_x * front + side_x * side, -heading_y * front + side_y * side),
+            ]
+        for offset_x, offset_y in offsets:
+            pygame.draw.circle(self.screen, wheel_color, (int(x + offset_x), int(y + offset_y)), wheel_radius)
 
     def render_outpost(self, entity, x, y, color):
         radius = self.entity_radius['outpost']
@@ -1481,20 +1533,22 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             game_engine.add_log(f'已删除 {removed_count} 个格栅地形', 'system')
         self._clear_terrain_selection()
 
-    def _smooth_selected_terrain_cells(self, game_engine):
+    def _smooth_selected_terrain_cells(self, game_engine, strength=None):
         selection = sorted(self._terrain_selection_keys())
         if not selection:
-            game_engine.add_log('请先框选需要 Smooth 的地形格栅', 'system')
+            game_engine.add_log('请先框选需要平滑的地形格栅', 'system')
             return
-        strength = max(1, min(3, int(getattr(self, 'terrain_smooth_strength', 1))))
-        self._record_undo_snapshot(game_engine, f'Smooth {len(selection)} 个格栅')
-        result = game_engine.map_manager.smooth_terrain_cells(selection, intensity=strength)
+        applied_strength = max(1, min(3, int(strength if strength is not None else getattr(self, 'terrain_smooth_strength', 1))))
+        self.terrain_smooth_strength = applied_strength
+        self._record_undo_snapshot(game_engine, f'平滑 {len(selection)} 个格栅')
+        result = game_engine.map_manager.smooth_terrain_cells(selection, intensity=applied_strength)
         if result.get('changed'):
             self.terrain_paint_dirty = True
             self._sync_terrain_grid_config(game_engine)
-            game_engine.add_log(f'已 Smooth {result.get("cell_count", 0)} 个格栅，强度 {strength}', 'system')
+            game_engine.config.setdefault('simulator', {})['terrain_smooth_strength'] = applied_strength
+            game_engine.add_log(f'已平滑 {result.get("cell_count", 0)} 个格栅，等级 {applied_strength}', 'system')
         else:
-            game_engine.add_log('选中区域未产生可见的 Smooth 变化', 'system')
+            game_engine.add_log('选中区域未产生可见的平滑变化', 'system')
 
     def _commit_terrain_line(self, game_engine, start, end):
         brush = self._selected_terrain_brush_def()
@@ -1952,6 +2006,10 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         if action == 'terrain_smooth_selected':
             self._smooth_selected_terrain_cells(game_engine)
             return
+        if action.startswith('terrain_smooth_apply:'):
+            strength = int(action.split(':', 1)[1])
+            self._smooth_selected_terrain_cells(game_engine, strength=strength)
+            return
         if action.startswith('delete_facility:'):
             facility_id = action.split(':', 1)[1]
             self._record_undo_snapshot(game_engine, f'删除设施 {facility_id}')
@@ -2360,7 +2418,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             if entity is None:
                 continue
             center_x, center_y = self.world_to_screen(entity.position['x'], entity.position['y'])
-            radius = self.entity_radius['sentry'] if entity.type == 'sentry' else self.entity_radius['robot']
+            radius = self._entity_draw_radius(entity)
             radius += 8
             if math.hypot(screen_pos[0] - center_x, screen_pos[1] - center_y) <= radius:
                 return entity, team, key

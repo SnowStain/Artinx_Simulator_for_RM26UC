@@ -734,17 +734,24 @@ class MapManager:
         rows = slice(y1, y2 + 1)
         cols = slice(x1, x2 + 1)
         terrain_type = cell.get('type', 'flat')
-        self.priority_map[rows, cols] = 0
-        self.terrain_type_map[rows, cols] = self.terrain_code_by_type.get(terrain_type, 0)
-        self.height_map[rows, cols] = round(float(cell.get('height_m', 0.0)), 2)
-        self.move_block_map[rows, cols] = bool(cell.get('blocks_movement', False))
+        override_height = round(float(cell.get('height_m', 0.0)), 2)
+        override_move_block = bool(cell.get('blocks_movement', False))
+        existing_move_block = self.move_block_map[rows, cols].copy()
+        preserve_block_mask = existing_move_block & (not override_move_block)
+
+        self.priority_map[rows, cols][~preserve_block_mask] = 0
+        self.terrain_type_map[rows, cols][~preserve_block_mask] = self.terrain_code_by_type.get(terrain_type, 0)
+        self.height_map[rows, cols] = np.where(
+            preserve_block_mask,
+            np.maximum(self.height_map[rows, cols], override_height),
+            override_height,
+        )
+        self.move_block_map[rows, cols] = existing_move_block | override_move_block
         if bool(cell.get('blocks_vision', False)):
             self.vision_block_height_map[rows, cols] = np.maximum(
                 self.vision_block_height_map[rows, cols],
-                round(float(cell.get('height_m', 0.0)), 2),
+                override_height,
             )
-        else:
-            self.vision_block_height_map[rows, cols] = 0.0
 
     def _rebuild_raster_layers(self):
         self._create_raster_layers()
@@ -1149,13 +1156,13 @@ class MapManager:
         start_world = self._nav_cell_center(start, step)
         goal_world = self._nav_cell_center(goal, step)
 
-        if not self._is_nav_cell_passable(start, step):
-            start = self._find_nearest_passable_nav_cell(start, step, search_radius=4)
+        if not self._is_nav_cell_passable(start, step, traversal_profile=traversal_profile):
+            start = self._find_nearest_passable_nav_cell(start, step, search_radius=6, traversal_profile=traversal_profile)
             if start is None:
                 return []
             start_world = self._nav_cell_center(start, step)
-        if not self._is_nav_cell_passable(goal, step):
-            goal = self._find_nearest_passable_nav_cell(goal, step, search_radius=4)
+        if not self._is_nav_cell_passable(goal, step, traversal_profile=traversal_profile):
+            goal = self._find_nearest_passable_nav_cell(goal, step, search_radius=6, traversal_profile=traversal_profile)
             if goal is None:
                 return []
             goal_world = self._nav_cell_center(goal, step)
@@ -1184,7 +1191,9 @@ class MapManager:
             for neighbor in self._iter_nav_neighbors(current):
                 if neighbor in closed:
                     continue
-                if not self._is_nav_cell_passable(neighbor, step):
+                if not self._is_nav_cell_passable(neighbor, step, traversal_profile=traversal_profile):
+                    continue
+                if not self._is_nav_transition_passable(current, neighbor, step, traversal_profile=traversal_profile):
                     continue
                 neighbor_world = self._nav_cell_center(neighbor, step)
                 neighbor_height = self.get_terrain_height_m(neighbor_world[0], neighbor_world[1])
@@ -1226,27 +1235,76 @@ class MapManager:
                     continue
                 yield cell[0] + offset_x, cell[1] + offset_y
 
-    def _is_nav_cell_passable(self, cell, step):
+    def _nav_cell_probe_points(self, center, clearance_radius):
+        probes = [(center[0], center[1])]
+        if clearance_radius <= 1.0:
+            return probes
+        offsets = [
+            (clearance_radius, 0.0),
+            (-clearance_radius, 0.0),
+            (0.0, clearance_radius),
+            (0.0, -clearance_radius),
+            (clearance_radius * 0.7, clearance_radius * 0.7),
+            (-clearance_radius * 0.7, clearance_radius * 0.7),
+            (clearance_radius * 0.7, -clearance_radius * 0.7),
+            (-clearance_radius * 0.7, -clearance_radius * 0.7),
+        ]
+        for offset_x, offset_y in offsets:
+            probe_x = min(max(0, int(round(center[0] + offset_x))), self.map_width - 1)
+            probe_y = min(max(0, int(round(center[1] + offset_y))), self.map_height - 1)
+            probes.append((probe_x, probe_y))
+        return probes
+
+    def _is_nav_cell_passable(self, cell, step, traversal_profile=None):
         max_cell_x = math.ceil(self.map_width / step)
         max_cell_y = math.ceil(self.map_height / step)
         if not (0 <= cell[0] < max_cell_x and 0 <= cell[1] < max_cell_y):
             return False
         center = self._nav_cell_center(cell, step)
-        sample = self.sample_raster_layers(center[0], center[1])
-        if sample['move_blocked']:
-            return False
+        traversal_profile = traversal_profile or {}
+        collision_radius = max(0.0, float(traversal_profile.get('collision_radius', 0.0)))
+        clearance_radius = max(0.0, collision_radius - float(step) * 0.25)
+        for probe_x, probe_y in self._nav_cell_probe_points(center, clearance_radius):
+            sample = self.sample_raster_layers(probe_x, probe_y)
+            if sample['move_blocked']:
+                return False
         return True
 
-    def _find_nearest_passable_nav_cell(self, cell, step, search_radius=4):
-        if self._is_nav_cell_passable(cell, step):
+    def _find_nearest_passable_nav_cell(self, cell, step, search_radius=4, traversal_profile=None):
+        if self._is_nav_cell_passable(cell, step, traversal_profile=traversal_profile):
             return cell
         for radius in range(1, search_radius + 1):
             for offset_y in range(-radius, radius + 1):
                 for offset_x in range(-radius, radius + 1):
                     candidate = cell[0] + offset_x, cell[1] + offset_y
-                    if self._is_nav_cell_passable(candidate, step):
+                    if self._is_nav_cell_passable(candidate, step, traversal_profile=traversal_profile):
                         return candidate
         return None
+
+    def _is_nav_transition_passable(self, current, neighbor, step, traversal_profile=None):
+        traversal_profile = traversal_profile or {}
+        delta_x = int(neighbor[0]) - int(current[0])
+        delta_y = int(neighbor[1]) - int(current[1])
+        if abs(delta_x) > 1 or abs(delta_y) > 1:
+            return False
+        if delta_x != 0 and delta_y != 0:
+            side_a = (current[0] + delta_x, current[1])
+            side_b = (current[0], current[1] + delta_y)
+            if not self._is_nav_cell_passable(side_a, step, traversal_profile=traversal_profile):
+                return False
+            if not self._is_nav_cell_passable(side_b, step, traversal_profile=traversal_profile):
+                return False
+        start_world = self._nav_cell_center(current, step)
+        end_world = self._nav_cell_center(neighbor, step)
+        collision_radius = float(traversal_profile.get('collision_radius', 0.0))
+        return self.is_segment_valid_for_radius(
+            start_world[0],
+            start_world[1],
+            end_world[0],
+            end_world[1],
+            collision_radius=collision_radius,
+            sample_stride=max(2.0, float(step) * 0.35),
+        )
 
     def _reconstruct_nav_path(self, came_from, current, step, start_point, end_point):
         cells = [current]
@@ -1257,7 +1315,41 @@ class MapManager:
         points = [start_point]
         points.extend(self._nav_cell_center(cell, step) for cell in cells[1:-1])
         points.append(end_point)
-        return points
+        return self._sparsify_nav_path(points, step)
+
+    def _sparsify_nav_path(self, points, step):
+        if len(points) <= 2:
+            return points
+        min_spacing = max(float(step) * 1.6, 24.0)
+        collinear_tol = max(float(step) * 0.35, 6.0)
+        simplified = [points[0]]
+        for index in range(1, len(points) - 1):
+            previous = simplified[-1]
+            current = points[index]
+            nxt = points[index + 1]
+            if math.hypot(current[0] - previous[0], current[1] - previous[1]) < min_spacing:
+                continue
+            if self._is_almost_collinear(previous, current, nxt, collinear_tol):
+                continue
+            simplified.append(current)
+        simplified.append(points[-1])
+        if len(simplified) > 2:
+            compact = [simplified[0]]
+            for point in simplified[1:-1]:
+                if math.hypot(point[0] - compact[-1][0], point[1] - compact[-1][1]) >= min_spacing:
+                    compact.append(point)
+            compact.append(simplified[-1])
+            simplified = compact
+        return simplified
+
+    def _is_almost_collinear(self, point_a, point_b, point_c, tolerance):
+        ab_x = float(point_b[0]) - float(point_a[0])
+        ab_y = float(point_b[1]) - float(point_a[1])
+        ac_x = float(point_c[0]) - float(point_a[0])
+        ac_y = float(point_c[1]) - float(point_a[1])
+        cross = abs(ab_x * ac_y - ab_y * ac_x)
+        baseline = max(math.hypot(ac_x, ac_y), 1e-6)
+        return (cross / baseline) <= float(tolerance)
 
     def _step_ascent_direction(self, facility):
         team = facility.get('team')
@@ -1268,54 +1360,149 @@ class MapManager:
         center_y = (facility['y1'] + facility['y2']) / 2.0
         return -1 if center_y >= self.map_height / 2.0 else 1
 
-    def _step_transition_for_facility(self, facility, from_x, from_y, to_x, to_y):
+    def _step_transition_for_facility(self, facility, from_x, from_y, to_x, to_y, max_height_delta_m=None):
         if facility.get('type') not in {'first_step', 'second_step'}:
             return None
         direction = self._step_ascent_direction(facility)
         center_x, center_y = self.facility_center(facility)
         width = max(1.0, abs(facility['x2'] - facility['x1']))
         margin = max(float(self.terrain_grid_cell_size) * 1.5, 12.0)
-        align_margin = max(width * 0.45, margin)
-        if abs(float(from_x) - center_x) > align_margin and abs(float(to_x) - center_x) > align_margin:
+        left_x = min(float(facility['x1']), float(facility['x2']))
+        right_x = max(float(facility['x1']), float(facility['x2']))
+        side_padding = min(width * 0.28, max(margin * 0.75, 10.0))
+        usable_left = min(center_x, right_x - 1.0) if right_x - left_x <= side_padding * 2.0 else left_x + side_padding
+        usable_right = max(center_x, left_x + 1.0) if right_x - left_x <= side_padding * 2.0 else right_x - side_padding
+        aligned_x = max(usable_left, min(usable_right, (float(from_x) + float(to_x)) * 0.5))
+        align_margin = max(width * 0.55, margin)
+        if abs(float(from_x) - aligned_x) > align_margin and abs(float(to_x) - aligned_x) > align_margin:
             return None
 
         if direction < 0:
             entry_y = float(facility['y2'])
             moving_ok = float(to_y) < float(from_y)
             crossing_ok = float(from_y) >= entry_y - margin and float(to_y) <= entry_y + margin
-            approach_point = (int(center_x), int(min(self.map_height - 1, facility['y2'] + margin)))
-            top_point = (int(center_x), int(max(facility['y1'], facility['y1'] + margin)))
+            near_entry = abs(float(from_y) - entry_y) <= margin * 1.6 or abs(float(to_y) - entry_y) <= margin * 1.6
+            approach_point = (int(round(aligned_x)), int(min(self.map_height - 1, float(facility['y2']) + margin)))
+            top_point = (int(round(aligned_x)), int(min(float(facility['y2']) - 1.0, float(facility['y1']) + margin)))
         else:
             entry_y = float(facility['y1'])
             moving_ok = float(to_y) > float(from_y)
             crossing_ok = float(from_y) <= entry_y + margin and float(to_y) >= entry_y - margin
-            approach_point = (int(center_x), int(max(0, facility['y1'] - margin)))
-            top_point = (int(center_x), int(min(facility['y2'], facility['y2'] - margin)))
+            near_entry = abs(float(from_y) - entry_y) <= margin * 1.6 or abs(float(to_y) - entry_y) <= margin * 1.6
+            approach_point = (int(round(aligned_x)), int(max(0, float(facility['y1']) - margin)))
+            top_point = (int(round(aligned_x)), int(max(float(facility['y1']) + 1.0, float(facility['y2']) - margin)))
 
-        if not moving_ok or not crossing_ok:
+        if not moving_ok or not (crossing_ok or near_entry):
             return None
         if not self._in_rect(to_x, to_y, facility):
             return None
+
+        approach_height_m = self.get_terrain_height_m(approach_point[0], approach_point[1])
+        top_height_m = self.get_terrain_height_m(top_point[0], top_point[1])
+        step_height_m = abs(float(top_height_m) - float(approach_height_m))
+        if step_height_m <= 1e-3:
+            return None
+        if max_height_delta_m is not None and step_height_m > float(max_height_delta_m) + 1e-6:
+            return None
+
         return {
             'facility_id': facility.get('id'),
             'facility_type': facility.get('type'),
             'approach_point': approach_point,
             'top_point': top_point,
             'direction': direction,
+            'step_height_m': round(step_height_m, 3),
         }
 
-    def get_step_transition(self, from_x, from_y, to_x, to_y):
+    def _terrain_step_transition(self, from_x, from_y, to_x, to_y, max_height_delta_m=None):
+        distance = math.hypot(float(to_x) - float(from_x), float(to_y) - float(from_y))
+        max_step_span = max(float(self.terrain_grid_cell_size) * 3.2, 56.0)
+        if distance <= 2.0 or distance > max_step_span:
+            return None
+
+        start_sample = self.sample_raster_layers(from_x, from_y)
+        end_sample = self.sample_raster_layers(to_x, to_y)
+        if start_sample['move_blocked'] or end_sample['move_blocked']:
+            return None
+
+        step_limit = float(max_height_delta_m if max_height_delta_m is not None else 0.23)
+        total_height = abs(float(end_sample['height_m']) - float(start_sample['height_m']))
+        if total_height <= 1e-3 or total_height > step_limit + 1e-6:
+            return None
+
+        stride = max(1.0, float(self.terrain_grid_cell_size) * 0.35)
+        sample_count = max(3, int(math.ceil(distance / stride)))
+        samples = []
+        for sample_index in range(sample_count + 1):
+            ratio = sample_index / sample_count
+            sample_x = float(from_x) + (float(to_x) - float(from_x)) * ratio
+            sample_y = float(from_y) + (float(to_y) - float(from_y)) * ratio
+            sample = self.sample_raster_layers(sample_x, sample_y)
+            samples.append({
+                'x': sample_x,
+                'y': sample_y,
+                'blocked': bool(sample['move_blocked']),
+                'height_m': float(sample['height_m']),
+            })
+
+        if any(sample['blocked'] for sample in samples):
+            return None
+
+        edge_start = None
+        edge_end = None
+        edge_threshold = max(0.02, min(step_limit * 0.35, 0.08))
+        for index in range(1, len(samples)):
+            previous = samples[index - 1]
+            current = samples[index]
+            delta = abs(float(current['height_m']) - float(previous['height_m']))
+            if delta >= edge_threshold:
+                if edge_start is None:
+                    edge_start = max(0, index - 1)
+                edge_end = index
+
+        if edge_start is None:
+            return None
+
+        edge_samples = max(1, edge_end - edge_start + 1)
+        if edge_samples > max(3, int(sample_count * 0.25)):
+            return None
+
+        approach_index = max(0, edge_start)
+        top_index = min(len(samples) - 1, edge_end)
+        approach = samples[approach_index]
+        top = samples[top_index]
+        edge_span = math.hypot(float(top['x']) - float(approach['x']), float(top['y']) - float(approach['y']))
+        if edge_span > max(float(self.terrain_grid_cell_size) * 1.8, 28.0):
+            return None
+
+        step_height_m = abs(float(top['height_m']) - float(approach['height_m']))
+        if step_height_m <= 1e-3 or step_height_m > step_limit + 1e-6:
+            return None
+
+        return {
+            'facility_id': 'terrain_step',
+            'facility_type': 'terrain_step',
+            'approach_point': (int(round(approach['x'])), int(round(approach['y']))),
+            'top_point': (int(round(top['x'])), int(round(top['y']))),
+            'direction': 0,
+            'step_height_m': round(step_height_m, 3),
+        }
+
+    def get_step_transition(self, from_x, from_y, to_x, to_y, max_height_delta_m=None):
+        terrain_transition = self._terrain_step_transition(from_x, from_y, to_x, to_y, max_height_delta_m=max_height_delta_m)
+        if terrain_transition is not None:
+            return terrain_transition
         for facility_type in ('first_step', 'second_step'):
             for facility in self.get_facility_regions(facility_type):
-                transition = self._step_transition_for_facility(facility, from_x, from_y, to_x, to_y)
+                transition = self._step_transition_for_facility(facility, from_x, from_y, to_x, to_y, max_height_delta_m=max_height_delta_m)
                 if transition is not None:
                     return transition
         return None
 
-    def evaluate_movement_path(self, from_x, from_y, to_x, to_y, max_height_delta_m=0.05):
+    def evaluate_movement_path(self, from_x, from_y, to_x, to_y, max_height_delta_m=0.05, collision_radius=0.0):
         start_sample = self.sample_raster_layers(from_x, from_y)
         end_sample = self.sample_raster_layers(to_x, to_y)
-        if end_sample['move_blocked']:
+        if not self.is_position_valid_for_radius(to_x, to_y, collision_radius=collision_radius):
             return {
                 'ok': False,
                 'reason': 'blocked',
@@ -1332,6 +1519,13 @@ class MapManager:
             ratio = step_index / sample_count
             sample_x = float(from_x) + (float(to_x) - float(from_x)) * ratio
             sample_y = float(from_y) + (float(to_y) - float(from_y)) * ratio
+            if not self.is_position_valid_for_radius(sample_x, sample_y, collision_radius=collision_radius):
+                return {
+                    'ok': False,
+                    'reason': 'blocked',
+                    'start_height_m': start_sample['height_m'],
+                    'end_height_m': end_sample['height_m'],
+                }
             sample = self.sample_raster_layers(sample_x, sample_y)
             if sample['move_blocked']:
                 return {
@@ -1363,6 +1557,51 @@ class MapManager:
         """检查位置是否有效（不在障碍物上）"""
         sample = self.sample_raster_layers(x, y)
         return not sample['move_blocked']
+
+    def is_position_valid_for_radius(self, x, y, collision_radius=0.0):
+        self._ensure_raster_layers()
+        if not (0 <= int(x) < self.map_width and 0 <= int(y) < self.map_height):
+            return False
+        clearance_radius = max(0.0, float(collision_radius) - float(self.terrain_grid_cell_size) * 0.25)
+        for probe_x, probe_y in self._nav_cell_probe_points((int(x), int(y)), clearance_radius):
+            sample = self.sample_raster_layers(probe_x, probe_y)
+            if sample['move_blocked']:
+                return False
+        return True
+
+    def is_segment_valid_for_radius(self, from_x, from_y, to_x, to_y, collision_radius=0.0, sample_stride=None):
+        self._ensure_raster_layers()
+        distance = math.hypot(float(to_x) - float(from_x), float(to_y) - float(from_y))
+        stride = max(1.0, float(sample_stride or self.terrain_grid_cell_size * 0.45))
+        sample_count = max(1, int(math.ceil(distance / stride)))
+        for sample_index in range(sample_count + 1):
+            ratio = sample_index / sample_count
+            sample_x = float(from_x) + (float(to_x) - float(from_x)) * ratio
+            sample_y = float(from_y) + (float(to_y) - float(from_y)) * ratio
+            if not self.is_position_valid_for_radius(sample_x, sample_y, collision_radius=collision_radius):
+                return False
+        return True
+
+    def find_nearest_passable_point(self, point, collision_radius=0.0, search_radius=96, step=6):
+        self._ensure_raster_layers()
+        if point is None:
+            return None
+        center_x = int(round(point[0]))
+        center_y = int(round(point[1]))
+        if self.is_position_valid_for_radius(center_x, center_y, collision_radius=collision_radius):
+            return center_x, center_y
+        step = max(1, int(step))
+        radius_limit = max(step, int(search_radius))
+        for radius in range(step, radius_limit + step, step):
+            for offset_y in range(-radius, radius + 1, step):
+                for offset_x in range(-radius, radius + 1, step):
+                    if abs(offset_x) != radius and abs(offset_y) != radius:
+                        continue
+                    candidate_x = min(max(0, center_x + offset_x), self.map_width - 1)
+                    candidate_y = min(max(0, center_y + offset_y), self.map_height - 1)
+                    if self.is_position_valid_for_radius(candidate_x, candidate_y, collision_radius=collision_radius):
+                        return candidate_x, candidate_y
+        return center_x, center_y
     
     def convert_world_to_screen(self, world_x, world_y):
         """将世界坐标转换为屏幕坐标"""

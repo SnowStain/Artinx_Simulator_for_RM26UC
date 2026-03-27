@@ -13,9 +13,13 @@ class EntityManager:
 
     def _rule_health(self, entity_type, fallback_max, fallback_initial):
         health_config = self.config.get('rules', {}).get('health', {}).get(entity_type, {})
+        dedicated_config = self.config.get('rules', {}).get(entity_type, {})
         return (
-            health_config.get('max_health', fallback_max),
-            health_config.get('initial_health', fallback_initial),
+            health_config.get('max_health', dedicated_config.get('max_health', fallback_max)),
+            health_config.get(
+                'initial_health',
+                dedicated_config.get('initial_health', health_config.get('max_health', dedicated_config.get('max_health', fallback_initial))),
+            ),
         )
 
     def _robot_role_key(self, robot_type):
@@ -117,16 +121,44 @@ class EntityManager:
     def _configure_mobility_profile(self, entity, entity_type, robot_type=None):
         entity.can_climb_steps = entity_type in {'robot', 'sentry'}
         if entity_type == 'sentry':
-            entity.step_climb_duration_sec = 2.0
+            entity.step_climb_duration_sec = 1.0
+            entity.max_terrain_step_height_m = 0.23
+            entity.collision_radius = 24.0
+            entity.wheel_count = 4
             return
         if entity_type != 'robot':
             entity.can_climb_steps = False
             entity.step_climb_duration_sec = 0.0
+            static_radius = {
+                'uav': 10.0,
+                'dart': 6.0,
+                'radar': 15.0,
+                'outpost': 50.0,
+                'base': 100.0,
+            }
+            entity.collision_radius = static_radius.get(entity_type, 10.0)
+            entity.wheel_count = 0
             return
         if robot_type == '步兵':
-            entity.step_climb_duration_sec = 0.5
+            entity.step_climb_duration_sec = 1.0
+            entity.max_terrain_step_height_m = 0.30
+            entity.collision_radius = 16.0
+            entity.wheel_count = 2
+        elif robot_type == '英雄':
+            entity.step_climb_duration_sec = 1.0
+            entity.max_terrain_step_height_m = 0.23
+            entity.collision_radius = 20.0
+            entity.wheel_count = 4
+        elif robot_type == '工程':
+            entity.step_climb_duration_sec = 1.0
+            entity.max_terrain_step_height_m = 0.23
+            entity.collision_radius = 21.0
+            entity.wheel_count = 4
         else:
-            entity.step_climb_duration_sec = 2.0
+            entity.step_climb_duration_sec = 1.0
+            entity.max_terrain_step_height_m = 0.23
+            entity.collision_radius = 18.0
+            entity.wheel_count = 4
     
     def create_entity(self, entity_id, entity_type, team, position, angle=0, robot_type=None):
         """创建单个实体"""
@@ -248,6 +280,11 @@ class EntityManager:
             if entity_id in self.entity_map:
                 continue
             facility = facility_map.get(facility_id)
+            if facility is None:
+                for candidate in self.config.get('map', {}).get('facilities', []):
+                    if candidate.get('type') == entity_type and candidate.get('team') == team:
+                        facility = candidate
+                        break
             if not facility:
                 continue
             position = {
@@ -328,10 +365,23 @@ class EntityManager:
                 'posture_active_time': entity.posture_active_time,
                 'shot_cooldown': entity.shot_cooldown,
                 'overheat_lock_timer': entity.overheat_lock_timer,
+                'autoaim_locked_target_id': entity.autoaim_locked_target_id,
+                'autoaim_lock_timer': entity.autoaim_lock_timer,
+                'evasive_spin_timer': entity.evasive_spin_timer,
+                'evasive_spin_direction': entity.evasive_spin_direction,
+                'evasive_spin_rate_deg': entity.evasive_spin_rate_deg,
+                'last_damage_source_id': entity.last_damage_source_id,
                 'respawn_timer': entity.respawn_timer,
                 'respawn_duration': entity.respawn_duration,
+                'respawn_recovery_timer': entity.respawn_recovery_timer,
                 'invincible_timer': entity.invincible_timer,
                 'weak_timer': entity.weak_timer,
+                'respawn_invalid_timer': entity.respawn_invalid_timer,
+                'respawn_invalid_elapsed': entity.respawn_invalid_elapsed,
+                'respawn_invalid_pending_release': entity.respawn_invalid_pending_release,
+                'respawn_weak_active': entity.respawn_weak_active,
+                'respawn_mode': entity.respawn_mode,
+                'instant_respawn_count': entity.instant_respawn_count,
                 'death_handled': entity.death_handled,
                 'fort_buff_active': entity.fort_buff_active,
                 'terrain_buff_timer': entity.terrain_buff_timer,
@@ -349,6 +399,7 @@ class EntityManager:
                 'dynamic_damage_dealt_mult': entity.dynamic_damage_dealt_mult,
                 'dynamic_cooling_mult': entity.dynamic_cooling_mult,
                 'dynamic_power_recovery_mult': entity.dynamic_power_recovery_mult,
+                'dynamic_power_capacity_mult': entity.dynamic_power_capacity_mult,
                 'dynamic_invincible': entity.dynamic_invincible,
                 'timed_buffs': dict(entity.timed_buffs),
                 'buff_cooldowns': dict(entity.buff_cooldowns),
@@ -393,10 +444,23 @@ class EntityManager:
             entity.posture_active_time = state.get('posture_active_time', entity.posture_active_time)
             entity.shot_cooldown = state.get('shot_cooldown', entity.shot_cooldown)
             entity.overheat_lock_timer = state.get('overheat_lock_timer', entity.overheat_lock_timer)
+            entity.autoaim_locked_target_id = state.get('autoaim_locked_target_id', entity.autoaim_locked_target_id)
+            entity.autoaim_lock_timer = state.get('autoaim_lock_timer', entity.autoaim_lock_timer)
+            entity.evasive_spin_timer = state.get('evasive_spin_timer', entity.evasive_spin_timer)
+            entity.evasive_spin_direction = state.get('evasive_spin_direction', entity.evasive_spin_direction)
+            entity.evasive_spin_rate_deg = state.get('evasive_spin_rate_deg', entity.evasive_spin_rate_deg)
+            entity.last_damage_source_id = state.get('last_damage_source_id', entity.last_damage_source_id)
             entity.respawn_timer = state.get('respawn_timer', entity.respawn_timer)
             entity.respawn_duration = state.get('respawn_duration', entity.respawn_duration)
+            entity.respawn_recovery_timer = state.get('respawn_recovery_timer', entity.respawn_recovery_timer)
             entity.invincible_timer = state.get('invincible_timer', entity.invincible_timer)
             entity.weak_timer = state.get('weak_timer', entity.weak_timer)
+            entity.respawn_invalid_timer = state.get('respawn_invalid_timer', entity.respawn_invalid_timer)
+            entity.respawn_invalid_elapsed = state.get('respawn_invalid_elapsed', entity.respawn_invalid_elapsed)
+            entity.respawn_invalid_pending_release = state.get('respawn_invalid_pending_release', entity.respawn_invalid_pending_release)
+            entity.respawn_weak_active = state.get('respawn_weak_active', entity.respawn_weak_active)
+            entity.respawn_mode = state.get('respawn_mode', entity.respawn_mode)
+            entity.instant_respawn_count = state.get('instant_respawn_count', entity.instant_respawn_count)
             entity.death_handled = state.get('death_handled', entity.death_handled)
             entity.fort_buff_active = state.get('fort_buff_active', entity.fort_buff_active)
             entity.terrain_buff_timer = state.get('terrain_buff_timer', entity.terrain_buff_timer)
@@ -414,6 +478,7 @@ class EntityManager:
             entity.dynamic_damage_dealt_mult = state.get('dynamic_damage_dealt_mult', entity.dynamic_damage_dealt_mult)
             entity.dynamic_cooling_mult = state.get('dynamic_cooling_mult', entity.dynamic_cooling_mult)
             entity.dynamic_power_recovery_mult = state.get('dynamic_power_recovery_mult', entity.dynamic_power_recovery_mult)
+            entity.dynamic_power_capacity_mult = state.get('dynamic_power_capacity_mult', entity.dynamic_power_capacity_mult)
             entity.dynamic_invincible = state.get('dynamic_invincible', entity.dynamic_invincible)
             entity.timed_buffs = dict(state.get('timed_buffs', entity.timed_buffs))
             entity.buff_cooldowns = dict(state.get('buff_cooldowns', entity.buff_cooldowns))

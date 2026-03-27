@@ -5,6 +5,38 @@ from pygame_compat import pygame
 
 
 class RendererHudMixin:
+    BT_NODE_LABELS = {
+        'return_to_supply_unlock': '回补解锁',
+        'sentry_opening_exchange': '开局换弹',
+        'opening_supply': '开局补给',
+        'hero_opening_highground': '抢高地',
+        'sentry_opening_highground': '抢台阶高地',
+        'emergency_retreat': '紧急撤退',
+        'recover_after_respawn': '复活回补',
+        'claim_buff': '抢地形增益',
+        'activate_energy': '开能量机关',
+        'cross_terrain': '翻越地形',
+        'support_structures': '保基地前哨',
+        'defend_outpost_from_hero': '防英雄吊射',
+        'intercept_enemy_engineer': '拦敌方工程',
+        'protect_hero': '保护英雄',
+        'support_infantry_push': '配合步兵推进',
+        'engineer_mining_cycle': '取矿兑矿',
+        'support_sentry_screen': '跟哨兵护送',
+        'teamfight_push': '团战推进',
+        'teamfight_cover': '团战掩护',
+        'pursue_enemy': '追击目标',
+        'sentry_engage': '哨兵交战',
+        'hero_lob_shot': '英雄吊射',
+        'hero_seek_cover': '英雄找掩护',
+        'hero_lob_outpost': '吊射前哨站',
+        'hero_lob_base': '吊射基地',
+        'hero_lob_structure': '结构吊射',
+        'push_outpost': '推进前哨站',
+        'push_base': '推进基地',
+        'patrol_key_facilities': '巡关键设施',
+    }
+
     def render_match_hud(self, game_engine):
         hud_rect = pygame.Rect(0, self.toolbar_height, self.window_width, self.hud_height)
         pygame.draw.rect(self.screen, self.colors['hud_bg'], hud_rect)
@@ -54,10 +86,10 @@ class RendererHudMixin:
         )
         self.screen.blit(structure_text, (rect.x + 12, rect.y + 40))
 
-        unit_area_y = rect.y + 62
+        unit_area_y = rect.y + 56
         unit_card_width = max(56, (rect.width - 20) // max(1, len(team_data['units'])))
         for index, unit in enumerate(team_data['units']):
-            card_rect = pygame.Rect(rect.x + 8 + index * unit_card_width, unit_area_y, unit_card_width - 6, 28)
+            card_rect = pygame.Rect(rect.x + 8 + index * unit_card_width, unit_area_y, unit_card_width - 6, 36)
             border_color = team_color if unit['alive'] else self.colors['gray']
             is_selected = self.selected_hud_entity_id == unit.get('entity_id')
             pygame.draw.rect(self.screen, (28, 33, 41), card_rect, border_radius=8)
@@ -65,12 +97,26 @@ class RendererHudMixin:
             name_text = self.tiny_font.render(unit['label'], True, self.colors['white'])
             hp_text = self.tiny_font.render(f'{unit["hp"]}', True, self.colors['hud_gold'] if unit['alive'] else self.colors['gray'])
             lv_text = self.tiny_font.render(f'Lv{unit["level"]}', True, self.colors['white'])
-            self.screen.blit(name_text, (card_rect.x + 6, card_rect.y + 2))
-            self.screen.blit(hp_text, (card_rect.x + 6, card_rect.y + 14))
-            self.screen.blit(lv_text, (card_rect.right - lv_text.get_width() - 6, card_rect.y + 14))
+            node_label = self._format_bt_node_label(unit.get('bt_node', ''))
+            node_text = self.tiny_font.render(node_label, True, self.colors['white'])
+            self.screen.blit(name_text, (card_rect.x + 6, card_rect.y + 1))
+            self.screen.blit(hp_text, (card_rect.x + 6, card_rect.y + 12))
+            self.screen.blit(lv_text, (card_rect.right - lv_text.get_width() - 6, card_rect.y + 12))
+            self.screen.blit(node_text, (card_rect.x + 6, card_rect.y + 22))
             if unit.get('has_barrel'):
                 pygame.draw.circle(self.screen, self.colors['green'], (card_rect.right - 12, card_rect.y + 9), 3)
             self.hud_actions.append((card_rect, f'hud_unit:{unit.get("entity_id", "")}'))
+
+    def _format_bt_node_label(self, node_name):
+        raw = str(node_name or '').strip()
+        if not raw:
+            return '待机'
+        if raw.startswith('_action_'):
+            raw = raw[len('_action_'):]
+        raw = self.BT_NODE_LABELS.get(raw, raw.replace('_', ' '))
+        if len(raw) > 10:
+            raw = raw[:10]
+        return raw
 
     def render_overlay_status(self, game_engine):
         if self.viewport is None:
