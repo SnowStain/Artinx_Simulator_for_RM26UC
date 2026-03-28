@@ -1,7 +1,7 @@
 {
   "version": 1,
   "name": "latest_behavior",
-  "saved_at": "2026-03-29T04:08:27",
+  "saved_at": "2026-03-29T05:07:55",
   "roles": {
     "hero": {
       "decisions": {
@@ -2813,6 +2813,283 @@
                 "y": 437.6
               }
             }
+          }
+        }
+      }
+    },
+    "common": {
+      "decisions": {
+        "common_first_step_up": {
+          "strategy": {
+            "stages": [
+              {
+                "task_type": "terrain_traversal"
+              }
+            ]
+          },
+          "point_targets_by_team": {
+            "red": {
+              "node_1": {
+                "x": 481.4,
+                "y": 711.5
+              },
+              "node_2": {
+                "x": 480.2,
+                "y": 754.8
+              }
+            },
+            "blue": {
+              "node_1": {
+                "x": 1094.6,
+                "y": 161.5
+              },
+              "node_2": {
+                "x": 1095.8,
+                "y": 118.2
+              }
+            }
+          },
+          "behavior_regions_by_team": {
+            "blue": [
+              {
+                "shape": "circle",
+                "cx": 1094.6,
+                "cy": 161.5,
+                "radius": 28.621428571428574
+              },
+              {
+                "shape": "circle",
+                "cx": 1095.8,
+                "cy": 118.2,
+                "radius": 28.621428571428574
+              }
+            ]
+          }
+        },
+        "common_first_step_down": {
+          "point_targets_by_team": {
+            "red": {
+              "node_1": {
+                "x": 481.4,
+                "y": 752.5
+              },
+              "node_2": {
+                "x": 482.6,
+                "y": 710.4
+              }
+            },
+            "blue": {
+              "node_1": {
+                "x": 1094.6,
+                "y": 120.5
+              },
+              "node_2": {
+                "x": 1093.4,
+                "y": 162.6
+              }
+            }
+          },
+          "behavior_regions_by_team": {
+            "blue": [
+              {
+                "shape": "circle",
+                "cx": 1094.6,
+                "cy": 120.5,
+                "radius": 28.621428571428574
+              },
+              {
+                "shape": "circle",
+                "cx": 1093.4,
+                "cy": 162.6,
+                "radius": 28.621428571428574
+              }
+            ]
+          },
+          "strategy": {
+            "stages": [
+              {
+                "task_type": "terrain_traversal"
+              }
+            ]
+          }
+        },
+        "common_second_step_up": {
+          "point_targets_by_team": {
+            "red": {
+              "node_1": {
+                "x": 504.2,
+                "y": 440.2
+              },
+              "node_2": {
+                "x": 553.9,
+                "y": 440.2
+              },
+              "node_3": {
+                "x": 614.8,
+                "y": 438.7
+              }
+            },
+            "blue": {
+              "node_1": {
+                "x": 1071.8,
+                "y": 432.8
+              },
+              "node_2": {
+                "x": 1022.1,
+                "y": 432.8
+              },
+              "node_3": {
+                "x": 961.2,
+                "y": 434.3
+              }
+            }
+          },
+          "behavior_regions_by_team": {
+            "blue": [
+              {
+                "shape": "circle",
+                "cx": 1071.8,
+                "cy": 432.8,
+                "radius": 28.621428571428574
+              },
+              {
+                "shape": "circle",
+                "cx": 1022.1,
+                "cy": 432.8,
+                "radius": 28.621428571428574
+              },
+              {
+                "shape": "circle",
+                "cx": 961.2,
+                "cy": 434.3,
+                "radius": 28.621428571428574
+              }
+            ]
+          },
+          "strategy": {
+            "stages": [
+              {
+                "task_type": "terrain_traversal"
+              }
+            ]
+          }
+        },
+        "common_second_step_down": {
+          "point_targets_by_team": {
+            "red": {
+              "node_1": {
+                "x": 614.0,
+                "y": 440.2,
+                "radius": 41.5
+              },
+              "node_2": {
+                "x": 551.0,
+                "y": 440.9,
+                "radius": 41.5
+              },
+              "node_3": {
+                "x": 507.2,
+                "y": 445.4,
+                "radius": 51.5
+              }
+            },
+            "blue": {
+              "node_1": {
+                "x": 962.0,
+                "y": 432.8,
+                "radius": 41.5
+              },
+              "node_2": {
+                "x": 1025.0,
+                "y": 432.1,
+                "radius": 41.5
+              },
+              "node_3": {
+                "x": 1068.8,
+                "y": 427.6,
+                "radius": 51.5
+              }
+            }
+          },
+          "behavior_regions_by_team": {
+            "blue": [
+              {
+                "shape": "circle",
+                "cx": 962.0,
+                "cy": 432.8,
+                "radius": 41.5
+              },
+              {
+                "shape": "circle",
+                "cx": 1025.0,
+                "cy": 432.1,
+                "radius": 41.5
+              },
+              {
+                "shape": "circle",
+                "cx": 1068.8,
+                "cy": 427.6,
+                "radius": 51.5
+              }
+            ]
+          },
+          "strategy": {
+            "stages": [
+              {
+                "task_type": "terrain_traversal"
+              }
+            ]
+          }
+        },
+        "common_fly_slope": {
+          "point_targets_by_team": {
+            "red": {
+              "node_1": {
+                "x": 598.9,
+                "y": 814.1,
+                "radius": 41.5
+              },
+              "node_2": {
+                "x": 855.3,
+                "y": 818.3,
+                "radius": 41.5
+              }
+            },
+            "blue": {
+              "node_1": {
+                "x": 977.1,
+                "y": 58.9,
+                "radius": 41.5
+              },
+              "node_2": {
+                "x": 720.7,
+                "y": 54.7,
+                "radius": 41.5
+              }
+            }
+          },
+          "behavior_regions_by_team": {
+            "blue": [
+              {
+                "shape": "circle",
+                "cx": 977.1,
+                "cy": 58.9,
+                "radius": 41.5
+              },
+              {
+                "shape": "circle",
+                "cx": 720.7,
+                "cy": 54.7,
+                "radius": 41.5
+              }
+            ]
+          },
+          "strategy": {
+            "stages": [
+              {
+                "task_type": "terrain_traversal"
+              }
+            ]
           }
         }
       }

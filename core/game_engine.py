@@ -5,6 +5,7 @@ import math
 import pygame
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 
 import json
@@ -58,6 +59,10 @@ class GameEngine:
         self._last_update_breakdown = None
         self._last_event_ms = 0.0
         self._perf_log_session_id = None
+        self._auto_aim_worker_threads = max(1, int(self.config.get('ai', {}).get('auto_aim_worker_threads', 1) or 1))
+        self._auto_aim_executor = None
+        self._auto_aim_future = None
+        self._restart_auto_aim_executor(wait=False)
 
         # 游戏状态
         self.game_time = 0
@@ -75,12 +80,37 @@ class GameEngine:
         old_controller = getattr(self, 'controller', None)
         if old_controller is not None and hasattr(old_controller, 'shutdown'):
             old_controller.shutdown()
+        self._restart_auto_aim_executor(wait=True)
         self.map_manager = MapManager(self.config)
         self.entity_manager = EntityManager(self.config)
         self.physics_engine = PhysicsEngine(self.config)
         self.rules_engine = RulesEngine(self.config)
         self.rules_engine.game_engine = self
         self.controller = Controller(self.config)
+
+    def _restart_auto_aim_executor(self, wait):
+        self._shutdown_auto_aim_worker(cancel_futures=True)
+        executor = getattr(self, '_auto_aim_executor', None)
+        if executor is not None:
+            executor.shutdown(wait=wait, cancel_futures=True)
+        self._auto_aim_executor = ThreadPoolExecutor(max_workers=self._auto_aim_worker_threads)
+
+    def _shutdown_auto_aim_worker(self, cancel_futures=False):
+        future = getattr(self, '_auto_aim_future', None)
+        if future is not None:
+            if cancel_futures and not future.done():
+                future.cancel()
+            self._auto_aim_future = None
+
+    def shutdown(self):
+        self._shutdown_auto_aim_worker(cancel_futures=True)
+        executor = getattr(self, '_auto_aim_executor', None)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+            self._auto_aim_executor = None
+        controller = getattr(self, 'controller', None)
+        if controller is not None and hasattr(controller, 'shutdown'):
+            controller.shutdown()
 
     def _reset_runtime_state(self):
         self.game_time = 0
@@ -387,7 +417,26 @@ class GameEngine:
             return False
         return entity.robot_type != '工程'
 
+    def _poll_general_auto_aim_future(self):
+        future = self._auto_aim_future
+        if future is None or not future.done():
+            return
+        try:
+            future.result()
+        except Exception:
+            pass
+        self._auto_aim_future = None
+
+    def _dispatch_general_auto_aim_update(self):
+        if self._auto_aim_executor is None or self._auto_aim_future is not None:
+            return
+        self._auto_aim_future = self._auto_aim_executor.submit(self._update_general_auto_aim_sync)
+
     def _update_general_auto_aim(self):
+        self._poll_general_auto_aim_future()
+        self._dispatch_general_auto_aim_update()
+
+    def _update_general_auto_aim_sync(self):
         max_distance = getattr(self.rules_engine, 'auto_aim_max_distance', 0.0)
         if max_distance <= 0:
             return
@@ -743,6 +792,7 @@ class GameEngine:
         
         # 清理资源
         self._flush_perf_samples_to_file('quit')
+        self.shutdown()
         pygame.quit()
 
     def save_match(self, save_path='saves/latest_match.json'):

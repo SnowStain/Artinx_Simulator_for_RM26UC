@@ -10,15 +10,22 @@ from control.ai_controller import AIController
 
 
 class Controller:
+    _ROLE_SHARD_ORDER = ('sentry', 'hero', 'engineer', 'infantry')
+
     def __init__(self, config):
         self.config = config
         self.manual_controller = ManualController(config)
         ai_config = config.get('ai', {})
-        configured_workers = int(ai_config.get('controller_worker_threads', 1))
+        configured_workers = int(ai_config.get('controller_worker_threads', len(self._ROLE_SHARD_ORDER)))
         cpu_count = os.cpu_count() or 2
-        self._ai_worker_threads = max(1, min(configured_workers, cpu_count))
+        role_worker_target = len(self._ROLE_SHARD_ORDER)
+        self._ai_worker_threads = max(1, min(max(configured_workers, role_worker_target), cpu_count))
 
-        # 每个分片使用独立 AIController，避免共享缓存字典导致线程冲突。
+        # 每个兵种角色使用独立 AIController，避免不同兵种争抢同一分片的缓存与运行时状态。
+        self._role_shard_map = {
+            role_key: min(index, self._ai_worker_threads - 1)
+            for index, role_key in enumerate(self._ROLE_SHARD_ORDER)
+        }
         self._ai_controllers = [AIController(config) for _ in range(self._ai_worker_threads)]
         self._ai_executor = ThreadPoolExecutor(max_workers=self._ai_worker_threads) if self._ai_worker_threads > 1 else None
         
@@ -26,6 +33,9 @@ class Controller:
         self.control_mode = 'manual'
 
     def shutdown(self):
+        for ai_controller in getattr(self, '_ai_controllers', ()):
+            if hasattr(ai_controller, 'shutdown'):
+                ai_controller.shutdown()
         if self._ai_executor is not None:
             self._ai_executor.shutdown(wait=False)
             self._ai_executor = None
@@ -40,6 +50,16 @@ class Controller:
         # 使用稳定分片保证实体始终走同一个 AIController，保留路径/卡住检测等历史状态。
         return abs(hash(entity_id)) % self._ai_worker_threads
 
+    def _entity_role_key(self, entity):
+        if entity.type == 'sentry':
+            return 'sentry'
+        robot_type = str(getattr(entity, 'robot_type', '') or '').strip()
+        return {
+            '英雄': 'hero',
+            '工程': 'engineer',
+            '步兵': 'infantry',
+        }.get(robot_type, 'infantry')
+
     def _update_ai_parallel(self, entities, map_manager=None, rules_engine=None, game_time=0.0, game_duration=0.0):
         if self._ai_worker_threads <= 1 or self._ai_executor is None:
             self._ai_controllers[0].update(entities, map_manager, rules_engine, game_time, game_duration)
@@ -49,7 +69,10 @@ class Controller:
         for entity in entities:
             if not self._is_ai_controllable_entity(entity):
                 continue
-            shard_index = self._assign_entity_to_shard(entity.id)
+            role_key = self._entity_role_key(entity)
+            shard_index = self._role_shard_map.get(role_key)
+            if shard_index is None:
+                shard_index = self._assign_entity_to_shard(entity.id)
             shard_entity_ids[shard_index].add(entity.id)
 
         futures = []

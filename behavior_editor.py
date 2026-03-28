@@ -19,13 +19,14 @@ from map.map_manager import MapManager
 
 
 class BehaviorEditorEngine:
-    ROLE_ORDER = ('sentry', 'infantry', 'hero', 'engineer')
+    ROLE_ORDER = ('sentry', 'infantry', 'hero', 'engineer', 'common')
     MAX_STRATEGY_STAGES = 4
     ROLE_PREVIEW_ENTITY_IDS = {
         'hero': 'robot_1',
         'engineer': 'robot_2',
         'infantry': 'robot_3',
         'sentry': 'robot_7',
+        'common': 'robot_3',
     }
     REGION_MODE_LABELS = {
         'enter_then_execute': '先进入区域再执行',
@@ -145,7 +146,7 @@ class BehaviorEditorEngine:
         return tuple(role_key for role_key in self.ROLE_ORDER if self.ai_controller.get_available_decision_plugins(role_key))
 
     def role_label(self, role_key):
-        return {'sentry': '哨兵', 'infantry': '步兵', 'hero': '英雄', 'engineer': '工程'}.get(role_key, role_key)
+        return {'sentry': '哨兵', 'infantry': '步兵', 'hero': '英雄', 'engineer': '工程', 'common': '通用'}.get(role_key, role_key)
 
     def selected_role_key(self):
         role_keys = self.role_keys()
@@ -156,6 +157,23 @@ class BehaviorEditorEngine:
 
     def role_specs(self, role_key=None):
         role = role_key or self.selected_role_key()
+        if role == self.ai_controller.COMMON_ROLE_KEY:
+            specs = []
+            for binding in self.role_available_plugins(role):
+                action = binding.get('action') if callable(binding.get('action')) else None
+                if action is None:
+                    continue
+                specs.append({
+                    'id': str(binding.get('id', '')),
+                    'label': str(binding.get('label', binding.get('id', ''))),
+                    'action': (lambda ctx, plugin_action=action, plugin_binding=dict(binding), plugin_role=role:
+                        plugin_action(self.ai_controller, ctx, plugin_role, plugin_binding)),
+                    'fallback': bool(binding.get('fallback', True)),
+                    'description': str(binding.get('description', '')),
+                    'editable_targets': tuple(binding.get('editable_targets', ())),
+                    'default_destination_types': tuple(binding.get('default_destination_types', ())),
+                })
+            return specs
         return list(self.ai_controller.role_decision_specs.get(role, ()))
 
     def selected_spec(self):
@@ -1606,7 +1624,7 @@ class BehaviorEditorApp:
         return rect.right + 8
 
     def _role_label(self, role_key):
-        return {'sentry': '哨兵', 'infantry': '步兵', 'hero': '英雄', 'engineer': '工程'}.get(role_key, role_key)
+        return {'sentry': '哨兵', 'infantry': '步兵', 'hero': '英雄', 'engineer': '工程', 'common': '通用'}.get(role_key, role_key)
 
     def _clear_region_selection(self):
         self.selected_region_kind = None

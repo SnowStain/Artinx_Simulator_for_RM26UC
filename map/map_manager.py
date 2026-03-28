@@ -1749,6 +1749,15 @@ class MapManager:
                 return False
         start_world = self._nav_cell_center(current, step)
         end_world = self._nav_cell_center(neighbor, step)
+        traversal = self.describe_segment_traversal(
+            start_world[0],
+            start_world[1],
+            end_world[0],
+            end_world[1],
+        )
+        if isinstance(traversal, dict) and str(traversal.get('facility_type', '')) == 'fly_slope':
+            if str(traversal.get('direction', 'forward')) != 'forward':
+                return False
         collision_radius = float(traversal_profile.get('collision_radius', 0.0))
         return self.is_segment_valid_for_radius(
             start_world[0],
@@ -1923,6 +1932,122 @@ class MapManager:
         if abs(delta_x) <= 1e-6 and abs(delta_y) <= 1e-6:
             return None
         return math.degrees(math.atan2(delta_y, delta_x))
+
+    def _step_direction_label(self, facility, from_y, to_y):
+        flow_direction = self._step_ascent_direction(facility)
+        delta_y = float(to_y) - float(from_y)
+        return 'up' if delta_y * flow_direction > 0.0 else 'down'
+
+    def _segment_crosses_facility_channel(self, facility, from_x, from_y, to_x, to_y, padding=0.0):
+        if not self._segment_intersects_rect_region((from_x, from_y), (to_x, to_y), facility, padding=padding):
+            return False
+        center_y = (float(facility.get('y1', 0.0)) + float(facility.get('y2', 0.0))) * 0.5
+        flow_direction = self._step_ascent_direction(facility)
+        start_side = (float(from_y) - center_y) * flow_direction
+        end_side = (float(to_y) - center_y) * flow_direction
+        threshold = max(2.0, float(padding))
+        if abs(start_side) <= threshold or abs(end_side) <= threshold:
+            return True
+        return start_side * end_side < 0.0
+
+    def _step_corridor_points(self, facility, direction_label, from_x, to_x):
+        direction = self._step_ascent_direction(facility)
+        center_x, _ = self.facility_center(facility)
+        width = max(1.0, abs(float(facility.get('x2', 0.0)) - float(facility.get('x1', 0.0))))
+        margin = max(float(self.terrain_grid_cell_size) * 1.5, 12.0)
+        left_x = min(float(facility.get('x1', 0.0)), float(facility.get('x2', 0.0)))
+        right_x = max(float(facility.get('x1', 0.0)), float(facility.get('x2', 0.0)))
+        side_padding = min(width * 0.28, max(margin * 0.75, 10.0))
+        usable_left = min(center_x, right_x - 1.0) if right_x - left_x <= side_padding * 2.0 else left_x + side_padding
+        usable_right = max(center_x, left_x + 1.0) if right_x - left_x <= side_padding * 2.0 else right_x - side_padding
+        aligned_x = max(usable_left, min(usable_right, (float(from_x) + float(to_x)) * 0.5))
+        if direction < 0:
+            lower_point = (int(round(aligned_x)), int(min(self.map_height - 1, float(facility['y2']) + margin)))
+            upper_point = (int(round(aligned_x)), int(min(float(facility['y2']) - 1.0, float(facility['y1']) + margin)))
+        else:
+            lower_point = (int(round(aligned_x)), int(max(0, float(facility['y1']) - margin)))
+            upper_point = (int(round(aligned_x)), int(max(float(facility['y1']) + 1.0, float(facility['y2']) - margin)))
+        if direction_label == 'up':
+            return lower_point, upper_point
+        return upper_point, lower_point
+
+    def _fly_slope_direction_label(self, facility, from_y, to_y):
+        flow_direction = self._step_ascent_direction(facility)
+        delta_y = float(to_y) - float(from_y)
+        return 'forward' if delta_y * flow_direction > 0.0 else 'reverse'
+
+    def _fly_slope_channel_points(self, facility, direction_label):
+        center_x, _ = self.facility_center(facility)
+        margin = max(float(self.terrain_grid_cell_size) * 1.35, 18.0)
+        direction = self._step_ascent_direction(facility)
+        if direction < 0:
+            launch_point = (int(round(center_x)), int(min(self.map_height - 1, float(facility['y2']) + margin * 0.5)))
+            landing_point = (int(round(center_x)), int(max(0, float(facility['y1']) - margin * 0.5)))
+        else:
+            launch_point = (int(round(center_x)), int(max(0, float(facility['y1']) - margin * 0.5)))
+            landing_point = (int(round(center_x)), int(min(self.map_height - 1, float(facility['y2']) + margin * 0.5)))
+        if direction_label == 'forward':
+            return launch_point, landing_point
+        return landing_point, launch_point
+
+    def describe_segment_traversal(self, from_x, from_y, to_x, to_y, max_height_delta_m=None):
+        terrain_transition = self._terrain_step_transition(from_x, from_y, to_x, to_y, max_height_delta_m=max_height_delta_m)
+        if terrain_transition is not None:
+            direction_label = 'up' if float(to_y) < float(from_y) else 'down'
+            approach_point = terrain_transition.get('approach_point')
+            top_point = terrain_transition.get('top_point')
+            return {
+                **terrain_transition,
+                'direction': direction_label,
+                'entry_point': approach_point,
+                'exit_point': top_point,
+            }
+
+        padding = max(float(self.terrain_grid_cell_size) * 0.45, 6.0)
+        for facility_type in ('first_step', 'second_step'):
+            for facility in self.get_facility_regions(facility_type):
+                transition = self._step_transition_for_facility(facility, from_x, from_y, to_x, to_y, max_height_delta_m=max_height_delta_m)
+                if transition is not None:
+                    direction_label = 'up'
+                    return {
+                        **transition,
+                        'direction': direction_label,
+                        'entry_point': transition.get('approach_point'),
+                        'exit_point': transition.get('top_point'),
+                    }
+                if not self._segment_crosses_facility_channel(facility, from_x, from_y, to_x, to_y, padding=padding):
+                    continue
+                direction_label = self._step_direction_label(facility, from_y, to_y)
+                entry_point, exit_point = self._step_corridor_points(facility, direction_label, from_x, to_x)
+                entry_height = self.get_terrain_height_m(entry_point[0], entry_point[1])
+                exit_height = self.get_terrain_height_m(exit_point[0], exit_point[1])
+                return {
+                    'facility_id': facility.get('id'),
+                    'facility_type': facility_type,
+                    'direction': direction_label,
+                    'entry_point': entry_point,
+                    'exit_point': exit_point,
+                    'approach_point': entry_point,
+                    'top_point': exit_point,
+                    'climb_points': (exit_point,),
+                    'step_height_m': round(abs(float(exit_height) - float(entry_height)), 3),
+                }
+
+        for facility in self.get_facility_regions('fly_slope'):
+            if not self._segment_crosses_facility_channel(facility, from_x, from_y, to_x, to_y, padding=padding):
+                continue
+            direction_label = self._fly_slope_direction_label(facility, from_y, to_y)
+            entry_point, exit_point = self._fly_slope_channel_points(facility, direction_label)
+            return {
+                'facility_id': facility.get('id'),
+                'facility_type': 'fly_slope',
+                'direction': direction_label,
+                'entry_point': entry_point,
+                'exit_point': exit_point,
+                'landing_point': exit_point,
+                'climb_points': (exit_point,),
+            }
+        return None
 
     def _terrain_step_transition(self, from_x, from_y, to_x, to_y, max_height_delta_m=None):
         distance = math.hypot(float(to_x) - float(from_x), float(to_y) - float(from_y))

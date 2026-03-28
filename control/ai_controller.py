@@ -8,6 +8,7 @@ import os
 import random
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 
 from control.behavior_tree import Action, BehaviorContext, Condition, Selector, Sequence, SUCCESS, FAILURE
@@ -18,6 +19,7 @@ class AIController:
     EMPTY_PATH_PREVIEW = ()
     MAX_STRATEGY_STAGES = 4
     DEFAULT_ENGAGE_DISTANCE_M = 8.0
+    COMMON_ROLE_KEY = 'common'
     STRATEGY_TASK_TYPES = {
         'default',
         'terrain_traversal',
@@ -45,6 +47,54 @@ class AIController:
         'hero': ('hero_btcpp.xml', 'HeroBehaviorTree'),
         'engineer': ('engineer_btcpp.xml', 'EngineerBehaviorTree'),
     }
+    COMMON_TERRAIN_POLICY_TARGET_DEFS = (
+        {'id': 'node_1', 'label': '跨越节点 1'},
+        {'id': 'node_2', 'label': '跨越节点 2'},
+        {'id': 'node_3', 'label': '跨越节点 3'},
+        {'id': 'node_4', 'label': '跨越节点 4'},
+    )
+    COMMON_TERRAIN_POLICY_DEFS = (
+        {
+            'id': 'common_first_step_up',
+            'label': '上一级台阶',
+            'description': '所有移动在经过一级台阶上行时统一调用的跨越策略。',
+            'terrain_type': 'first_step',
+            'direction': 'up',
+            'default_destination_types': ('first_step',),
+        },
+        {
+            'id': 'common_first_step_down',
+            'label': '下一级台阶',
+            'description': '所有移动在经过一级台阶下行时统一调用的跨越策略。',
+            'terrain_type': 'first_step',
+            'direction': 'down',
+            'default_destination_types': ('first_step',),
+        },
+        {
+            'id': 'common_second_step_up',
+            'label': '上二级台阶',
+            'description': '所有移动在经过二级台阶上行时统一调用的跨越策略。',
+            'terrain_type': 'second_step',
+            'direction': 'up',
+            'default_destination_types': ('second_step',),
+        },
+        {
+            'id': 'common_second_step_down',
+            'label': '下二级台阶',
+            'description': '所有移动在经过二级台阶下行时统一调用的跨越策略。',
+            'terrain_type': 'second_step',
+            'direction': 'down',
+            'default_destination_types': ('second_step',),
+        },
+        {
+            'id': 'common_fly_slope',
+            'label': '飞坡通道',
+            'description': '所有移动在经过飞坡时统一调用的跨越策略。',
+            'terrain_type': 'fly_slope',
+            'direction': 'forward',
+            'default_destination_types': ('fly_slope',),
+        },
+    )
 
     def __init__(self, config):
         self.config = config
@@ -70,9 +120,12 @@ class AIController:
         self._path_failure_retry_sec = max(self._ai_update_interval, float(self._ai_config.get('path_failure_retry_sec', max(0.45, self._ai_update_interval * 2.5))))
         self._path_failure_retry_max_sec = max(self._path_failure_retry_sec, float(self._ai_config.get('path_failure_retry_max_sec', 1.6)))
         self._path_goal_hysteresis_world = max(24.0, float(self._ai_config.get('path_goal_hysteresis_world', 56.0)))
+        self._direct_segment_check_interval = max(self._ai_update_interval, float(self._ai_config.get('direct_segment_check_interval_sec', max(0.28, self._ai_update_interval * 1.5))))
+        self._pathfinder_worker_threads = max(1, int(self._ai_config.get('pathfinder_worker_threads', 1)))
         self._path_replans_remaining = self._path_replans_per_update
         self._last_ai_update_time = {}
         self._entity_path_state = {}
+        self._route_progress_state = {}
         self._movement_status_cache = {}
         self._sentry_fly_slope_state = {}
         self._behavior_tree_dir = os.path.join(os.path.dirname(__file__), 'behavior_trees')
@@ -85,7 +138,16 @@ class AIController:
         self._last_behavior_reload_check_time = -1.0
         self.role_decision_specs = {}
         self.role_trees = {}
+        self._path_executor = ThreadPoolExecutor(max_workers=self._pathfinder_worker_threads)
         self._refresh_behavior_runtime_overrides(force=True)
+
+    def shutdown(self):
+        if self._path_executor is not None:
+            self._path_executor.shutdown(wait=False)
+            self._path_executor = None
+
+    def __del__(self):
+        self.shutdown()
 
     def _entity_update_phase_offset(self, entity_id):
         # 打散同帧集中重算，避免 update_interval 对齐造成周期性卡顿峰值。
@@ -178,6 +240,8 @@ class AIController:
         }
 
     def _available_plugin_bindings_for_role(self, role_key):
+        if role_key == self.COMMON_ROLE_KEY:
+            return [dict(binding) for binding in self._common_terrain_policy_bindings()]
         bindings = []
         for plugin_id, plugin in self._decision_plugin_catalog.items():
             role_config = plugin.get('roles', {}).get(role_key)
@@ -197,6 +261,264 @@ class AIController:
             if str(binding.get('id', '')) == decision_id:
                 return binding
         return None
+
+    def _common_terrain_policy_def(self, decision_id):
+        decision_id = str(decision_id or '').strip()
+        for policy in self.COMMON_TERRAIN_POLICY_DEFS:
+            if str(policy.get('id', '')) == decision_id:
+                return dict(policy)
+        return None
+
+    def _common_terrain_policy_bindings(self):
+        bindings = []
+        for policy in self.COMMON_TERRAIN_POLICY_DEFS:
+            policy_id = str(policy['id'])
+            bindings.append({
+                'id': policy_id,
+                'label': str(policy['label']),
+                'description': str(policy.get('description', '')),
+                'fallback': True,
+                'default_destination_types': tuple(policy.get('default_destination_types', ())),
+                'terrain_type': str(policy.get('terrain_type', '')),
+                'direction': str(policy.get('direction', 'forward')),
+                'editable_targets': tuple(dict(item) for item in self.COMMON_TERRAIN_POLICY_TARGET_DEFS),
+                'preview_points': (lambda controller, role_key, map_manager, team=None, override=None, binding=None, bound_id=policy_id:
+                    controller._common_terrain_policy_preview_points(bound_id, map_manager, team=team or 'red')),
+                'preview_regions': (lambda controller, role_key, map_manager, team=None, override=None, binding=None, bound_id=policy_id:
+                    controller._common_terrain_policy_preview_regions(bound_id, map_manager, team=team or 'red')),
+                'action': (lambda controller, ctx, plugin_role, plugin_binding, bound_id=policy_id:
+                    controller._preview_common_terrain_policy_action(ctx, bound_id)),
+            })
+        return bindings
+
+    def _preview_common_terrain_policy_action(self, context, decision_id):
+        route_specs = self._common_terrain_policy_route_specs(
+            decision_id,
+            context.entity.team,
+            context.map_manager,
+            entity=context.entity,
+        )
+        if not route_specs:
+            return FAILURE
+        target_point = route_specs[0]['point']
+        policy = self._common_terrain_policy_def(decision_id) or {}
+        focus_target = context.data.get('target')
+        return self._set_decision(
+            context,
+            f"通用跨越策略：{str(policy.get('label', decision_id))}",
+            target=focus_target,
+            target_point=target_point,
+            speed=self._meters_to_world_units(1.9, context.map_manager),
+            preferred_route={'target': target_point},
+            turret_state='aiming' if focus_target is not None else 'searching',
+        )
+
+    def _nearest_team_facility(self, map_manager, team, facility_type):
+        if map_manager is None:
+            return None
+        base_anchor = self.get_team_anchor(team, 'base', map_manager)
+        best_facility = None
+        best_distance = None
+        for facility in map_manager.get_facility_regions(facility_type):
+            if facility.get('team') not in {team, 'neutral'}:
+                continue
+            center = self.facility_center(facility)
+            if base_anchor is None:
+                return facility
+            distance = math.hypot(float(center[0]) - float(base_anchor[0]), float(center[1]) - float(base_anchor[1]))
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_facility = facility
+        return best_facility
+
+    def _common_terrain_policy_team_direction(self, team):
+        return 1.0 if str(team) == 'red' else -1.0
+
+    def _common_step_policy_default_points(self, facility_type, direction, team, map_manager, entity=None):
+        facility = self._nearest_team_facility(map_manager, team, facility_type)
+        if facility is None:
+            return {}
+        travel_sign = self._common_terrain_policy_team_direction(team)
+        if direction == 'down':
+            travel_sign *= -1.0
+        min_x = min(float(facility.get('x1', 0.0)), float(facility.get('x2', 0.0)))
+        max_x = max(float(facility.get('x1', 0.0)), float(facility.get('x2', 0.0)))
+        center_y = (float(facility.get('y1', 0.0)) + float(facility.get('y2', 0.0))) * 0.5
+        near_edge = min_x if travel_sign > 0 else max_x
+        far_edge = max_x if travel_sign > 0 else min_x
+        if facility_type == 'first_step':
+            near_offset_m = 0.45
+            far_offset_m = 0.78
+        else:
+            near_offset_m = 0.55
+            far_offset_m = 1.05
+        primary = self._resolve_navigation_target(
+            (near_edge - travel_sign * self._meters_to_world_units(near_offset_m, map_manager), center_y),
+            map_manager,
+            entity=entity,
+        )
+        secondary = self._resolve_navigation_target(
+            (far_edge + travel_sign * self._meters_to_world_units(far_offset_m, map_manager), center_y),
+            map_manager,
+            entity=entity,
+        )
+        targets = {}
+        if primary is not None:
+            targets['node_1'] = {'x': float(primary[0]), 'y': float(primary[1])}
+        if secondary is not None:
+            targets['node_2'] = {'x': float(secondary[0]), 'y': float(secondary[1])}
+        return targets
+
+    def _common_fly_slope_policy_default_points(self, team, map_manager, entity=None):
+        if map_manager is None:
+            return {}
+        facility_type = 'buff_terrain_fly_slope_red_start' if team == 'red' else 'buff_terrain_fly_slope_blue_start'
+        primary = None
+        for facility in map_manager.get_facility_regions(facility_type):
+            if facility.get('team') in {'neutral', team}:
+                primary = self._resolve_navigation_target(self.facility_center(facility), map_manager, entity=entity)
+                break
+        slope = self._nearest_team_facility(map_manager, team, 'fly_slope')
+        if slope is None:
+            return {'node_1': {'x': float(primary[0]), 'y': float(primary[1])}} if primary is not None else {}
+        direction = self._common_terrain_policy_team_direction(team)
+        peak_x = float(slope.get('x2', 0.0)) if direction > 0 else float(slope.get('x1', 0.0))
+        center_y = (float(slope.get('y1', 0.0)) + float(slope.get('y2', 0.0))) * 0.5
+        if primary is None:
+            primary = self._resolve_navigation_target(self.facility_center(slope), map_manager, entity=entity)
+        landing = self._resolve_navigation_target(
+            (peak_x + direction * self._meters_to_world_units(0.85, map_manager), center_y),
+            map_manager,
+            entity=entity,
+        )
+        targets = {}
+        if primary is not None:
+            targets['node_1'] = {'x': float(primary[0]), 'y': float(primary[1])}
+        if landing is not None:
+            targets['node_2'] = {'x': float(landing[0]), 'y': float(landing[1])}
+        return targets
+
+    def _default_common_terrain_policy_target_specs(self, decision_id, team, map_manager, entity=None):
+        policy = self._common_terrain_policy_def(decision_id) or {}
+        terrain_type = str(policy.get('terrain_type', ''))
+        if terrain_type == 'fly_slope':
+            return self._common_fly_slope_policy_default_points(team, map_manager, entity=entity)
+        if terrain_type in {'first_step', 'second_step'}:
+            return self._common_step_policy_default_points(
+                terrain_type,
+                str(policy.get('direction', 'up')),
+                team,
+                map_manager,
+                entity=entity,
+            )
+        return {}
+
+    def _ordered_common_target_specs(self, target_specs, map_manager, entity=None):
+        ordered = []
+        for target_id, point_spec in (target_specs or {}).items():
+            if not str(target_id).startswith('node_'):
+                continue
+            suffix = str(target_id).split('_', 1)[1]
+            try:
+                sort_key = int(suffix)
+            except ValueError:
+                continue
+            point = (float(point_spec['x']), float(point_spec['y']))
+            resolved = self._resolve_navigation_target(point, map_manager, entity=entity) if map_manager is not None else point
+            if resolved is None:
+                continue
+            ordered.append((
+                sort_key,
+                {
+                    'id': str(target_id),
+                    'index': sort_key,
+                    'point': (float(resolved[0]), float(resolved[1])),
+                    'radius': float(point_spec.get('radius', 0.0) or 0.0),
+                },
+            ))
+        ordered.sort(key=lambda item: item[0])
+        return [item[1] for item in ordered[:self.MAX_STRATEGY_STAGES]]
+
+    def _common_terrain_policy_route_specs(self, decision_id, team, map_manager, entity=None):
+        override = self._behavior_override_for_decision(self.COMMON_ROLE_KEY, decision_id)
+        target_specs = self._behavior_override_point_target_specs(override, team=team)
+        if not target_specs:
+            target_specs = self._default_common_terrain_policy_target_specs(decision_id, team, map_manager, entity=entity)
+        return self._ordered_common_target_specs(target_specs, map_manager, entity=entity)
+
+    def _common_terrain_policy_preview_points(self, decision_id, map_manager, team='red'):
+        route_specs = self._common_terrain_policy_route_specs(decision_id, team, map_manager)
+        return {
+            str(spec['id']): (float(spec['point'][0]), float(spec['point'][1]))
+            for spec in route_specs
+        }
+
+    def _common_terrain_policy_preview_regions(self, decision_id, map_manager, team='red'):
+        route_specs = self._common_terrain_policy_route_specs(decision_id, team, map_manager)
+        radius = self._meters_to_world_units(0.5, map_manager) if map_manager is not None else 22.0
+        return [
+            {
+                'shape': 'circle',
+                'cx': float(spec['point'][0]),
+                'cy': float(spec['point'][1]),
+                'radius': float(spec['radius'] or radius),
+            }
+            for spec in route_specs
+        ]
+
+    def _terrain_policy_decision_id_for_traversal(self, traversal):
+        if not isinstance(traversal, dict):
+            return None
+        terrain_type = str(traversal.get('facility_type', '') or '')
+        direction = str(traversal.get('direction', '') or '')
+        if terrain_type == 'first_step':
+            return 'common_first_step_up' if direction == 'up' else 'common_first_step_down'
+        if terrain_type == 'second_step':
+            return 'common_second_step_up' if direction == 'up' else 'common_second_step_down'
+        if terrain_type == 'fly_slope':
+            return 'common_fly_slope'
+        return None
+
+    def _default_traversal_path_points(self, traversal):
+        if not isinstance(traversal, dict):
+            return self.EMPTY_PATH_PREVIEW
+        points = []
+        for key in ('entry_point', 'approach_point'):
+            point = traversal.get(key)
+            if point is None:
+                continue
+            normalized = (float(point[0]), float(point[1]))
+            if not points or points[-1] != normalized:
+                points.append(normalized)
+            break
+        for point in tuple(traversal.get('climb_points', ())) or self.EMPTY_PATH_PREVIEW:
+            if point is None:
+                continue
+            normalized = (float(point[0]), float(point[1]))
+            if not points or points[-1] != normalized:
+                points.append(normalized)
+        for key in ('top_point', 'exit_point', 'landing_point'):
+            point = traversal.get(key)
+            if point is None:
+                continue
+            normalized = (float(point[0]), float(point[1]))
+            if not points or points[-1] != normalized:
+                points.append(normalized)
+        return tuple(points)
+
+    def _terrain_policy_path_points(self, entity, traversal, map_manager):
+        decision_id = self._terrain_policy_decision_id_for_traversal(traversal)
+        if decision_id is None:
+            return self._default_traversal_path_points(traversal)
+        route_specs = self._common_terrain_policy_route_specs(
+            decision_id,
+            getattr(entity, 'team', 'red'),
+            map_manager,
+            entity=entity,
+        )
+        if route_specs:
+            return tuple((float(spec['point'][0]), float(spec['point'][1])) for spec in route_specs)
+        return self._default_traversal_path_points(traversal)
 
     def _normalize_behavior_point_targets(self, targets):
         specs = self._normalize_behavior_point_target_specs(targets)
@@ -884,21 +1206,22 @@ class AIController:
             return
         final_target = decision.get('navigation_target')
         if final_target is None:
+            self._clear_route_progress(context.entity, 'override_route_points')
             return
         route_specs = self._resolve_ordered_route_specs(context.entity, override, context.map_manager)
         if not route_specs:
+            self._clear_route_progress(context.entity, 'override_route_points')
             return
 
         active_target = (float(final_target[0]), float(final_target[1]))
         active_radius = float(decision.get('navigation_radius', 0.0) or 0.0)
-        active_index = None
-        for index, route_spec in enumerate(route_specs):
-            if self._is_target_reached(context.entity, route_spec['point'], context.map_manager, navigation_radius=route_spec['radius']):
-                continue
-            active_target = route_spec['point']
-            active_radius = float(route_spec['radius'])
-            active_index = index
-            break
+        active_spec, active_index = self._advance_route_progress(context.entity, 'override_route_points', route_specs, context.map_manager)
+        if active_spec is not None:
+            active_target = active_spec['point']
+            active_radius = float(active_spec['radius'])
+            remaining_route_specs = route_specs[active_index:]
+        else:
+            remaining_route_specs = []
 
         staged_target = getattr(context.entity, 'ai_navigation_waypoint', None) or active_target
         speed = self._decision_navigation_speed(decision, context.map_manager)
@@ -907,9 +1230,11 @@ class AIController:
         decision['movement_target'] = staged_target
         decision['velocity'] = velocity
         decision['navigation_radius'] = active_radius
-        decision['route_points'] = tuple((spec['point'][0], spec['point'][1], spec['radius']) for spec in route_specs)
-        if active_index is not None:
-            decision['active_route_index'] = int(active_index)
+        decision['route_points'] = tuple((spec['point'][0], spec['point'][1], spec['radius']) for spec in remaining_route_specs)
+        if active_spec is not None:
+            decision['active_route_index'] = 0
+        else:
+            decision.pop('active_route_index', None)
 
     def _strategy_node_default_radius(self, map_manager=None):
         return max(18.0, self._meters_to_world_units(0.55, map_manager))
@@ -1182,14 +1507,14 @@ class AIController:
             focus_target = context.data.get('target')
             speed = self._meters_to_world_units(1.9, context.map_manager)
             active_nodes = nodes[:self.MAX_STRATEGY_STAGES]
-            for node in active_nodes:
-                point = node.get('point')
-                node_radius = self._strategy_node_radius(node, context.map_manager)
-                if self._is_target_reached(context.entity, point, context.map_manager, navigation_radius=node_radius):
-                    continue
+            progress_key = f'terrain_traversal:{int(stage_index)}'
+            active_node, active_node_index = self._advance_route_progress(context.entity, progress_key, active_nodes, context.map_manager)
+            if active_node is not None:
+                point = active_node.get('point')
+                node_radius = self._strategy_node_radius(active_node, context.map_manager)
                 return self._set_decision(
                     context,
-                    f'{stage_prefix}：前往跨越节点 {int(node.get("index", 1))}/{max(1, len(active_nodes))}',
+                    f'{stage_prefix}：前往跨越节点 {int(active_node.get("index", (active_node_index or 0) + 1))}/{max(1, len(active_nodes))}',
                     target=focus_target,
                     target_point=point,
                     speed=speed,
@@ -1197,6 +1522,7 @@ class AIController:
                     turret_state='aiming' if focus_target is not None else 'searching',
                     navigation_radius=node_radius,
                 )
+            self._clear_route_progress(context.entity, progress_key)
             destination = None
             if str(stage.get('destination_mode', 'region') or 'region') == 'reference':
                 destination = self._strategy_destination_target(context, override, stage)
@@ -1543,6 +1869,121 @@ class AIController:
         x2 = float(region.get('x2', 0.0))
         y2 = float(region.get('y2', 0.0))
         return min(x1, x2) <= px <= max(x1, x2) and min(y1, y2) <= py <= max(y1, y2)
+
+    def _clear_route_progress(self, entity, progress_key=None):
+        state = self._route_progress_state.get(entity.id)
+        if not isinstance(state, dict):
+            return
+        if progress_key is None:
+            self._route_progress_state.pop(entity.id, None)
+            return
+        state.pop(progress_key, None)
+        if not state:
+            self._route_progress_state.pop(entity.id, None)
+
+    def _route_progress_signature(self, route_specs):
+        return tuple(
+            (
+                str(route_spec.get('id', '')),
+                round(float(route_spec['point'][0]), 1),
+                round(float(route_spec['point'][1]), 1),
+                round(float(route_spec.get('radius', 0.0) or 0.0), 1),
+            )
+            for route_spec in route_specs
+        )
+
+    def _advance_route_progress(self, entity, progress_key, route_specs, map_manager=None):
+        if not route_specs:
+            self._clear_route_progress(entity, progress_key)
+            return None, None
+
+        entity_state = self._route_progress_state.setdefault(entity.id, {})
+        signature = self._route_progress_signature(route_specs)
+        progress_state = entity_state.get(progress_key)
+        if not isinstance(progress_state, dict) or progress_state.get('signature') != signature:
+            progress_state = {
+                'signature': signature,
+                'index': 0,
+                'best_distance': None,
+            }
+            entity_state[progress_key] = progress_state
+
+        tolerance = self._arrival_tolerance_world_units(map_manager)
+        index = max(0, min(int(progress_state.get('index', 0)), len(route_specs)))
+        best_distance = progress_state.get('best_distance')
+
+        while index < len(route_specs):
+            route_spec = route_specs[index]
+            point = route_spec['point']
+            radius = max(0.0, float(route_spec.get('radius', 0.0) or 0.0))
+            distance = self._distance_to_point(entity, point)
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+            completion_window = max(radius, tolerance * 0.65)
+            overshoot_margin = max(10.0, tolerance * 0.4)
+            reached = self._is_target_reached(entity, point, map_manager, navigation_radius=radius)
+            overshot = best_distance <= completion_window and distance > best_distance + overshoot_margin
+            if not reached and not overshot:
+                break
+            index += 1
+            best_distance = None
+
+        progress_state['index'] = index
+        progress_state['best_distance'] = best_distance
+        entity_state[progress_key] = progress_state
+
+        if index >= len(route_specs):
+            return None, None
+        return route_specs[index], index
+
+    def _facility_step_side(self, point, facility, map_manager):
+        if point is None or facility is None or map_manager is None:
+            return 0
+        center = map_manager.facility_center(facility)
+        if center is None:
+            return 0
+        team = facility.get('team')
+        if team == 'red':
+            direction = -1.0
+        elif team == 'blue':
+            direction = 1.0
+        else:
+            direction = -1.0 if float(center[1]) >= float(getattr(map_manager, 'map_height', 0.0)) * 0.5 else 1.0
+        delta_y = float(point[1]) - float(center[1])
+        if abs(delta_y) <= max(6.0, float(getattr(map_manager, 'terrain_grid_cell_size', 0.0)) * 0.6):
+            return 0
+        return 1 if delta_y * direction >= 0.0 else -1
+
+    def _engineer_second_step_yield_penalty(self, context, facility_type, facility, resolved_point):
+        if facility_type != 'second_step' or context.data.get('role_key') != 'engineer':
+            return 0.0
+        ally_infantry = context.data.get('allied_infantry')
+        if ally_infantry is None or not ally_infantry.is_alive():
+            return 0.0
+        map_manager = context.map_manager
+        if map_manager is None:
+            return 0.0
+        center = map_manager.facility_center(facility)
+        if center is None:
+            return 0.0
+        entity_point = (float(context.entity.position['x']), float(context.entity.position['y']))
+        infantry_point = (float(ally_infantry.position['x']), float(ally_infantry.position['y']))
+        extent = max(abs(float(facility['x2']) - float(facility['x1'])), abs(float(facility['y2']) - float(facility['y1'])))
+        near_limit = max(extent * 1.7, self._meters_to_world_units(2.4, map_manager))
+        if math.hypot(entity_point[0] - center[0], entity_point[1] - center[1]) > near_limit:
+            return 0.0
+        if math.hypot(infantry_point[0] - center[0], infantry_point[1] - center[1]) > near_limit:
+            return 0.0
+        entity_side = self._facility_step_side(entity_point, facility, map_manager)
+        infantry_side = self._facility_step_side(infantry_point, facility, map_manager)
+        target_side = self._facility_step_side(resolved_point, facility, map_manager)
+        if entity_side == 0 or infantry_side == 0:
+            return 0.0
+        if entity_side == infantry_side:
+            return 0.0
+        if target_side != 0 and target_side == infantry_side:
+            return 340.0
+        return 220.0
 
     def _behavior_region_center(self, region):
         shape = str(region.get('shape', 'rect'))
@@ -2262,6 +2703,128 @@ class AIController:
             path_valid = waypoint is not None or bool(entity.ai_path_preview)
         entity.ai_navigation_path_valid = bool(path_valid)
 
+    def _build_navigation_search_request(self, entity, target_point, map_manager, step_limit, traversal_profile):
+        budget_scale = self._pathfinder_distance_scale(entity, target_point, map_manager)
+        total_budget_sec = self._pathfinder_total_budget_sec * budget_scale
+        base_steps = [max(map_manager.terrain_grid_cell_size * 4, 18)]
+        if self._pathfinder_use_dual_resolution:
+            base_steps.append(max(map_manager.terrain_grid_cell_size * 2, 12))
+        candidate_points = self._target_region_candidate_points(entity, target_point, map_manager)
+        if self._pathfinder_try_resolved_target:
+            resolved_target = map_manager.find_nearest_passable_point(
+                target_point,
+                collision_radius=float(traversal_profile.get('collision_radius', 0.0)),
+                search_radius=max(72, map_manager.terrain_grid_cell_size * 10),
+                step=max(4, map_manager.terrain_grid_cell_size),
+            )
+            if resolved_target is not None and resolved_target != target_point:
+                candidate_points.append(resolved_target)
+        search_plans = [
+            {
+                'steps': tuple(base_steps),
+                'max_iterations': max(self._pathfinder_max_iterations, int(self._pathfinder_max_iterations * budget_scale)),
+                'max_runtime_sec': self._pathfinder_time_budget_sec * budget_scale,
+            },
+            {
+                'steps': tuple(sorted({max(map_manager.terrain_grid_cell_size, 8), max(map_manager.terrain_grid_cell_size * 2, 12), *base_steps})),
+                'max_iterations': max(1200, int(self._pathfinder_max_iterations * 2 * budget_scale)),
+                'max_runtime_sec': max(0.006, self._pathfinder_time_budget_sec * 1.6 * budget_scale),
+            },
+        ]
+        resolved_candidates = []
+        seen_candidates = set()
+        for candidate in candidate_points:
+            resolved_candidate = self._resolve_navigation_target(candidate, map_manager, entity=entity)
+            if resolved_candidate is None:
+                continue
+            key = (round(float(resolved_candidate[0]), 2), round(float(resolved_candidate[1]), 2))
+            if key in seen_candidates:
+                continue
+            seen_candidates.add(key)
+            resolved_candidates.append((float(resolved_candidate[0]), float(resolved_candidate[1])))
+        resolved_candidates.sort(key=lambda point: math.hypot(point[0] - float(entity.position['x']), point[1] - float(entity.position['y'])))
+        max_candidates = max(2, int(self._ai_config.get('pathfinder_max_candidates', 4)))
+        return {
+            'start_point': (float(entity.position['x']), float(entity.position['y'])),
+            'target_point': (float(target_point[0]), float(target_point[1])),
+            'step_limit': float(step_limit),
+            'traversal_profile': dict(traversal_profile or {}),
+            'search_plans': tuple(search_plans),
+            'resolved_candidates': tuple(resolved_candidates[:max_candidates]),
+            'total_budget_sec': float(total_budget_sec),
+        }
+
+    def _run_navigation_search_request(self, map_manager, request):
+        resolved_candidates = tuple(request.get('resolved_candidates', ()))
+        if not resolved_candidates:
+            return self.EMPTY_PATH_PREVIEW
+        start_time = time.perf_counter()
+        total_budget_sec = float(request.get('total_budget_sec', 0.0))
+        deadline = start_time + total_budget_sec if total_budget_sec > 0.0 else None
+        attempts = 0
+        for search_plan in tuple(request.get('search_plans', ())):
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
+            for candidate in resolved_candidates:
+                for grid_step in tuple(search_plan.get('steps', ())):
+                    if attempts >= self._pathfinder_max_attempts:
+                        return self.EMPTY_PATH_PREVIEW
+                    if deadline is not None:
+                        remaining_budget = deadline - time.perf_counter()
+                        if remaining_budget <= 0.0:
+                            return self.EMPTY_PATH_PREVIEW
+                        runtime_limit = min(float(search_plan.get('max_runtime_sec', 0.0)), remaining_budget)
+                    else:
+                        runtime_limit = float(search_plan.get('max_runtime_sec', 0.0))
+                    if runtime_limit <= 0.0002:
+                        return self.EMPTY_PATH_PREVIEW
+                    attempts += 1
+                    path = map_manager.find_path(
+                        request['start_point'],
+                        candidate,
+                        max_height_delta_m=float(request.get('step_limit', 0.05)),
+                        grid_step=grid_step,
+                        traversal_profile=request.get('traversal_profile', {}),
+                        max_iterations=search_plan.get('max_iterations'),
+                        max_runtime_sec=runtime_limit,
+                    )
+                    if path:
+                        return tuple((float(point[0]), float(point[1])) for point in path)
+        return self.EMPTY_PATH_PREVIEW
+
+    def _finalize_navigation_search_path(self, entity, raw_path, target_point, map_manager):
+        raw_path = tuple(raw_path or self.EMPTY_PATH_PREVIEW)
+        if not raw_path:
+            return self.EMPTY_PATH_PREVIEW
+        if not self._is_path_traversable(entity, raw_path, map_manager):
+            return self.EMPTY_PATH_PREVIEW
+        expanded_path = self._expand_path_with_step_transitions(entity, raw_path, map_manager)
+        return tuple(self._segment_path_points(expanded_path, map_manager, entity=entity))
+
+    def _consume_pending_navigation_search(self, entity, target_point, map_manager, state, request_signature):
+        future = state.get('pending_path_future') if isinstance(state, dict) else None
+        if future is None or state.get('pending_request_signature') != request_signature:
+            return None, False
+        if not future.done():
+            return None, True
+        state.pop('pending_path_future', None)
+        state.pop('pending_request_signature', None)
+        state.pop('pending_target_point', None)
+        try:
+            raw_path = tuple(future.result() or self.EMPTY_PATH_PREVIEW)
+        except Exception:
+            raw_path = self.EMPTY_PATH_PREVIEW
+        return self._finalize_navigation_search_path(entity, raw_path, target_point, map_manager), False
+
+    def _submit_navigation_search(self, entity, target_point, map_manager, step_limit, traversal_profile, state, request_signature):
+        if self._path_executor is None:
+            return False
+        request = self._build_navigation_search_request(entity, target_point, map_manager, step_limit, traversal_profile)
+        state['pending_path_future'] = self._path_executor.submit(self._run_navigation_search_request, map_manager, request)
+        state['pending_request_signature'] = request_signature
+        state['pending_target_point'] = (float(target_point[0]), float(target_point[1]))
+        return True
+
     def _clear_navigation_overlay_state(self, entity):
         self._set_navigation_overlay_state(entity, waypoint=None, preview=self.EMPTY_PATH_PREVIEW, path_valid=False, region_radius=0.0, traversal_state='idle')
 
@@ -2309,6 +2872,7 @@ class AIController:
         runtime_maps = (
             self._last_ai_update_time,
             self._entity_path_state,
+            self._route_progress_state,
             self._stuck_state,
             self._forced_supply_escape_state,
             self._post_supply_goal_state,
@@ -3039,13 +3603,13 @@ class AIController:
         return waypoint
 
     def _navigation_subgoal_spacing(self, map_manager=None):
-        spacing_m = float(self._ai_config.get('navigation_subgoal_spacing_m', 1.35))
+        spacing_m = float(self._ai_config.get('navigation_subgoal_spacing_m', 1.75))
         base_step = 18.0
         if map_manager is not None:
             base_step = max(base_step, float(map_manager.terrain_grid_cell_size) * 2.0)
         return max(base_step, self._meters_to_world_units(spacing_m, map_manager))
 
-    def _segment_path_points(self, path_points, map_manager=None):
+    def _segment_path_points(self, path_points, map_manager=None, entity=None):
         if not path_points:
             return self.EMPTY_PATH_PREVIEW
 
@@ -3062,6 +3626,11 @@ class AIController:
 
         add_point(path_points[0])
         max_segment = self._navigation_subgoal_spacing(map_manager)
+        role_key = self._role_key(entity) if entity is not None else None
+        if role_key in {'engineer', 'infantry'}:
+            max_segment *= 1.18
+        elif role_key in {'hero', 'sentry'}:
+            max_segment *= 1.08
         for point in path_points[1:]:
             start = segmented[-1]
             end = (float(point[0]), float(point[1]))
@@ -3556,7 +4125,7 @@ class AIController:
 
     def _basic_movement_segment_status(self, entity, from_point, to_point, map_manager, step_limit=None):
         if map_manager is None or from_point is None or to_point is None:
-            return {'passable': False, 'requires_step': False, 'transition': None, 'reason': 'no_map', 'detour_points': self.EMPTY_PATH_PREVIEW}
+            return {'passable': False, 'requires_step': False, 'transition': None, 'traversal': None, 'reason': 'no_map', 'detour_points': self.EMPTY_PATH_PREVIEW}
         resolved_step_limit = float(step_limit if step_limit is not None else getattr(entity, 'max_terrain_step_height_m', 0.05))
         cache_key = (
             'basic',
@@ -3581,8 +4150,23 @@ class AIController:
             max_height_delta_m=resolved_step_limit,
             collision_radius=float(getattr(entity, 'collision_radius', 0.0)),
         )
+        traversal = map_manager.describe_segment_traversal(
+            float(from_point[0]),
+            float(from_point[1]),
+            float(to_point[0]),
+            float(to_point[1]),
+            max_height_delta_m=resolved_step_limit,
+        )
         if result.get('ok'):
-            status = {'passable': True, 'requires_step': False, 'transition': None, 'reason': 'ok', 'detour_points': self.EMPTY_PATH_PREVIEW}
+            requires_step = bool(isinstance(traversal, dict) and str(traversal.get('facility_type', '')) in {'first_step', 'second_step'})
+            status = {
+                'passable': True,
+                'requires_step': requires_step,
+                'transition': traversal if requires_step else None,
+                'traversal': traversal,
+                'reason': 'ok',
+                'detour_points': self.EMPTY_PATH_PREVIEW,
+            }
             self._movement_status_cache[cache_key] = status
             return status
         transition = None
@@ -3595,10 +4179,25 @@ class AIController:
                 max_height_delta_m=resolved_step_limit,
             )
         if transition is not None:
-            status = {'passable': True, 'requires_step': True, 'transition': transition, 'reason': 'step', 'detour_points': self.EMPTY_PATH_PREVIEW}
+            traversal = traversal or transition
+            status = {
+                'passable': True,
+                'requires_step': True,
+                'transition': transition,
+                'traversal': traversal,
+                'reason': 'step',
+                'detour_points': self.EMPTY_PATH_PREVIEW,
+            }
             self._movement_status_cache[cache_key] = status
             return status
-        status = {'passable': False, 'requires_step': False, 'transition': None, 'reason': result.get('reason', 'blocked'), 'detour_points': self.EMPTY_PATH_PREVIEW}
+        status = {
+            'passable': False,
+            'requires_step': False,
+            'transition': None,
+            'traversal': traversal,
+            'reason': result.get('reason', 'blocked'),
+            'detour_points': self.EMPTY_PATH_PREVIEW,
+        }
         self._movement_status_cache[cache_key] = status
         return status
 
@@ -3784,6 +4383,7 @@ class AIController:
                 'passable': True,
                 'requires_step': False,
                 'transition': None,
+                'traversal': None,
                 'reason': 'probe_detour',
                 'detour_points': detour_points,
             }
@@ -4480,6 +5080,7 @@ class AIController:
                     role_bias -= 12.0
                 if role_key == 'engineer' and facility_type == 'fly_slope':
                     role_bias += 24.0
+                role_bias += self._engineer_second_step_yield_penalty(context, facility_type, facility, resolved)
                 score = distance_to_entity * 0.58 + distance_to_target * 0.42 + terrain_bias + role_bias
                 candidates.append((score, facility_type, facility, resolved))
         if not candidates:
@@ -5095,7 +5696,21 @@ class AIController:
 
         direct_traverse_distance = self._distance_to_point(entity, target_point)
         direct_traverse_limit = math.hypot(float(map_manager.map_width), float(map_manager.map_height))
-        direct_status = self._movement_segment_status(entity, (entity.position['x'], entity.position['y']), target_point, map_manager)
+        current_time = self._last_ai_update_time.get(entity.id, 0.0)
+        state = self._entity_path_state.get(entity.id)
+        direct_target_signature = (round(float(target_point[0]), 1), round(float(target_point[1]), 1))
+        direct_status = None
+        if state is not None and state.get('direct_target') == direct_target_signature and current_time < float(state.get('direct_status_until', 0.0)):
+            direct_status = state.get('direct_status')
+        if direct_status is None:
+            direct_status = self._movement_segment_status(entity, (entity.position['x'], entity.position['y']), target_point, map_manager)
+            if state is None:
+                state = {}
+                self._entity_path_state[entity.id] = state
+            direct_interval = self._direct_segment_check_interval
+            state['direct_target'] = direct_target_signature
+            state['direct_status'] = direct_status
+            state['direct_status_until'] = current_time + direct_interval
         if direct_traverse_distance <= direct_traverse_limit and direct_status['passable']:
             raw_path = [(float(entity.position['x']), float(entity.position['y']))]
             for detour_point in tuple(direct_status.get('detour_points', ())) or self.EMPTY_PATH_PREVIEW:
@@ -5106,7 +5721,7 @@ class AIController:
             if raw_path[-1] != final_target:
                 raw_path.append(final_target)
             expanded_path = self._expand_path_with_step_transitions(entity, raw_path, map_manager)
-            segmented_path = tuple(self._segment_path_points(expanded_path, map_manager))
+            segmented_path = tuple(self._segment_path_points(expanded_path, map_manager, entity=entity))
             traversal_state = 'step-passable' if any(self._movement_segment_status(entity, segmented_path[idx], segmented_path[idx + 1], map_manager)['requires_step'] for idx in range(len(segmented_path) - 1)) else 'passable'
             direct_index = 1 if len(segmented_path) > 1 else 0
             direct_waypoint = segmented_path[direct_index] if segmented_path else (float(target_point[0]), float(target_point[1]))
@@ -5117,6 +5732,9 @@ class AIController:
                 'planned_at': self._last_ai_update_time.get(entity.id, 0.0),
                 'last_speed': math.hypot(float(getattr(entity, 'velocity', {}).get('vx', 0.0)), float(getattr(entity, 'velocity', {}).get('vy', 0.0))),
                 'last_wp_distance': self._distance_to_point(entity, direct_waypoint),
+                'direct_target': direct_target_signature,
+                'direct_status': direct_status,
+                'direct_status_until': current_time + self._direct_segment_check_interval,
             }
             preview = self._build_path_preview(entity, segmented_path, direct_index)
             self._set_navigation_overlay_state(entity, waypoint=direct_waypoint, preview=preview, path_valid=True, region_radius=self._target_region_radius(entity, target_point, map_manager), traversal_state=traversal_state)
@@ -5129,7 +5747,6 @@ class AIController:
         goal_cell = self._path_cell({'x': target_point[0], 'y': target_point[1]}, map_manager)
         state = self._entity_path_state.get(entity.id)
         state_view = state or {}
-        current_time = self._last_ai_update_time.get(entity.id, 0.0)
         current_speed = math.hypot(float(getattr(entity, 'velocity', {}).get('vx', 0.0)), float(getattr(entity, 'velocity', {}).get('vy', 0.0)))
         force_fresh_replan = False
         path_signature_changed = False
@@ -5233,42 +5850,73 @@ class AIController:
         if need_replan:
             cache_key = (start_cell, goal_cell, raster_version, round(step_limit, 3), traversal_profile['step_climb_duration_sec'], round(traversal_profile.get('collision_radius', 0.0), 2))
             path = None
+            path_pending = False
             fail_count = int(state_view.get('fail_count', 0))
             next_replan_at = float(state_view.get('next_replan_at', 0.0))
+            pending_future = state_view.get('pending_path_future') if isinstance(state_view, dict) else None
+            pending_signature = state_view.get('pending_request_signature') if isinstance(state_view, dict) else None
+            pending_target_point = state_view.get('pending_target_point') if isinstance(state_view, dict) else None
+            pending_path, path_pending = self._consume_pending_navigation_search(entity, target_point, map_manager, state_view, cache_key)
+            if pending_path:
+                path = tuple(pending_path)
+                fail_count = 0
+                next_replan_at = 0.0
             if not force_fresh_replan:
-                cache_entry = self._path_cache.get(cache_key)
-                if isinstance(cache_entry, dict):
-                    cached_path = tuple(cache_entry.get('path', self.EMPTY_PATH_PREVIEW))
-                    cached_retry_at = float(cache_entry.get('next_replan_at', 0.0))
-                    if cached_path or cached_retry_at > current_time:
-                        path = cached_path
-                        fail_count = int(cache_entry.get('fail_count', fail_count))
-                        next_replan_at = cached_retry_at
-                elif cache_entry is not None:
-                    path = tuple(cache_entry)
-            if path is None:
+                if path is None:
+                    cache_entry = self._path_cache.get(cache_key)
+                    if isinstance(cache_entry, dict):
+                        cached_path = tuple(cache_entry.get('path', self.EMPTY_PATH_PREVIEW))
+                        cached_retry_at = float(cache_entry.get('next_replan_at', 0.0))
+                        if cached_path or cached_retry_at > current_time:
+                            path = cached_path
+                            fail_count = int(cache_entry.get('fail_count', fail_count))
+                            next_replan_at = cached_retry_at
+                    elif cache_entry is not None:
+                        path = tuple(cache_entry)
+            if path is None and not path_pending:
                 if self._can_replan_path():
-                    path = self._search_navigation_path(entity, target_point, map_manager, step_limit, traversal_profile)
-                    path = tuple(path or self.EMPTY_PATH_PREVIEW)
+                    submit_state = dict(state_view) if isinstance(state_view, dict) else {}
+                    if self._submit_navigation_search(entity, target_point, map_manager, step_limit, traversal_profile, submit_state, cache_key):
+                        path_pending = True
+                    else:
+                        path = self._finalize_navigation_search_path(
+                            entity,
+                            self._run_navigation_search_request(
+                                map_manager,
+                                self._build_navigation_search_request(entity, target_point, map_manager, step_limit, traversal_profile),
+                            ),
+                            target_point,
+                            map_manager,
+                        )
+                    pending_future = submit_state.get('pending_path_future')
+                    pending_signature = submit_state.get('pending_request_signature')
+                    pending_target_point = submit_state.get('pending_target_point')
                     if path:
                         fail_count = 0
                         next_replan_at = 0.0
-                    else:
+                    elif not path_pending:
                         fail_count = min(8, fail_count + 1)
                         retry_delay = min(self._path_failure_retry_max_sec, self._path_failure_retry_sec * (2 ** max(0, fail_count - 1)))
                         next_replan_at = current_time + retry_delay
-                    if len(self._path_cache) > 64:
-                        self._path_cache.clear()
-                    self._path_cache[cache_key] = {
-                        'path': path,
-                        'fail_count': fail_count,
-                        'next_replan_at': next_replan_at,
-                    }
+                    if not path_pending:
+                        if len(self._path_cache) > 64:
+                            self._path_cache.clear()
+                        self._path_cache[cache_key] = {
+                            'path': tuple(path or self.EMPTY_PATH_PREVIEW),
+                            'fail_count': fail_count,
+                            'next_replan_at': next_replan_at,
+                        }
                 else:
                     path = tuple(state_view.get('path', self.EMPTY_PATH_PREVIEW))
             elif path:
                 fail_count = 0
                 next_replan_at = 0.0
+            if path_pending and not path:
+                path = tuple(state_view.get('path', self.EMPTY_PATH_PREVIEW))
+            if not path_pending:
+                pending_future = None
+                pending_signature = None
+                pending_target_point = None
             state = {
                 'start_cell': start_cell,
                 'goal_cell': goal_cell,
@@ -5285,6 +5933,10 @@ class AIController:
                 'last_speed': current_speed,
                 'last_wp_distance': 0.0,
             }
+            if pending_future is not None and pending_signature == cache_key:
+                state['pending_path_future'] = pending_future
+                state['pending_request_signature'] = pending_signature
+                state['pending_target_point'] = pending_target_point
             self._entity_path_state[entity.id] = state
             self._stuck_state[entity.id] = {
                 'best_distance': float('inf'),
@@ -5364,7 +6016,7 @@ class AIController:
                 if local_path[-1] != waypoint_target:
                     local_path.append(waypoint_target)
                 local_expanded_path = self._expand_path_with_step_transitions(entity, local_path, map_manager)
-                segmented_local_path = tuple(self._segment_path_points(local_expanded_path, map_manager))
+                segmented_local_path = tuple(self._segment_path_points(local_expanded_path, map_manager, entity=entity))
                 detour_index = 1 if len(segmented_local_path) > 1 else 0
                 detour_waypoint = segmented_local_path[detour_index] if segmented_local_path else waypoint_target
                 preview_path = list(segmented_local_path)
@@ -5394,10 +6046,21 @@ class AIController:
                 preview = ((float(entity.position['x']), float(entity.position['y'])), (float(path[index][0]), float(path[index][1])), (float(target_point[0]), float(target_point[1])))
                 self._set_navigation_overlay_state(entity, waypoint=path[index], preview=preview, path_valid=False, traversal_state='blocked')
                 return path[index]
-            refreshed_path = self._search_navigation_path(entity, target_point, map_manager, step_limit, traversal_profile)
-            state['path'] = tuple(refreshed_path or self.EMPTY_PATH_PREVIEW)
-            state['index'] = self._path_waypoint_index(state['path'], 1)
-            state['planned_at'] = current_time
+            refresh_signature = (
+                start_cell,
+                goal_cell,
+                raster_version,
+                round(step_limit, 3),
+                traversal_profile['step_climb_duration_sec'],
+                round(traversal_profile.get('collision_radius', 0.0), 2),
+            )
+            refreshed_path, refresh_pending = self._consume_pending_navigation_search(entity, target_point, map_manager, state, refresh_signature)
+            if refreshed_path:
+                state['path'] = tuple(refreshed_path or self.EMPTY_PATH_PREVIEW)
+                state['index'] = self._path_waypoint_index(state['path'], 1)
+                state['planned_at'] = current_time
+            elif not refresh_pending:
+                self._submit_navigation_search(entity, target_point, map_manager, step_limit, traversal_profile, state, refresh_signature)
             if not state['path']:
                 forced_anchor = self._activate_infantry_supply_escape(entity, target_point, map_manager, current_time)
                 if forced_anchor is not None:
@@ -5499,7 +6162,7 @@ class AIController:
                     )
                     if self._is_path_traversable(entity, path, map_manager):
                         expanded_path = self._expand_path_with_step_transitions(entity, path, map_manager)
-                        return tuple(self._segment_path_points(expanded_path, map_manager))
+                        return tuple(self._segment_path_points(expanded_path, map_manager, entity=entity))
         return self.EMPTY_PATH_PREVIEW
 
     def _expand_path_with_step_transitions(self, entity, path, map_manager):
@@ -5515,16 +6178,21 @@ class AIController:
             for segment_target in segment_targets:
                 normalized_target = (float(segment_target[0]), float(segment_target[1]))
                 segment_status = self._basic_movement_segment_status(entity, segment_start, normalized_target, map_manager)
-                if segment_status['requires_step'] and segment_status['transition'] is not None:
+                traversal = segment_status.get('traversal') or segment_status.get('transition')
+                extra_points = self._terrain_policy_path_points(entity, traversal, map_manager) if traversal is not None else self.EMPTY_PATH_PREVIEW
+                if not extra_points and segment_status['requires_step'] and segment_status['transition'] is not None:
                     transition = segment_status['transition']
                     approach_point = transition.get('approach_point')
                     climb_points = tuple(transition.get('climb_points', ())) or (transition.get('top_point'),)
-                    for extra_point in (approach_point, *climb_points):
-                        if extra_point is None:
-                            continue
-                        normalized = (float(extra_point[0]), float(extra_point[1]))
-                        if expanded[-1] != normalized:
-                            expanded.append(normalized)
+                    extra_points = tuple(
+                        (float(extra_point[0]), float(extra_point[1]))
+                        for extra_point in (approach_point, *climb_points)
+                        if extra_point is not None
+                    )
+                for extra_point in extra_points:
+                    normalized = (float(extra_point[0]), float(extra_point[1]))
+                    if expanded[-1] != normalized:
+                        expanded.append(normalized)
                 if expanded[-1] != normalized_target:
                     expanded.append(normalized_target)
                 segment_start = normalized_target
