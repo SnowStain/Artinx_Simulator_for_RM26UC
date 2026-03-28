@@ -154,6 +154,8 @@ class GameEngine:
             self.logs.pop(0)
 
     def _record_perf_sample(self, update_ms, render_ms, frame_ms, breakdown=None, game_time=0.0):
+        if not self.match_started:
+            return
         sample = {
             'update_ms': float(update_ms),
             'render_ms': float(render_ms),
@@ -303,7 +305,13 @@ class GameEngine:
     def update(self):
         """更新游戏状态"""
         if self.paused or not self.match_started:
+            self._last_update_breakdown = None
             return
+
+        active_entity_ids = {entity.id for entity in self.entity_manager.entities if entity.is_alive()}
+        stale_autoaim_ids = [entity_id for entity_id in self._last_auto_aim_update.keys() if entity_id not in active_entity_ids]
+        for entity_id in stale_autoaim_ids:
+            self._last_auto_aim_update.pop(entity_id, None)
 
         measure_perf = self._should_measure_perf()
 
@@ -394,18 +402,21 @@ class GameEngine:
             if getattr(entity, 'respawn_weak_active', False):
                 entity.target = None
                 entity.auto_aim_locked = False
+                entity.auto_aim_hit_probability = 0.0
                 entity.fire_control_state = 'idle'
                 self._clear_auto_aim_lock(entity)
                 continue
             if entity.type == 'sentry' and getattr(entity, 'front_gun_locked', False):
                 entity.target = None
                 entity.auto_aim_locked = False
+                entity.auto_aim_hit_probability = 0.0
                 entity.fire_control_state = 'idle'
                 self._clear_auto_aim_lock(entity)
                 continue
             if not self.entity_has_barrel(entity):
                 entity.target = None
                 entity.auto_aim_locked = False
+                entity.auto_aim_hit_probability = 0.0
                 entity.fire_control_state = 'idle'
                 self._clear_auto_aim_lock(entity)
                 entity.ai_decision = '工程仅保留机械臂，不参与自动射击'
@@ -448,6 +459,7 @@ class GameEngine:
                 else:
                     entity.target = None
                     entity.auto_aim_locked = False
+                    entity.auto_aim_hit_probability = 0.0
                     entity.fire_control_state = 'idle'
                     wait_text = '部署模式待机，当前无可视敌方前哨/基地'
                     entity.ai_decision = f'{base_decision} | {wait_text}' if base_decision else wait_text
@@ -461,6 +473,7 @@ class GameEngine:
             if target is None:
                 entity.target = None
                 entity.auto_aim_locked = False
+                entity.auto_aim_hit_probability = 0.0
                 entity.fire_control_state = 'idle'
                 self._clear_auto_aim_lock(entity)
                 entity.ai_decision = f'{base_decision} | 未发现满足地形可视条件的目标' if base_decision else '未发现满足地形可视条件的目标'
@@ -486,6 +499,7 @@ class GameEngine:
                 entity.turret_angle = (current_angle + max_step * (1 if angle_diff > 0 else -1)) % 360
 
             assessment = self.rules_engine.evaluate_auto_aim_target(entity, target, distance=distance, require_fov=True)
+            entity.auto_aim_hit_probability = self.rules_engine.calculate_hit_probability(entity, target, distance)
             entity.auto_aim_locked = bool(assessment.get('can_auto_aim', False))
             effective_fire_rate = self.rules_engine.get_effective_fire_rate_hz(entity)
             entity.fire_control_state = 'firing' if entity.auto_aim_locked and getattr(entity, 'ammo', 0) > 0 and effective_fire_rate > 0 else 'idle'
@@ -712,6 +726,7 @@ class GameEngine:
                     self.add_log('游戏结束', 'system')
                 self.paused = True
                 self._game_over_announced = True
+                self._last_update_breakdown = None
             
             # 渲染画面
             renderer.render(self)
@@ -719,7 +734,8 @@ class GameEngine:
             update_ms = (update_end - update_start) * 1000.0
             render_ms = (frame_end - update_end) * 1000.0
             frame_ms = (frame_end - frame_start) * 1000.0
-            self._record_perf_sample(update_ms, render_ms, frame_ms, breakdown=breakdown, game_time=self.game_time)
+            if self.match_started and not self.paused:
+                self._record_perf_sample(update_ms, render_ms, frame_ms, breakdown=breakdown, game_time=self.game_time)
             self._maybe_log_perf()
             
             # 控制帧率
@@ -1004,6 +1020,12 @@ class GameEngine:
             'respawn_weak_active': bool(getattr(entity, 'respawn_weak_active', False)),
             'fort_buff_active': bool(getattr(entity, 'fort_buff_active', False)),
             'terrain_buff_timer': float(getattr(entity, 'terrain_buff_timer', 0.0)),
+            'energy_small_buff_timer': float(getattr(entity, 'energy_small_buff_timer', 0.0)),
+            'energy_large_buff_timer': float(getattr(entity, 'energy_large_buff_timer', 0.0)),
+            'energy_large_damage_dealt_mult': float(getattr(entity, 'energy_large_damage_dealt_mult', 1.0)),
+            'energy_large_damage_taken_mult': float(getattr(entity, 'energy_large_damage_taken_mult', 1.0)),
+            'energy_large_cooling_mult': float(getattr(entity, 'energy_large_cooling_mult', 1.0)),
+            'energy_mechanism_state': dict(self.rules_engine.get_energy_mechanism_snapshot(entity.team)),
             'active_buff_labels': list(getattr(entity, 'active_buff_labels', [])),
             'carried_minerals': int(getattr(entity, 'carried_minerals', 0)),
             'carried_mineral_type': getattr(entity, 'carried_mineral_type', None),

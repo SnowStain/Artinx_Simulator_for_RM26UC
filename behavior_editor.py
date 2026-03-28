@@ -20,6 +20,7 @@ from map.map_manager import MapManager
 
 class BehaviorEditorEngine:
     ROLE_ORDER = ('sentry', 'infantry', 'hero', 'engineer')
+    MAX_STRATEGY_STAGES = 4
     ROLE_PREVIEW_ENTITY_IDS = {
         'hero': 'robot_1',
         'engineer': 'robot_2',
@@ -30,6 +31,71 @@ class BehaviorEditorEngine:
         'enter_then_execute': '先进入区域再执行',
         'strict_inside': '仅在区域内触发',
     }
+    STRATEGY_TASK_TYPE_ORDER = ('default', 'terrain_traversal', 'assault', 'field_interaction', 'defense', 'area_patrol')
+    STRATEGY_TASK_TYPE_LABELS = {
+        'default': '默认行为树',
+        'terrain_traversal': '地形跨越类',
+        'assault': '进攻类',
+        'field_interaction': '场地交互类',
+        'defense': '防守类',
+        'area_patrol': '区域巡航类',
+    }
+    DESTINATION_MODE_ORDER = ('region', 'reference', 'none')
+    DESTINATION_MODE_LABELS = {
+        'region': '到达选定区域',
+        'reference': '跟随引用目标',
+        'none': '不设置目标地点',
+    }
+    DESTINATION_REFERENCE_ORDER = (
+        'enemy_any_unit', 'enemy_hero', 'enemy_infantry', 'enemy_engineer', 'enemy_sentry',
+        'enemy_any_facility', 'enemy_outpost', 'enemy_base',
+        'ally_hero', 'ally_infantry', 'ally_engineer', 'ally_sentry',
+        'own_supply', 'own_base', 'own_outpost',
+        'enemy_outpost_anchor', 'enemy_base_anchor', 'map_center',
+    )
+    ASSAULT_REFERENCE_ORDER = (
+        'enemy_any_unit', 'enemy_hero', 'enemy_infantry', 'enemy_engineer', 'enemy_sentry',
+        'enemy_any_facility', 'enemy_outpost', 'enemy_base',
+    )
+    ASSAULT_FOLLOW_PRIORITY_ORDER = ('target_first', 'destination_first')
+    ASSAULT_FOLLOW_PRIORITY_LABELS = {
+        'target_first': '目标优先',
+        'destination_first': '引用地点优先',
+    }
+    FIELD_INTERACTION_ORDER = ('own_supply', 'mining_area', 'energy_mechanism')
+    FIELD_INTERACTION_LABELS = {
+        'own_supply': '补给',
+        'mining_area': '取矿',
+        'energy_mechanism': '激活能量机关',
+    }
+    DEFENSE_REFERENCE_ORDER = ('high_threat_enemy', 'defend_base')
+    DEFENSE_REFERENCE_LABELS = {
+        'high_threat_enemy': '打击高威胁敌人',
+        'defend_base': '回防基地',
+    }
+    STRATEGY_REFERENCE_LABELS = {
+        'enemy_any_unit': '敌方任意单位',
+        'enemy_hero': '敌方英雄',
+        'enemy_infantry': '敌方步兵',
+        'enemy_engineer': '敌方工程',
+        'enemy_sentry': '敌方哨兵',
+        'enemy_any_facility': '敌方任意设施',
+        'enemy_outpost': '敌方前哨站',
+        'enemy_base': '敌方基地',
+        'ally_hero': '己方英雄',
+        'ally_infantry': '己方步兵',
+        'ally_engineer': '己方工程',
+        'ally_sentry': '己方哨兵',
+        'own_supply': '己方补给区',
+        'own_base': '己方基地',
+        'own_outpost': '己方前哨站',
+        'enemy_outpost_anchor': '敌前哨锚点',
+        'enemy_base_anchor': '敌基地锚点',
+        'map_center': '地图中心',
+    }
+    STRATEGY_TERRAIN_TARGET_DEFS = tuple(
+        {'id': f'node_{index}', 'label': f'跨越节点 {index}'} for index in range(1, MAX_STRATEGY_STAGES + 1)
+    )
 
     def __init__(self, config_path='config.json', settings_path='settings.json'):
         self.config_path = config_path
@@ -116,9 +182,14 @@ class BehaviorEditorEngine:
         if role_entry is None:
             return None
         decisions = role_entry.setdefault('decisions', {})
-        if spec['id'] not in decisions and create:
-            decisions[spec['id']] = {}
-        return decisions.get(spec['id'])
+        canonical_id = self.ai_controller._canonical_decision_id(spec['id'])
+        if canonical_id not in decisions:
+            for alias_id in self.ai_controller._decision_alias_ids(canonical_id):
+                if alias_id in decisions:
+                    return decisions.get(alias_id)
+        if canonical_id not in decisions and create:
+            decisions[canonical_id] = {}
+        return decisions.get(canonical_id)
 
     def _normalize_region_list(self, regions):
         if not isinstance(regions, list):
@@ -136,14 +207,44 @@ class BehaviorEditorEngine:
         return normalized
 
     def _normalize_point_target_map(self, point_targets):
+        specs = self._normalize_point_target_specs(point_targets)
+        return {
+            key: [float(spec['x']), float(spec['y'])]
+            for key, spec in specs.items()
+        }
+
+    def _normalize_point_target_specs(self, point_targets):
         if not isinstance(point_targets, dict):
             return {}
         normalized = {}
+        aliases = {'primary': 'node_1', 'secondary': 'node_2', 'first': 'node_1', 'second': 'node_2'}
         for key, value in point_targets.items():
-            if not isinstance(key, str) or not isinstance(value, (list, tuple)) or len(value) < 2:
+            if not isinstance(key, str):
                 continue
             try:
-                normalized[key] = [round(float(value[0]), 1), round(float(value[1]), 1)]
+                radius = None
+                if isinstance(value, dict):
+                    point_x = value.get('x', value.get('cx'))
+                    point_y = value.get('y', value.get('cy'))
+                    radius = value.get('radius')
+                elif isinstance(value, (list, tuple)) and len(value) >= 2:
+                    point_x = value[0]
+                    point_y = value[1]
+                    radius = value[2] if len(value) >= 3 else None
+                else:
+                    continue
+                if point_x in {None, ''} or point_y in {None, ''}:
+                    continue
+                point_x_value = float(str(point_x))
+                point_y_value = float(str(point_y))
+                spec = {
+                    'x': round(point_x_value, 1),
+                    'y': round(point_y_value, 1),
+                }
+                if radius not in {None, ''}:
+                    radius_value = float(str(radius))
+                    spec['radius'] = round(max(6.0, radius_value), 1)
+                normalized[aliases.get(key, key)] = spec
             except (TypeError, ValueError):
                 continue
         return normalized
@@ -158,55 +259,144 @@ class BehaviorEditorEngine:
                 normalized[team] = targets
         return normalized
 
+    def _normalize_team_point_target_specs(self, team_targets):
+        if not isinstance(team_targets, dict):
+            return {}
+        normalized = {}
+        for team in ('red', 'blue'):
+            targets = self._normalize_point_target_specs(team_targets.get(team, {}))
+            if targets:
+                normalized[team] = targets
+        return normalized
+
+    def _normalize_strategy_stage(self, strategy):
+        if not isinstance(strategy, dict):
+            return {}
+        normalized = {}
+        task_type = str(strategy.get('task_type', 'default') or 'default').strip()
+        if task_type not in self.STRATEGY_TASK_TYPE_ORDER:
+            task_type = 'default'
+        if task_type != 'default':
+            normalized['task_type'] = task_type
+        destination_mode = str(strategy.get('destination_mode', 'region') or 'region').strip()
+        if destination_mode not in self.DESTINATION_MODE_ORDER:
+            destination_mode = 'region'
+        if destination_mode != 'region':
+            normalized['destination_mode'] = destination_mode
+        destination_ref = str(strategy.get('destination_ref', '') or '').strip()
+        if destination_ref:
+            normalized['destination_ref'] = destination_ref
+        assault_ref = str(strategy.get('assault_ref', 'enemy_any_unit') or 'enemy_any_unit').strip()
+        if assault_ref and assault_ref != 'enemy_any_unit':
+            normalized['assault_ref'] = assault_ref
+        assault_follow_priority = str(strategy.get('assault_follow_priority', 'target_first') or 'target_first').strip()
+        if assault_follow_priority in self.ASSAULT_FOLLOW_PRIORITY_ORDER and assault_follow_priority != 'target_first':
+            normalized['assault_follow_priority'] = assault_follow_priority
+        interaction_ref = str(strategy.get('interaction_ref', 'own_supply') or 'own_supply').strip()
+        if interaction_ref in self.FIELD_INTERACTION_ORDER and interaction_ref != 'own_supply':
+            normalized['interaction_ref'] = interaction_ref
+        defense_ref = str(strategy.get('defense_ref', 'high_threat_enemy') or 'high_threat_enemy').strip()
+        if defense_ref in self.DEFENSE_REFERENCE_ORDER and defense_ref != 'high_threat_enemy':
+            normalized['defense_ref'] = defense_ref
+        engage_distance = strategy.get('engage_distance_m', None)
+        if engage_distance not in {None, ''}:
+            try:
+                engage_value = max(0.5, float(str(engage_distance)))
+            except (TypeError, ValueError):
+                engage_value = None
+            if engage_value is not None and abs(engage_value - 8.0) > 1e-6:
+                normalized['engage_distance_m'] = round(engage_value, 2)
+        return normalized
+
+    def _normalize_strategy(self, strategy):
+        if not isinstance(strategy, dict):
+            return {}
+        stages = []
+        raw_stages = strategy.get('stages', None)
+        if isinstance(raw_stages, list):
+            for stage in raw_stages[:self.MAX_STRATEGY_STAGES]:
+                normalized_stage = self._normalize_strategy_stage(stage)
+                if normalized_stage:
+                    stages.append(normalized_stage)
+        else:
+            normalized_stage = self._normalize_strategy_stage(strategy)
+            if normalized_stage:
+                stages.append(normalized_stage)
+        return {'stages': stages} if stages else {}
+
     def _override_is_default(self, normalized):
         return (
             not normalized.get('label')
+            and not normalized.get('brief')
+            and not normalized.get('trigger_note')
+            and not normalized.get('logic_note')
+            and not normalized.get('function_note')
             and 'enabled' not in normalized
             and not normalized.get('condition_expr')
             and not normalized.get('time_window')
-            and not normalized.get('task_regions')
-            and not normalized.get('destination_regions')
-            and not normalized.get('task_regions_by_team')
-            and not normalized.get('destination_regions_by_team')
+            and not normalized.get('behavior_regions')
+            and not normalized.get('behavior_regions_by_team')
             and not normalized.get('point_targets')
             and not normalized.get('point_targets_by_team')
+            and not normalized.get('strategy')
             and normalized.get('region_mode', 'enter_then_execute') == 'enter_then_execute'
         )
 
     def _normalize_override(self, override):
         override = deepcopy(override or {})
+        for field_name in ('brief', 'trigger_note', 'logic_note', 'function_note'):
+            text = str(override.get(field_name, '') or '').strip()
+            if text:
+                override[field_name] = text
+            else:
+                override.pop(field_name, None)
         if 'time_window' in override and not isinstance(override['time_window'], dict):
             override.pop('time_window', None)
-        task_regions = self._normalize_region_list(override.get('task_regions', []))
-        if task_regions:
-            override['task_regions'] = task_regions
+        behavior_regions = self._normalize_region_list(override.get('behavior_regions', []))
+        if not behavior_regions:
+            legacy_behavior_regions = []
+            for region in self._normalize_region_list(override.get('task_regions', [])) + self._normalize_region_list(override.get('destination_regions', [])):
+                if region not in legacy_behavior_regions:
+                    legacy_behavior_regions.append(region)
+            behavior_regions = legacy_behavior_regions
+        if behavior_regions:
+            override['behavior_regions'] = behavior_regions
         else:
-            override.pop('task_regions', None)
-        destination_regions = self._normalize_region_list(override.get('destination_regions', []))
-        if destination_regions:
-            override['destination_regions'] = destination_regions
+            override.pop('behavior_regions', None)
+        behavior_regions_by_team = self._normalize_team_region_map(override.get('behavior_regions_by_team', {}))
+        if not behavior_regions_by_team:
+            merged_by_team = {}
+            for team in ('red', 'blue'):
+                team_regions = []
+                for region in self._normalize_region_list((override.get('task_regions_by_team', {}) or {}).get(team, [])) + self._normalize_region_list((override.get('destination_regions_by_team', {}) or {}).get(team, [])):
+                    if region not in team_regions:
+                        team_regions.append(region)
+                if team_regions:
+                    merged_by_team[team] = team_regions
+            behavior_regions_by_team = merged_by_team
+        if behavior_regions_by_team:
+            override['behavior_regions_by_team'] = behavior_regions_by_team
         else:
-            override.pop('destination_regions', None)
-        task_regions_by_team = self._normalize_team_region_map(override.get('task_regions_by_team', {}))
-        if task_regions_by_team:
-            override['task_regions_by_team'] = task_regions_by_team
-        else:
-            override.pop('task_regions_by_team', None)
-        destination_regions_by_team = self._normalize_team_region_map(override.get('destination_regions_by_team', {}))
-        if destination_regions_by_team:
-            override['destination_regions_by_team'] = destination_regions_by_team
-        else:
-            override.pop('destination_regions_by_team', None)
-        point_targets = self._normalize_point_target_map(override.get('point_targets', {}))
+            override.pop('behavior_regions_by_team', None)
+        override.pop('task_regions', None)
+        override.pop('destination_regions', None)
+        override.pop('task_regions_by_team', None)
+        override.pop('destination_regions_by_team', None)
+        point_targets = self._normalize_point_target_specs(override.get('point_targets', {}))
         if point_targets:
             override['point_targets'] = point_targets
         else:
             override.pop('point_targets', None)
-        point_targets_by_team = self._normalize_team_point_target_map(override.get('point_targets_by_team', {}))
+        point_targets_by_team = self._normalize_team_point_target_specs(override.get('point_targets_by_team', {}))
         if point_targets_by_team:
             override['point_targets_by_team'] = point_targets_by_team
         else:
             override.pop('point_targets_by_team', None)
+        strategy = self._normalize_strategy(override.get('strategy', {}))
+        if strategy:
+            override['strategy'] = strategy
+        else:
+            override.pop('strategy', None)
         override.setdefault('region_mode', 'enter_then_execute')
         return override
 
@@ -309,6 +499,7 @@ class BehaviorEditorEngine:
         role_key = self.selected_role_key()
         if spec is None:
             return None
+        override_brief = str((self.current_override(create=False) or {}).get('brief', '') or '').strip()
         self.preview_world = self._build_preview_world()
         plan = {
             'role_key': role_key,
@@ -331,6 +522,7 @@ class BehaviorEditorEngine:
                 decision = None
                 action_error = f'{type(exc).__name__}: {exc}'
             fallback_target = self._fallback_preview_target(team, role_key, spec['id'], actor)
+            preview_script = self.ai_controller.build_override_preview_script(context, role_key, spec['id'], spec['label'])
             if decision is None:
                 decision = {
                     'summary': '当前预演态势下未生成动作，回退到默认目的地预览' if action_error is None else '预演执行异常，已回退到默认目的地预览',
@@ -340,15 +532,40 @@ class BehaviorEditorEngine:
                     'chassis_state': 'normal',
                     'turret_state': 'searching',
                 }
+            segments = []
+            if preview_script is not None:
+                current_start = (float(actor.position['x']), float(actor.position['y']))
+                for segment in preview_script.get('segments', []):
+                    point = segment.get('point')
+                    if point is None:
+                        continue
+                    target_point = (float(point[0]), float(point[1]))
+                    segments.append({
+                        'label': str(segment.get('label', spec['label'])),
+                        'start': current_start,
+                        'target': target_point,
+                        'duration_ms': max(250, int(segment.get('duration_ms', 900))),
+                        'target_entity_id': segment.get('target_entity_id'),
+                    })
+                    current_start = target_point
             navigation_target = decision.get('navigation_target') or decision.get('movement_target') or fallback_target
+            if segments:
+                navigation_target = segments[-1]['target']
             if navigation_target is None:
                 navigation_target = (float(actor.position['x']), float(actor.position['y']))
             region_candidates = []
-            for region in self.ai_controller.get_decision_destination_preview_regions(role_key, spec['id'], self.map_manager, team=team):
-                region_team = region.get('team')
-                if region_team not in {None, 'neutral', team}:
-                    continue
-                region_candidates.append(deepcopy(region))
+            if preview_script is not None:
+                for region in preview_script.get('regions', []):
+                    region_team = region.get('team')
+                    if region_team not in {None, 'neutral', team}:
+                        continue
+                    region_candidates.append(deepcopy(region))
+            else:
+                for region in self.ai_controller.get_decision_destination_preview_regions(role_key, spec['id'], self.map_manager, team=team):
+                    region_team = region.get('team')
+                    if region_team not in {None, 'neutral', team}:
+                        continue
+                    region_candidates.append(deepcopy(region))
             if not region_candidates and navigation_target is not None:
                 region_candidates.append({
                     'shape': 'circle',
@@ -356,12 +573,24 @@ class BehaviorEditorEngine:
                     'cy': float(navigation_target[1]),
                     'radius': 28.0,
                 })
+            if not segments:
+                decision_target = decision.get('target') if isinstance(decision.get('target'), dict) else None
+                segments = [{
+                    'label': str(decision.get('summary', spec['label'])),
+                    'start': (float(actor.position['x']), float(actor.position['y'])),
+                    'target': (float(navigation_target[0]), float(navigation_target[1])),
+                    'duration_ms': 1200,
+                    'target_entity_id': decision_target.get('id') if decision_target is not None else None,
+                }]
+            duration_ms = sum(int(segment.get('duration_ms', 0)) for segment in segments)
             plan['teams'][team] = {
                 'entity_id': actor.id,
                 'start': (float(actor.position['x']), float(actor.position['y'])),
                 'target': (float(navigation_target[0]), float(navigation_target[1])),
+                'segments': segments,
+                'duration_ms': duration_ms,
                 'regions': region_candidates,
-                'summary': str(decision.get('summary', '')),
+                'summary': str(override_brief or (preview_script or {}).get('summary', decision.get('summary', ''))),
                 'result': str(result),
                 'chassis_state': str(decision.get('chassis_state', 'normal')),
                 'turret_state': str(decision.get('turret_state', 'searching')),
@@ -370,6 +599,8 @@ class BehaviorEditorEngine:
                 feedback_lines.append(f"{team.upper()}: {plan['teams'][team]['summary']}")
             else:
                 feedback_lines.append(f"{team.upper()}: {action_error}")
+        if plan['teams']:
+            plan['duration_ms'] = max(int(team_plan.get('duration_ms', 0)) for team_plan in plan['teams'].values())
         self.preview_plan = plan if plan['teams'] else None
         self.preview_feedback = feedback_lines
         if self.preview_plan is not None:
@@ -392,8 +623,35 @@ class BehaviorEditorEngine:
             return list(default_ids)
         if not isinstance(override_order, list):
             return list(default_ids)
-        filtered = [str(decision_id) for decision_id in override_order if str(decision_id) in default_ids]
+        filtered = []
+        seen = set()
+        for decision_id in override_order:
+            canonical_id = self.ai_controller._canonical_decision_id(decision_id)
+            if canonical_id not in default_ids or canonical_id in seen:
+                continue
+            filtered.append(canonical_id)
+            seen.add(canonical_id)
         return filtered
+
+    def move_role_decision(self, decision_id, direction, role_key=None):
+        role = role_key or self.selected_role_key()
+        active_ids = self.role_active_decision_ids(role)
+        decision_id = str(decision_id)
+        if decision_id not in active_ids:
+            return False
+        current_index = active_ids.index(decision_id)
+        target_index = current_index + int(direction)
+        if target_index < 0 or target_index >= len(active_ids):
+            return False
+        active_ids[current_index], active_ids[target_index] = active_ids[target_index], active_ids[current_index]
+        role_entry = self._role_entry(role, create=True)
+        if active_ids == self.role_default_decision_ids(role):
+            role_entry.pop('decision_order', None)
+        else:
+            role_entry['decision_order'] = list(active_ids)
+        self.selected_decision_index[role] = target_index
+        self._persist_live_changes(f'已调整 {self.role_label(role)} 决策顺序')
+        return True
 
     def is_decision_active_for_role(self, decision_id, role_key=None):
         return str(decision_id) in set(self.role_active_decision_ids(role_key))
@@ -405,7 +663,10 @@ class BehaviorEditorEngine:
         active_ids = self.role_active_decision_ids(role)
         if decision_id in active_ids:
             active_ids = [item for item in active_ids if item != decision_id]
-            role_entry.get('decisions', {}).pop(decision_id, None)
+            decisions = role_entry.get('decisions', {})
+            if isinstance(decisions, dict):
+                for alias_id in self.ai_controller._decision_alias_ids(decision_id):
+                    decisions.pop(alias_id, None)
             self.add_log(f'已从 {self.role_label(role)} 移除决策: {decision_id}')
         else:
             default_ids = self.role_default_decision_ids(role)
@@ -436,7 +697,7 @@ class BehaviorEditorEngine:
         override = self.current_override(create=True)
         if override is None:
             return
-        if field_name in {'label', 'condition_expr'}:
+        if field_name in {'label', 'condition_expr', 'brief', 'trigger_note', 'logic_note', 'function_note'}:
             text = str(value or '').strip()
             if text:
                 override[field_name] = text
@@ -476,7 +737,10 @@ class BehaviorEditorEngine:
         role_entry = self._role_entry(self.selected_role_key(), create=False)
         if role_entry is None:
             return
-        role_entry.get('decisions', {}).pop(spec['id'], None)
+        decisions = role_entry.get('decisions', {})
+        if isinstance(decisions, dict):
+            for alias_id in self.ai_controller._decision_alias_ids(spec['id']):
+                decisions.pop(alias_id, None)
         if not role_entry.get('decisions') and 'decision_order' not in role_entry:
             self.behavior_payload.get('roles', {}).pop(self.selected_role_key(), None)
 
@@ -493,15 +757,14 @@ class BehaviorEditorEngine:
         self.set_override_field('region_mode', next_state)
 
     def current_task_regions(self, team=None):
+        return self.current_behavior_regions(team=team)
+
+    def current_behavior_override_regions(self, team=None):
         override = self.current_override(create=False) or {}
         return [deepcopy(region) for region in self.ai_controller._behavior_override_regions(override, team=team)]
 
-    def current_destination_override_regions(self, team=None):
-        override = self.current_override(create=False) or {}
-        return [deepcopy(region) for region in self.ai_controller._behavior_override_destination_regions(override, team=team)]
-
-    def current_destination_regions(self, team=None):
-        override_regions = self.current_destination_override_regions(team=team)
+    def current_behavior_regions(self, team=None):
+        override_regions = self.current_behavior_override_regions(team=team)
         if override_regions:
             return override_regions
         spec = self.selected_spec()
@@ -509,25 +772,371 @@ class BehaviorEditorEngine:
             return []
         return self.ai_controller.get_decision_destination_preview_regions(self.selected_role_key(), spec['id'], self.map_manager, team=team)
 
+    def current_destination_override_regions(self, team=None):
+        return self.current_behavior_override_regions(team=team)
+
+    def current_destination_regions(self, team=None):
+        return self.current_behavior_regions(team=team)
+
     def current_point_targets(self, team=None):
         spec = self.selected_spec()
         if spec is None:
             return {}
         return dict(self.ai_controller.get_decision_point_targets(self.selected_role_key(), spec['id'], self.map_manager, team=team))
 
+    def current_point_target_specs(self, team=None):
+        spec = self.selected_spec()
+        if spec is None:
+            return {}
+        return {
+            str(target_id): dict(target_spec)
+            for target_id, target_spec in self.ai_controller.get_decision_point_target_specs(self.selected_role_key(), spec['id'], self.map_manager, team=team).items()
+        }
+
     def editable_point_targets(self):
         spec = self.selected_spec() or {}
         editable = spec.get('editable_targets', ())
-        return [dict(item) for item in editable if isinstance(item, dict) and str(item.get('id', '')).strip()]
+        items = [dict(item) for item in editable if isinstance(item, dict) and str(item.get('id', '')).strip()]
+        if any(str(stage.get('task_type', 'default')) == 'terrain_traversal' for stage in self.strategy_stages()):
+            existing = {str(item.get('id')) for item in items}
+            for item in self.STRATEGY_TERRAIN_TARGET_DEFS:
+                if item['id'] not in existing:
+                    items.append(dict(item))
+        return items
+
+    def strategy_stages(self):
+        override = self.current_override(create=False) or {}
+        strategy = self._normalize_strategy(override.get('strategy', {}))
+        return [dict(stage) for stage in strategy.get('stages', [])]
+
+    def current_strategy_stage(self, stage_index=0):
+        stages = self.strategy_stages()
+        if 0 <= stage_index < len(stages):
+            return dict(stages[stage_index])
+        return {}
+
+    def current_strategy(self):
+        return self.current_strategy_stage(0)
+
+    def set_strategy_field(self, field_name, value, stage_index=0):
+        override = self.current_override(create=True)
+        if override is None:
+            return
+        strategy = self._normalize_strategy(override.get('strategy', {}))
+        stages = [dict(stage) for stage in strategy.get('stages', [])]
+        if stage_index < 0 or stage_index >= self.MAX_STRATEGY_STAGES:
+            return
+        while len(stages) <= stage_index:
+            stages.append({})
+        stage = dict(stages[stage_index])
+        if field_name in {'task_type', 'destination_mode', 'destination_ref', 'assault_ref', 'assault_follow_priority', 'interaction_ref', 'defense_ref'}:
+            text = str(value or '').strip()
+            if field_name == 'task_type' and (not text or text == 'default'):
+                stage.pop('task_type', None)
+            elif field_name == 'destination_mode' and (not text or text == 'region'):
+                stage.pop('destination_mode', None)
+            elif field_name == 'assault_ref' and (not text or text == 'enemy_any_unit'):
+                stage.pop('assault_ref', None)
+            elif field_name == 'assault_follow_priority' and (not text or text == 'target_first'):
+                stage.pop('assault_follow_priority', None)
+            elif field_name == 'interaction_ref' and (not text or text == 'own_supply'):
+                stage.pop('interaction_ref', None)
+            elif field_name == 'defense_ref' and (not text or text == 'high_threat_enemy'):
+                stage.pop('defense_ref', None)
+            elif text:
+                stage[field_name] = text
+            else:
+                stage.pop(field_name, None)
+        elif field_name == 'engage_distance_m':
+            if value in {None, ''}:
+                stage.pop('engage_distance_m', None)
+            else:
+                stage['engage_distance_m'] = float(value)
+        stages[stage_index] = self._normalize_strategy_stage(stage)
+        stages = [dict(item) for item in stages if item][:self.MAX_STRATEGY_STAGES]
+        normalized = {'stages': stages} if stages else {}
+        if normalized:
+            override['strategy'] = normalized
+        else:
+            override.pop('strategy', None)
+        self.prune_current_override_if_default()
+        self._persist_live_changes('已更新策略编辑')
+
+    def clear_strategy_stage(self, stage_index=0):
+        override = self.current_override(create=True)
+        if override is None:
+            return
+        stages = self.strategy_stages()
+        if stage_index < 0 or stage_index >= len(stages):
+            return
+        del stages[stage_index]
+        if stages:
+            override['strategy'] = {'stages': stages[:self.MAX_STRATEGY_STAGES]}
+        else:
+            override.pop('strategy', None)
+        self.prune_current_override_if_default()
+        self._persist_live_changes('已清除阶段策略')
+
+    def cycle_strategy_field(self, field_name, stage_index=0):
+        strategy = self.current_strategy_stage(stage_index)
+        if field_name == 'task_type':
+            order = self.STRATEGY_TASK_TYPE_ORDER
+            current = str(strategy.get('task_type', 'default'))
+        elif field_name == 'destination_mode':
+            order = self.DESTINATION_MODE_ORDER
+            current = str(strategy.get('destination_mode', 'region'))
+        elif field_name == 'destination_ref':
+            order = self.DESTINATION_REFERENCE_ORDER
+            current = str(strategy.get('destination_ref', order[0]))
+        elif field_name == 'assault_ref':
+            order = self.ASSAULT_REFERENCE_ORDER
+            current = str(strategy.get('assault_ref', order[0]))
+        elif field_name == 'assault_follow_priority':
+            order = self.ASSAULT_FOLLOW_PRIORITY_ORDER
+            current = str(strategy.get('assault_follow_priority', order[0]))
+        elif field_name == 'interaction_ref':
+            order = self.FIELD_INTERACTION_ORDER
+            current = str(strategy.get('interaction_ref', order[0]))
+        elif field_name == 'defense_ref':
+            order = self.DEFENSE_REFERENCE_ORDER
+            current = str(strategy.get('defense_ref', order[0]))
+        else:
+            return
+        if current not in order:
+            current = order[0]
+        next_value = order[(order.index(current) + 1) % len(order)]
+        self.set_strategy_field(field_name, next_value, stage_index=stage_index)
+
+    def current_strategy_task_type_label(self, stage_index=0):
+        task_type = str(self.current_strategy_stage(stage_index).get('task_type', 'default'))
+        return self.STRATEGY_TASK_TYPE_LABELS.get(task_type, task_type)
+
+    def current_destination_mode_label(self, stage_index=0):
+        mode = str(self.current_strategy_stage(stage_index).get('destination_mode', 'region'))
+        return self.DESTINATION_MODE_LABELS.get(mode, mode)
+
+    def current_destination_ref_label(self, stage_index=0):
+        reference = str(self.current_strategy_stage(stage_index).get('destination_ref', self.DESTINATION_REFERENCE_ORDER[0]))
+        return self.STRATEGY_REFERENCE_LABELS.get(reference, reference)
+
+    def current_assault_ref_label(self, stage_index=0):
+        reference = str(self.current_strategy_stage(stage_index).get('assault_ref', self.ASSAULT_REFERENCE_ORDER[0]))
+        return self.STRATEGY_REFERENCE_LABELS.get(reference, reference)
+
+    def current_assault_follow_priority_label(self, stage_index=0):
+        priority = str(self.current_strategy_stage(stage_index).get('assault_follow_priority', self.ASSAULT_FOLLOW_PRIORITY_ORDER[0]))
+        return self.ASSAULT_FOLLOW_PRIORITY_LABELS.get(priority, priority)
+
+    def current_interaction_ref_label(self, stage_index=0):
+        reference = str(self.current_strategy_stage(stage_index).get('interaction_ref', self.FIELD_INTERACTION_ORDER[0]))
+        return self.FIELD_INTERACTION_LABELS.get(reference, reference)
+
+    def current_defense_ref_label(self, stage_index=0):
+        reference = str(self.current_strategy_stage(stage_index).get('defense_ref', self.DEFENSE_REFERENCE_ORDER[0]))
+        return self.DEFENSE_REFERENCE_LABELS.get(reference, reference)
+
+    def current_engage_distance_text(self, stage_index=0):
+        return str(self.current_strategy_stage(stage_index).get('engage_distance_m', 8.0))
+
+    def _callable_source_label(self, func):
+        if func is None:
+            return '未绑定'
+        raw = getattr(func, '__func__', func)
+        name = str(getattr(raw, '__name__', type(raw).__name__))
+        code = getattr(raw, '__code__', None)
+        if code is None:
+            return name
+        workspace_root = os.path.dirname(os.path.abspath(__file__))
+        try:
+            file_label = os.path.relpath(str(code.co_filename), workspace_root).replace('\\', '/')
+        except ValueError:
+            file_label = os.path.basename(str(code.co_filename))
+        return f'{name} -> {file_label}:{int(code.co_firstlineno)}'
+
+    def current_decision_implementation_details(self):
+        spec = self.selected_spec()
+        if spec is None:
+            return {
+                'description': '',
+                'trigger_lines': [],
+                'logic_lines': [],
+                'function_lines': [],
+                'interface_lines': [],
+                'override': {},
+            }
+        role_key = self.selected_role_key()
+        decision_id = str(spec.get('id', ''))
+        binding = self.ai_controller._available_plugin_binding(role_key, decision_id) or {}
+        condition_registry = self.ai_controller._behavior_condition_registry()
+        action_registry = self.ai_controller._behavior_action_registry()
+        condition_ref = str(binding.get('condition_ref', '') or '').strip()
+        action_ref = str(binding.get('action_ref', decision_id) or decision_id).strip()
+        condition_callable = binding.get('condition') if callable(binding.get('condition')) else condition_registry.get(condition_ref)
+        action_callable = binding.get('action') if callable(binding.get('action')) else action_registry.get(action_ref)
+        preview_points_callable = binding.get('preview_points') if callable(binding.get('preview_points')) else None
+        preview_regions_callable = binding.get('preview_regions') if callable(binding.get('preview_regions')) else None
+        override = self.current_override(create=False) or {}
+        description = str(binding.get('description', spec.get('description', '')) or '').strip() or '当前决策没有提供额外插件描述。'
+        trigger_lines = [description]
+        if bool(binding.get('fallback', spec.get('fallback', False))):
+            trigger_lines.append('该决策是兜底行为：当前面更高优先级决策都不触发时，才会运行这个决策。')
+        elif condition_ref:
+            trigger_lines.append(f'触发条件引用: {condition_ref}')
+        else:
+            trigger_lines.append('当前决策没有显式 condition_ref，通常由上层逻辑直接调度。')
+        trigger_lines.append(f'触发函数入口: {self._callable_source_label(condition_callable or spec.get("condition"))}')
+
+        logic_lines = [f'执行动作引用: {action_ref}']
+        logic_lines.append(f'执行函数入口: {self._callable_source_label(action_callable or spec.get("action"))}')
+        stages = self.strategy_stages()
+        if stages:
+            logic_lines.append(f'当前已配置 {len(stages)} 个顺序阶段，运行时会按阶段 1 到阶段 {len(stages)} 依次执行。')
+        else:
+            logic_lines.append('当前未配置自定义阶段，运行时会保持默认决策逻辑。')
+        if binding.get('default_destination_types'):
+            logic_lines.append(f'默认设施目标类型: {", ".join(str(item) for item in binding.get("default_destination_types", ()))}')
+        if binding.get('terrain_mode'):
+            logic_lines.append(f'地形模式: {binding.get("terrain_mode")}')
+        editable_targets = [str(item.get('id', '')) for item in binding.get('editable_targets', ()) if isinstance(item, dict)]
+        if editable_targets:
+            logic_lines.append(f'可编辑目标点接口: {", ".join(editable_targets)}')
+
+        function_lines = [
+            f'condition: {self._callable_source_label(condition_callable or spec.get("condition"))}',
+            f'action: {self._callable_source_label(action_callable or spec.get("action"))}',
+            f'preview_points: {self._callable_source_label(preview_points_callable)}',
+            f'preview_regions: {self._callable_source_label(preview_regions_callable)}',
+        ]
+        interface_lines = [
+            'label: 决策显示名称',
+            'brief: 决策简述与预演摘要',
+            'trigger_note: 你自己写的触发说明',
+            'logic_note: 你自己写的运行逻辑说明',
+            'function_note: 你自己写的函数说明/备注',
+            'condition_expr: 额外触发条件表达式',
+            'region_mode: 先进入行为区域 or 严格在区域内',
+            'behavior_regions: 统一行为区域',
+            'point_targets: 跨越节点或自定义目标点（支持半径）',
+            'strategy.stages[n].task_type: 阶段行为类型',
+            'strategy.stages[n].destination_mode: 阶段目标模式',
+            'strategy.stages[n].destination_ref: 阶段引用目标',
+            'strategy.stages[n].assault_ref: 阶段进攻对象',
+            'strategy.stages[n].assault_follow_priority: 引用地点/目标优先级',
+            'strategy.stages[n].interaction_ref: 场地交互目标',
+            'strategy.stages[n].defense_ref: 防守目标',
+            'strategy.stages[n].engage_distance_m: 巡航触敌距离',
+        ]
+        return {
+            'description': description,
+            'trigger_lines': trigger_lines,
+            'logic_lines': logic_lines,
+            'function_lines': function_lines,
+            'interface_lines': interface_lines,
+            'override': dict(override),
+        }
+
+    def _opposite_team(self, team):
+        return 'blue' if team == 'red' else 'red'
+
+    def _mirror_point_across_map_center(self, point):
+        if point is None:
+            return None
+        map_width = float(getattr(self.map_manager, 'map_width', 0.0) or 0.0)
+        map_height = float(getattr(self.map_manager, 'map_height', 0.0) or 0.0)
+        return (round(map_width - float(point[0]), 1), round(map_height - float(point[1]), 1))
+
+    def _mirror_region_across_map_center(self, region, target_team):
+        mirrored = deepcopy(region)
+        shape = str(mirrored.get('shape', 'rect'))
+        mirrored.pop('id', None)
+        if 'team' in mirrored:
+            mirrored['team'] = target_team
+        if shape == 'circle':
+            mirrored_point = self._mirror_point_across_map_center((mirrored.get('cx', mirrored.get('x', 0.0)), mirrored.get('cy', mirrored.get('y', 0.0))))
+            if mirrored_point is not None:
+                mirrored['cx'] = mirrored_point[0]
+                mirrored['cy'] = mirrored_point[1]
+            return mirrored
+        if shape == 'polygon':
+            mirrored['points'] = [self._mirror_point_across_map_center(point) for point in mirrored.get('points', [])]
+            return mirrored
+        x1 = float(mirrored.get('x1', 0.0))
+        y1 = float(mirrored.get('y1', 0.0))
+        x2 = float(mirrored.get('x2', 0.0))
+        y2 = float(mirrored.get('y2', 0.0))
+        first = self._mirror_point_across_map_center((x1, y1))
+        second = self._mirror_point_across_map_center((x2, y2))
+        if first is not None and second is not None:
+            mirrored['x1'] = min(first[0], second[0])
+            mirrored['y1'] = min(first[1], second[1])
+            mirrored['x2'] = max(first[0], second[0])
+            mirrored['y2'] = max(first[1], second[1])
+        return mirrored
+
+    def _replace_team_regions(self, region_kind, team, regions):
+        target_regions = self._editable_regions(region_kind, create=True, team=team)
+        if target_regions is None:
+            return False
+        target_regions[:] = [deepcopy(region) for region in regions]
+        return True
+
+    def _replace_team_point_targets(self, team, targets):
+        override = self.current_override(create=True)
+        if override is None:
+            return False
+        point_targets_by_team = self._normalize_team_point_target_specs(override.get('point_targets_by_team', {}))
+        point_targets_by_team[team] = {
+            str(target_id): ({
+                'x': round(float(point.get('x', point.get('cx', 0.0))), 1),
+                'y': round(float(point.get('y', point.get('cy', 0.0))), 1),
+                **({'radius': round(max(6.0, float(point.get('radius', 0.0))), 1)} if point.get('radius', None) not in {None, ''} else {}),
+            } if isinstance(point, dict) else {
+                'x': round(float(point[0]), 1),
+                'y': round(float(point[1]), 1),
+            })
+            for target_id, point in targets.items()
+        }
+        override['point_targets_by_team'] = point_targets_by_team
+        return True
+
+    def mirror_current_team_to_opponent(self, source_team):
+        source_team = str(source_team or 'red')
+        target_team = self._opposite_team(source_team)
+        behavior_regions = [
+            self._mirror_region_across_map_center(region, target_team)
+            for region in self.current_behavior_regions(team=source_team)
+        ]
+        point_targets = {}
+        for target_id, point_spec in self.current_point_target_specs(team=source_team).items():
+            mirrored_point = self._mirror_point_across_map_center((point_spec.get('x', 0.0), point_spec.get('y', 0.0)))
+            if mirrored_point is None:
+                continue
+            radius_value = point_spec.get('radius')
+            mirrored_spec = {
+                'x': mirrored_point[0],
+                'y': mirrored_point[1],
+            }
+            if radius_value not in {None, ''}:
+                mirrored_spec['radius'] = float(str(radius_value))
+            point_targets[str(target_id)] = mirrored_spec
+        updated = False
+        updated = self._replace_team_regions('behavior', target_team, behavior_regions) or updated
+        if point_targets:
+            updated = self._replace_team_point_targets(target_team, point_targets) or updated
+        if not updated:
+            return False
+        self.prune_current_override_if_default()
+        self._persist_live_changes(f'已将{self.role_label(self.selected_role_key())} {source_team} 侧绘制中心对称到 {target_team}')
+        return True
 
     def current_regions_for_kind(self, region_kind='destination', team=None):
-        return self.current_destination_regions(team=team) if region_kind == 'destination' else self.current_task_regions(team=team)
+        return self.current_behavior_regions(team=team)
 
     def _editable_regions(self, region_kind='destination', create=False, team=None):
         override = self.current_override(create=create)
         if override is None:
             return None
-        field_name = 'destination_regions' if region_kind == 'destination' else 'task_regions'
+        field_name = 'behavior_regions'
         if team in {'red', 'blue'}:
             by_team_field = f'{field_name}_by_team'
             by_team = override.get(by_team_field)
@@ -537,12 +1146,12 @@ class BehaviorEditorEngine:
                     override[by_team_field] = by_team
             regions = by_team.get(team)
             if not isinstance(regions, list) and create:
-                regions = [deepcopy(region) for region in self.current_regions_for_kind(region_kind, team=team)]
+                regions = [deepcopy(region) for region in self.current_behavior_regions(team=team)]
                 by_team[team] = regions
             return by_team.get(team) if isinstance(by_team.get(team), list) else []
         regions = override.get(field_name)
         if not isinstance(regions, list) and create:
-            regions = [deepcopy(region) for region in self.current_regions_for_kind(region_kind)] if region_kind == 'destination' else []
+            regions = [deepcopy(region) for region in self.current_behavior_regions()]
             override[field_name] = regions
         return override.get(field_name) if isinstance(override.get(field_name), list) else []
 
@@ -566,7 +1175,7 @@ class BehaviorEditorEngine:
         if regions is None or region_index < 0 or region_index >= len(regions):
             return False
         regions.pop(region_index)
-        field_name = 'destination_regions' if region_kind == 'destination' else 'task_regions'
+        field_name = 'behavior_regions'
         override = self.current_override(create=False)
         if override is not None and not regions:
             if team in {'red', 'blue'}:
@@ -582,18 +1191,17 @@ class BehaviorEditorEngine:
         return True
 
     def add_task_region(self, region, team=None):
-        task_regions = self._editable_regions('task', create=True, team=team)
-        if task_regions is None:
+        self.add_behavior_region(region, team=team)
+
+    def add_behavior_region(self, region, team=None):
+        behavior_regions = self._editable_regions('behavior', create=True, team=team)
+        if behavior_regions is None:
             return
-        task_regions.append(deepcopy(region))
-        self._persist_live_changes('已更新任务区域')
+        behavior_regions.append(deepcopy(region))
+        self._persist_live_changes('已更新行为区域')
 
     def add_destination_region(self, region, team=None):
-        destination_regions = self._editable_regions('destination', create=True, team=team)
-        if destination_regions is None:
-            return
-        destination_regions.append(deepcopy(region))
-        self._persist_live_changes('已更新目的地区域')
+        self.add_behavior_region(region, team=team)
 
     def remove_region_at_point(self, point, region_kind='destination', team=None, log_message=None):
         regions = self._editable_regions(region_kind, create=True, team=team)
@@ -607,7 +1215,7 @@ class BehaviorEditorEngine:
                 break
         if not removed:
             return False
-        field_name = 'destination_regions' if region_kind == 'destination' else 'task_regions'
+        field_name = 'behavior_regions'
         override = self.current_override(create=False)
         if override is not None and not regions:
             if team in {'red', 'blue'}:
@@ -627,14 +1235,38 @@ class BehaviorEditorEngine:
         if override is None:
             return
 
-        point_targets_by_team = self._normalize_team_point_target_map(override.get('point_targets_by_team', {}))
+        point_targets_by_team = self._normalize_team_point_target_specs(override.get('point_targets_by_team', {}))
         team_targets = point_targets_by_team.setdefault(team, {})
-        team_targets[str(target_id)] = (float(point[0]), float(point[1]))
+        current_spec = dict(team_targets.get(str(target_id), {}))
+        radius_value = current_spec.get('radius')
+        target_spec = {
+            'x': round(float(point[0]), 1),
+            'y': round(float(point[1]), 1),
+        }
+        if radius_value not in {None, ''}:
+            target_spec['radius'] = float(str(radius_value))
+        team_targets[str(target_id)] = target_spec
 
         override['point_targets_by_team'] = point_targets_by_team
 
         self.prune_current_override_if_default()
         self._persist_live_changes('已更新目标点')
+
+    def set_point_target_radius(self, target_id, radius, team=None):
+        override = self.current_override(create=True)
+        if override is None:
+            return False
+        point_targets_by_team = self._normalize_team_point_target_specs(override.get('point_targets_by_team', {}))
+        team_targets = point_targets_by_team.setdefault(team, {})
+        current_spec = dict(team_targets.get(str(target_id), {}))
+        if not current_spec:
+            return False
+        current_spec['radius'] = round(max(6.0, float(radius)), 1)
+        team_targets[str(target_id)] = current_spec
+        override['point_targets_by_team'] = point_targets_by_team
+        self.prune_current_override_if_default()
+        self._persist_live_changes('已更新节点生效范围')
+        return True
 
     def clear_point_target(self, target_id, team=None):
         override = self.current_override(create=False)
@@ -671,7 +1303,13 @@ class BehaviorEditorEngine:
         role_entry = self._role_entry(role_key, create=False)
         if role_entry is None:
             return False
-        removed = role_entry.get('decisions', {}).pop(spec['id'], None)
+        removed = None
+        decisions = role_entry.get('decisions', {})
+        if isinstance(decisions, dict):
+            for alias_id in self.ai_controller._decision_alias_ids(spec['id']):
+                popped = decisions.pop(alias_id, None)
+                if popped is not None:
+                    removed = popped
         if not role_entry.get('decisions') and 'decision_order' not in role_entry:
             self.behavior_payload.get('roles', {}).pop(role_key, None)
         if removed is not None:
@@ -706,7 +1344,14 @@ class BehaviorEditorEngine:
             elif not isinstance(decision_order, list):
                 persist_order = None
             else:
-                filtered_order = [str(decision_id) for decision_id in decision_order if str(decision_id) in default_ids]
+                filtered_order = []
+                seen = set()
+                for decision_id in decision_order:
+                    canonical_id = self.ai_controller._canonical_decision_id(decision_id)
+                    if canonical_id not in default_ids or canonical_id in seen:
+                        continue
+                    filtered_order.append(canonical_id)
+                    seen.add(canonical_id)
                 persist_order = None if filtered_order == list(default_ids) else filtered_order
             if decisions or persist_order is not None:
                 payload['roles'][role_key] = {'decisions': decisions}
@@ -746,14 +1391,14 @@ class BehaviorEditorApp:
     def __init__(self, engine):
         self.engine = engine
         pygame.init()
-        self.window_width = int(engine.config.get('simulator', {}).get('window_width', 1400))
-        self.window_height = int(engine.config.get('simulator', {}).get('window_height', 900))
+        self.window_width = max(1680, int(engine.config.get('simulator', {}).get('window_width', 1400)))
+        self.window_height = max(980, int(engine.config.get('simulator', {}).get('window_height', 900)))
         self.screen = pygame.display.set_mode((self.window_width, self.window_height))
         pygame.display.set_caption('RoboMaster 行为编辑器')
         self.clock = pygame.time.Clock()
         self.running = False
         self.toolbar_height = 56
-        self.panel_width = 760
+        self.panel_width = 960
         self.padding = 12
         self.decision_rows_per_page = 6
         self.decision_page_index = {role_key: 0 for role_key in self.engine.ROLE_ORDER}
@@ -766,7 +1411,9 @@ class BehaviorEditorApp:
         self.detail_pages = (
             ('overview', '概览'),
             ('condition', '条件'),
+            ('strategy', '策略'),
             ('region', '区域'),
+            ('implementation', '实现说明'),
         )
         self.detail_page = 'overview'
         self.panel_scroll_y = 0
@@ -774,8 +1421,9 @@ class BehaviorEditorApp:
         self.panel_scroll_step = 48
         self.list_scroll_step = 32
         self.panel_viewport_rect = None
-        self.region_edit_target = 'destination'
+        self.region_edit_target = 'behavior'
         self.region_edit_team = 'red'
+        self.selected_strategy_stage_index = 0
         self.map_texture = self.engine.map_manager.map_image
         self.map_cache = None
         self.map_cache_size = None
@@ -1242,6 +1890,12 @@ class BehaviorEditorApp:
         if not preview_world:
             return
         current_ms = pygame.time.get_ticks()
+        active_plan = self.engine.preview_plan or {}
+        plan_duration = int(active_plan.get('duration_ms', self.preview_run_duration_ms) or self.preview_run_duration_ms)
+        if self.preview_loop_active and active_plan:
+            cycle_duration = plan_duration + self.preview_pause_duration_ms
+            if current_ms - self.preview_cycle_started_ms >= cycle_duration:
+                self._restart_preview_cycle(current_ms)
         for entity in preview_world:
             if entity.type not in {'robot', 'sentry'}:
                 continue
@@ -1253,22 +1907,12 @@ class BehaviorEditorApp:
                 team_plan = self.engine.preview_plan.get('teams', {}).get(entity.team)
                 if team_plan is not None and team_plan.get('entity_id') == entity.id:
                     elapsed = current_ms - self.preview_cycle_started_ms
-                    cycle_duration = self.preview_run_duration_ms + self.preview_pause_duration_ms
-                    if elapsed >= cycle_duration:
-                        self._restart_preview_cycle(current_ms)
-                        team_plan = self.engine.preview_plan.get('teams', {}).get(entity.team)
-                        elapsed = current_ms - self.preview_cycle_started_ms
-                    ratio = min(1.0, max(0.0, elapsed / max(self.preview_run_duration_ms, 1)))
-                    start = team_plan.get('start', (entity.position['x'], entity.position['y']))
-                    target = team_plan.get('target', start)
-                    interp = (
-                        float(start[0]) + (float(target[0]) - float(start[0])) * ratio,
-                        float(start[1]) + (float(target[1]) - float(start[1])) * ratio,
-                    )
-                    preview_point = self.world_to_screen(interp)
+                    interp, active_segment = self._preview_team_position(team_plan, elapsed)
+                    preview_point = self.world_to_screen(interp) if interp is not None else None
                     if preview_point is not None:
                         draw_point = preview_point
-                    target_point = self.world_to_screen(target)
+                    target = active_segment.get('target') if active_segment is not None else team_plan.get('target')
+                    target_point = self.world_to_screen(target) if target is not None else None
                     if target_point is not None:
                         pygame.draw.line(self.screen, self.colors['green'], draw_point, target_point, 2)
                         pygame.draw.circle(self.screen, self.colors['green'], target_point, 5, 2)
@@ -1279,6 +1923,26 @@ class BehaviorEditorApp:
             role_text = entity.robot_type[0] if getattr(entity, 'robot_type', '') else 'B'
             label_surface = self.tiny_font.render(role_text, True, self.colors['white'])
             self.screen.blit(label_surface, (draw_point[0] - label_surface.get_width() // 2, draw_point[1] - label_surface.get_height() // 2))
+
+    def _preview_team_position(self, team_plan, elapsed_ms):
+        segments = list(team_plan.get('segments', ()))
+        if not segments:
+            return team_plan.get('start'), None
+        remaining = max(0, int(elapsed_ms))
+        for segment in segments:
+            duration_ms = max(1, int(segment.get('duration_ms', 900)))
+            start = segment.get('start', team_plan.get('start'))
+            target = segment.get('target', start)
+            if remaining <= duration_ms:
+                ratio = min(1.0, max(0.0, remaining / duration_ms))
+                interp = (
+                    float(start[0]) + (float(target[0]) - float(start[0])) * ratio,
+                    float(start[1]) + (float(target[1]) - float(start[1])) * ratio,
+                )
+                return interp, segment
+            remaining -= duration_ms
+        last_segment = segments[-1]
+        return last_segment.get('target', team_plan.get('target')), last_segment
 
     def _restart_preview_cycle(self, current_ms=None):
         plan = self.engine.build_decision_preview()
@@ -1306,7 +1970,7 @@ class BehaviorEditorApp:
         pygame.draw.rect(self.screen, self.colors['panel_border'], feedback_rect, 1, border_radius=6)
         feedback_title = self.tiny_font.render('预演反馈', True, self.colors['panel_text'])
         self.screen.blit(feedback_title, (feedback_rect.x + 8, feedback_rect.y + 8))
-        feedback_lines = self.engine.preview_feedback or ['点击上方按钮预演当前选中决策', '红蓝双方会沿决策输出的导航目标循环播放']
+        feedback_lines = self.engine.preview_feedback or ['点击上方按钮预演当前选中决策', '预演会按完整策略阶段播放移动与追击结果']
         self._draw_text_lines(feedback_lines[:4], self.tiny_font, self.colors['gray'], feedback_rect.x + 8, feedback_rect.y + 26, line_gap=2, max_height=feedback_rect.bottom - 8)
 
         list_y = feedback_rect.bottom + 10
@@ -1387,7 +2051,7 @@ class BehaviorEditorApp:
 
     def _region_summary_lines(self, regions):
         if not regions:
-            return ['未设置任务区域，保持默认地点逻辑。']
+            return ['未设置行为区域，保持默认地点逻辑。']
         lines = []
         for index, region in enumerate(regions[:4], start=1):
             lines.append(self._region_display_label(region, index=index))
@@ -1452,26 +2116,30 @@ class BehaviorEditorApp:
         row_y = rect.y + 12 + title_surface.get_height()
         for item in target_defs:
             point_id = str(item.get('id', ''))
-            point = targets.get(point_id)
+            point_spec = targets.get(point_id)
             row_rect = pygame.Rect(rect.x + 8, row_y, rect.width - 16, 30)
             active = self.point_edit_target == point_id
             pygame.draw.rect(self.screen, self.colors['panel_row_active'] if active else self.colors['panel_row'], row_rect, border_radius=6)
             pygame.draw.rect(self.screen, self.colors['panel_border'], row_rect, 1, border_radius=6)
             label = str(item.get('label', point_id))
-            value_text = f'({int(point[0])}, {int(point[1])})' if point is not None else '未设置'
+            if point_spec is None:
+                value_text = '未设置'
+            else:
+                radius_text = f' / 范围 {int(point_spec.get("radius", 0) or 0)}' if point_spec.get('radius', None) not in {None, ''} else ''
+                value_text = f'({int(point_spec.get("x", 0))}, {int(point_spec.get("y", 0))}){radius_text}'
             label_surface = self.tiny_font.render(f'{label}: {value_text}', True, self.colors['panel_text'])
             self.screen.blit(label_surface, (row_rect.x + 8, row_rect.y + 8))
             edit_rect = pygame.Rect(row_rect.right - 56, row_rect.y + 5, 22, 20)
             clear_rect = pygame.Rect(row_rect.right - 28, row_rect.y + 5, 22, 20)
             pygame.draw.rect(self.screen, self.colors['green'] if active else self.colors['blue'], edit_rect, border_radius=5)
-            pygame.draw.rect(self.screen, self.colors['gray'] if point is None else self.colors['orange'], clear_rect, border_radius=5)
+            pygame.draw.rect(self.screen, self.colors['gray'] if point_spec is None else self.colors['orange'], clear_rect, border_radius=5)
             edit_text = self.tiny_font.render('设', True, self.colors['white'])
             clear_text = self.tiny_font.render('清', True, self.colors['white'])
             self.screen.blit(edit_text, (edit_rect.x + (edit_rect.width - edit_text.get_width()) // 2, edit_rect.y + 3))
             self.screen.blit(clear_text, (clear_rect.x + (clear_rect.width - clear_text.get_width()) // 2, clear_rect.y + 3))
             self._append_click_action(row_rect, f'edit_point_target:{point_id}', clip_rect=self.panel_viewport_rect)
             self._append_click_action(edit_rect, f'edit_point_target:{point_id}', clip_rect=self.panel_viewport_rect)
-            if point is not None:
+            if point_spec is not None:
                 self._append_click_action(clear_rect, f'clear_point_target:{point_id}', clip_rect=self.panel_viewport_rect)
             row_y += 36
 
@@ -1482,10 +2150,9 @@ class BehaviorEditorApp:
             ('保存预设', 'save', False),
             ('应用到主程序', 'apply', False),
             ('重载预设', 'reload', False),
-            ('编辑目的地', 'edit_layer:destination', self.region_edit_target == 'destination'),
-            ('编辑任务区域', 'edit_layer:task', self.region_edit_target == 'task'),
             ('编辑红方', 'edit_team:red', self.region_edit_team == 'red'),
             ('编辑蓝方', 'edit_team:blue', self.region_edit_team == 'blue'),
+            ('中心对称到对方', 'mirror:to_opponent', False),
             ('矩形', 'shape:rect', self.shape_mode == 'rect'),
             ('圆形', 'shape:circle', self.shape_mode == 'circle'),
             ('多边形', 'shape:polygon', self.shape_mode == 'polygon'),
@@ -1503,7 +2170,7 @@ class BehaviorEditorApp:
         self.screen.blit(rendered, (preset_rect.x + 10, preset_rect.y + 8))
         self.click_actions.append((preset_rect, 'edit:preset_name'))
 
-        hint_text = '绿色=目的地 | 黄色=任务区域 | 红蓝按钮切换队伍 | 点回起点或 Enter 完成多边形 | 目标点点设后左键落点'
+        hint_text = '绿色=行为区域 | 策略页可编辑 4 个顺序阶段 | 目标点点设后左键落点'
         hint = self.tiny_font.render(hint_text, True, self.colors['toolbar_text'])
         hint_x = preset_rect.right + 14
         if hint_x + hint.get_width() <= self.window_width - 12:
@@ -1519,8 +2186,7 @@ class BehaviorEditorApp:
             self.screen.blit(surface, map_rect.topleft)
         pygame.draw.rect(self.screen, self.colors['panel_border'], map_rect, 1)
         self._render_facility_overlay()
-        self._render_destination_regions()
-        self._render_task_regions()
+        self._render_behavior_regions()
         self._render_selected_region_overlay()
         self._render_point_targets_overlay()
         self._render_preview_target_regions()
@@ -1554,10 +2220,6 @@ class BehaviorEditorApp:
                     rect = pygame.Rect(top_left[0], top_left[1], max(1, bottom_right[0] - top_left[0]), max(1, bottom_right[1] - top_left[1]))
                     pygame.draw.rect(self.screen, color, rect, 1)
 
-    def _task_region_color(self, index):
-        palette = (self.colors['yellow'], self.colors['orange'], self.colors['red'], self.colors['blue'])
-        return palette[index % len(palette)]
-
     def _render_region_collection(self, regions, color, width=3):
         for region in regions:
             shape = region.get('shape', 'rect')
@@ -1584,31 +2246,36 @@ class BehaviorEditorApp:
                     )
                     pygame.draw.rect(self.screen, color, rect, width)
 
-    def _render_destination_regions(self):
-        self._render_region_collection(self.engine.current_destination_regions(team=self.region_edit_team), self.colors['green'], width=3)
-
-    def _render_task_regions(self):
-        for index, region in enumerate(self.engine.current_task_regions(team=self.region_edit_team)):
-            self._render_region_collection([region], self._task_region_color(index), width=3)
+    def _render_behavior_regions(self):
+        if str(self.engine.current_strategy_stage(self.selected_strategy_stage_index).get('task_type', 'default') or 'default') == 'terrain_traversal':
+            return
+        self._render_region_collection(self.engine.current_behavior_regions(team=self.region_edit_team), self.colors['green'], width=3)
 
     def _render_point_targets_overlay(self):
         target_defs = self.engine.editable_point_targets()
         if not target_defs:
             return
-        targets = self.engine.current_point_targets(team=self.region_edit_team)
+        targets = self.engine.current_point_target_specs(team=self.region_edit_team)
         if not targets:
             return
         color = self.colors['red'] if self.region_edit_team == 'red' else self.colors['blue']
         ordered_points = []
         for index, item in enumerate(target_defs, start=1):
-            point = targets.get(str(item.get('id', '')))
-            if point is None:
+            point_spec = targets.get(str(item.get('id', '')))
+            if point_spec is None:
                 continue
+            point = (float(point_spec.get('x', 0.0)), float(point_spec.get('y', 0.0)))
             ordered_points.append(point)
             screen_point = self.world_to_screen(point)
             if screen_point is None:
                 continue
             active = self.point_edit_target == str(item.get('id', ''))
+            radius = float(point_spec.get('radius', 0.0) or 0.0)
+            if radius > 0.0:
+                edge_point = self.world_to_screen((point[0] + radius, point[1]))
+                if edge_point is not None:
+                    draw_radius = max(2, int(math.hypot(edge_point[0] - screen_point[0], edge_point[1] - screen_point[1])))
+                    pygame.draw.circle(self.screen, self.colors['orange'] if active else color, screen_point, draw_radius, 2)
             pygame.draw.circle(self.screen, self.colors['white'], screen_point, 10)
             pygame.draw.circle(self.screen, self.colors['orange'] if active else color, screen_point, 10, 3)
             label_surface = self.tiny_font.render(str(index), True, self.colors['panel_text'])
@@ -1676,7 +2343,7 @@ class BehaviorEditorApp:
         if self.shape_mode == 'polygon' and self.polygon_points:
             points = [self.world_to_screen(point) for point in self.polygon_points]
             points = [point for point in points if point is not None]
-            preview_color = self.colors['green'] if self.region_edit_target == 'destination' else self.colors['yellow']
+            preview_color = self.colors['green']
             if self.mouse_world is not None:
                 preview_target = self._current_draw_target(self.mouse_world)
                 target_point = self.world_to_screen(preview_target)
@@ -1697,13 +2364,35 @@ class BehaviorEditorApp:
         end = self.world_to_screen(self.drag_current)
         if start is None or end is None:
             return
-        preview_color = self.colors['green'] if self.region_edit_target == 'destination' else self.colors['yellow']
+        preview_color = self.colors['green']
         if self.shape_mode == 'circle':
             radius = max(2, int(math.hypot(end[0] - start[0], end[1] - start[1])))
             pygame.draw.circle(self.screen, preview_color, start, radius, 2)
         else:
             rect = pygame.Rect(min(start[0], end[0]), min(start[1], end[1]), abs(end[0] - start[0]), abs(end[1] - start[1]))
             pygame.draw.rect(self.screen, preview_color, rect, 2)
+
+    def _strategy_stage_summary(self, stage_index):
+        stage = self.engine.current_strategy_stage(stage_index)
+        if not stage:
+            return f'阶段 {stage_index + 1}: 未启用'
+        task_type = self.engine.current_strategy_task_type_label(stage_index)
+        parts = [task_type]
+        destination_mode = str(stage.get('destination_mode', 'region') or 'region')
+        if destination_mode == 'reference':
+            parts.append(self.engine.current_destination_ref_label(stage_index))
+        task_key = str(stage.get('task_type', 'default') or 'default')
+        if task_key == 'assault':
+            parts.append(self.engine.current_assault_ref_label(stage_index))
+            if destination_mode == 'reference':
+                parts.append(self.engine.current_assault_follow_priority_label(stage_index))
+        if task_key == 'field_interaction':
+            parts.append(self.engine.current_interaction_ref_label(stage_index))
+        if task_key == 'defense':
+            parts.append(self.engine.current_defense_ref_label(stage_index))
+        if task_key == 'area_patrol':
+            parts.append(f'{self.engine.current_engage_distance_text(stage_index)}m')
+        return f'阶段 {stage_index + 1}: ' + ' / '.join(parts)
 
     def render_panel(self):
         panel_rect = self.panel_rect()
@@ -1737,8 +2426,20 @@ class BehaviorEditorApp:
         header_text = self.small_font.render(f'决策列表 共 {len(specs)} 项', True, self.colors['panel_text'])
         self.screen.blit(header_text, (header_rect.x, header_rect.y + 4))
         if specs:
+            move_up_rect = pygame.Rect(header_rect.right - 118, header_rect.y + 2, 50, 24)
+            move_down_rect = pygame.Rect(header_rect.right - 60, header_rect.y + 2, 50, 24)
+            pygame.draw.rect(self.screen, self.colors['panel_row'], move_up_rect, border_radius=5)
+            pygame.draw.rect(self.screen, self.colors['panel_border'], move_up_rect, 1, border_radius=5)
+            pygame.draw.rect(self.screen, self.colors['panel_row'], move_down_rect, border_radius=5)
+            pygame.draw.rect(self.screen, self.colors['panel_border'], move_down_rect, 1, border_radius=5)
+            up_text = self.tiny_font.render('上移', True, self.colors['panel_text'])
+            down_text = self.tiny_font.render('下移', True, self.colors['panel_text'])
+            self.screen.blit(up_text, (move_up_rect.x + (move_up_rect.width - up_text.get_width()) // 2, move_up_rect.y + 5))
+            self.screen.blit(down_text, (move_down_rect.x + (move_down_rect.width - down_text.get_width()) // 2, move_down_rect.y + 5))
+            self.click_actions.append((move_up_rect, 'decision_move:up'))
+            self.click_actions.append((move_down_rect, 'decision_move:down'))
             hint_text = self.tiny_font.render('滚轮可上下滚动全部决策', True, self.colors['gray'])
-            self.screen.blit(hint_text, (header_rect.right - hint_text.get_width(), header_rect.y + 6))
+            self.screen.blit(hint_text, (header_rect.right - hint_text.get_width() - 126, header_rect.y + 6))
         y += 30
 
         decision_row_height = 44
@@ -1794,11 +2495,19 @@ class BehaviorEditorApp:
         self._draw_scroll_hint(viewport_rect)
 
         active_input = self.active_text.input or {}
+        selected_stage_index = max(0, min(self.selected_strategy_stage_index, self.engine.MAX_STRATEGY_STAGES - 1))
+        self.selected_strategy_stage_index = selected_stage_index
+        implementation_details = self.engine.current_decision_implementation_details()
         edit_values = {
             'label': active_input.get('text', '') if active_input.get('field') == 'label' else str(override.get('label', '')),
+            'brief': active_input.get('text', '') if active_input.get('field') == 'brief' else str(override.get('brief', '')),
+            'trigger_note': active_input.get('text', '') if active_input.get('field') == 'trigger_note' else str(override.get('trigger_note', '')),
+            'logic_note': active_input.get('text', '') if active_input.get('field') == 'logic_note' else str(override.get('logic_note', '')),
+            'function_note': active_input.get('text', '') if active_input.get('field') == 'function_note' else str(override.get('function_note', '')),
             'condition_expr': active_input.get('text', '') if active_input.get('field') == 'condition_expr' else str(override.get('condition_expr', '')),
             'start_sec': active_input.get('text', '') if active_input.get('field') == 'start_sec' else str((override.get('time_window') or {}).get('start_sec', '')),
             'end_sec': active_input.get('text', '') if active_input.get('field') == 'end_sec' else str((override.get('time_window') or {}).get('end_sec', '')),
+            'engage_distance_m': active_input.get('text', '') if active_input.get('field') == f'engage_distance_m:{selected_stage_index}' else self.engine.current_engage_distance_text(selected_stage_index),
         }
 
         self._clamp_panel_scroll()
@@ -1818,13 +2527,15 @@ class BehaviorEditorApp:
             card_y += card_h_small + 8
             self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_medium), '当前标签', [current_label])
             card_y += card_h_medium + 8
+            self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_medium), '决策简述', [edit_values['brief'] or '未填写'], action='edit:brief', active=True)
+            card_y += card_h_medium + 8
             half_width = (viewport_rect.width - 28) // 2
             self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, half_width, card_h_small), '启用状态', [self.engine.current_enabled_label()], action='toggle:enabled', active=True)
             self._panel_card(pygame.Rect(viewport_rect.x + 18 + half_width, card_y, half_width, card_h_small), '区域模式', [self.engine.current_region_mode_label()], action='toggle:region_mode')
             card_y += card_h_small + 8
             self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, 92), '覆盖说明', [
                 '未修改的字段保持默认行为树逻辑。',
-                '已覆盖的标签、时间、条件和区域会在运行时叠加到默认决策上。',
+                '已覆盖的标签、简述、时间、条件、策略和行为区域会在运行时叠加到默认决策上。',
             ])
             card_y += 100
         elif self.detail_page == 'condition':
@@ -1840,40 +2551,113 @@ class BehaviorEditorApp:
                 'health_ratio < 0.45 or outnumbered',
             ])
             card_y += 110
-        elif self.detail_page == 'region':
-            destination_regions = self.engine.current_destination_regions(team=self.region_edit_team)
-            task_regions = self.engine.current_task_regions(team=self.region_edit_team)
-            editable_targets = self.engine.editable_point_targets()
-            point_targets = self.engine.current_point_targets(team=self.region_edit_team)
-            edit_layer_label = '目的地区域' if self.region_edit_target == 'destination' else '任务区域'
-            edit_team_label = '红方' if self.region_edit_team == 'red' else '蓝方'
-            self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_small), '当前编辑层', [edit_layer_label], action=f'edit_layer:{self.region_edit_target}', active=True)
+        elif self.detail_page == 'strategy':
+            strategy = self.engine.current_strategy_stage(selected_stage_index)
+            task_type = str(strategy.get('task_type', 'default'))
+            destination_mode = str(strategy.get('destination_mode', 'region'))
+            stage_card_width = (viewport_rect.width - 28) // 2
+            stage_card_height = 62
+            for stage_slot_index in range(self.engine.MAX_STRATEGY_STAGES):
+                stage_rect = pygame.Rect(
+                    viewport_rect.x + 10 + (stage_slot_index % 2) * (stage_card_width + 8),
+                    card_y + (stage_slot_index // 2) * (stage_card_height + 8),
+                    stage_card_width,
+                    stage_card_height,
+                )
+                self._panel_card(
+                    stage_rect,
+                    f'阶段 {stage_slot_index + 1}',
+                    [self._strategy_stage_summary(stage_slot_index)],
+                    action=f'strategy_stage:select:{stage_slot_index}',
+                    active=selected_stage_index == stage_slot_index,
+                )
+            card_y += stage_card_height * 2 + 24
+            half_width = (viewport_rect.width - 28) // 2
+            self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, half_width, card_h_small), '当前编辑阶段', [f'阶段 {selected_stage_index + 1}'], active=True)
+            self._panel_card(pygame.Rect(viewport_rect.x + 18 + half_width, card_y, half_width, card_h_small), '清空当前阶段', ['移除该阶段并压缩后续顺序'], action=f'strategy_stage:clear:{selected_stage_index}')
             card_y += card_h_small + 8
+            self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_small), '任务目标类型', [self.engine.current_strategy_task_type_label(selected_stage_index)], action=f'cycle:strategy_task_type:{selected_stage_index}', active=True)
+            card_y += card_h_small + 8
+            self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_small), '目标地点类型', [self.engine.current_destination_mode_label(selected_stage_index)], action=f'cycle:destination_mode:{selected_stage_index}', active=True)
+            card_y += card_h_small + 8
+            if destination_mode == 'reference':
+                self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_medium), '目标地点引用', [self.engine.current_destination_ref_label(selected_stage_index)], action=f'cycle:destination_ref:{selected_stage_index}', active=True)
+                card_y += card_h_medium + 8
+            if task_type == 'assault':
+                self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_medium), '进攻对象', [self.engine.current_assault_ref_label(selected_stage_index)], action=f'cycle:assault_ref:{selected_stage_index}', active=True)
+                card_y += card_h_medium + 8
+                if destination_mode == 'reference':
+                    self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_small), '引用优先级', [self.engine.current_assault_follow_priority_label(selected_stage_index)], action=f'cycle:assault_follow_priority:{selected_stage_index}', active=True)
+                    card_y += card_h_small + 8
+            if task_type == 'field_interaction':
+                self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_medium), '交互目标', [self.engine.current_interaction_ref_label(selected_stage_index)], action=f'cycle:interaction_ref:{selected_stage_index}', active=True)
+                card_y += card_h_medium + 8
+            if task_type == 'defense':
+                self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_medium), '防守目标', [self.engine.current_defense_ref_label(selected_stage_index)], action=f'cycle:defense_ref:{selected_stage_index}', active=True)
+                card_y += card_h_medium + 8
+            if task_type == 'area_patrol':
+                self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_small), '触敌距离（米）', [edit_values['engage_distance_m']], action=f'edit:engage_distance_m:{selected_stage_index}', active=True)
+                card_y += card_h_small + 8
+            self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, 144), '策略说明', [
+                '一个决策最多可配置 4 个顺序阶段，会按阶段 1 到 4 依次执行。',
+                '地形跨越类：使用跨越节点 1 到 4，节点自带生效范围，不再额外叠目标区域。',
+                '进攻类：可设置进攻对象，并在“跟随引用目标”时切换目标优先或地点优先。',
+                '场地交互类：支持补给、取矿、激活能量机关。',
+                '防守类：需要先配置行为区域，再选择高威胁敌人或回防基地。',
+                '区域巡航类：在行为区域内随机巡航，触敌距离可单独配置。',
+                '目标地点可设置为行为区域、引用目标，也可以明确关闭。',
+            ])
+            card_y += 152
+        elif self.detail_page == 'region':
+            behavior_regions = self.engine.current_behavior_regions(team=self.region_edit_team)
+            editable_targets = self.engine.editable_point_targets()
+            point_targets = self.engine.current_point_target_specs(team=self.region_edit_team)
+            edit_team_label = '红方' if self.region_edit_team == 'red' else '蓝方'
+            terrain_stage_active = str(self.engine.current_strategy_stage(selected_stage_index).get('task_type', 'default') or 'default') == 'terrain_traversal'
             self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_small), '当前编辑队伍', [edit_team_label], action=f'edit_team:{self.region_edit_team}', active=True)
             card_y += card_h_small + 8
             if editable_targets:
                 point_rect = pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, self._point_target_section_height(len(editable_targets)))
-                self._render_point_target_section(point_rect, f'地形目标点列表（{edit_team_label}）', editable_targets, point_targets)
+                self._render_point_target_section(point_rect, f'目标点 / 节点列表（{edit_team_label}）', editable_targets, point_targets)
                 card_y += point_rect.height + 8
-            self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_small), '目的地区域数量', [f'{len(destination_regions)} 个区域'])
-            card_y += card_h_small + 8
-            destination_rect = pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, self._region_list_section_height(len(destination_regions)))
-            self._render_region_list_section(destination_rect, f'目的地列表（{edit_team_label}）', destination_regions, 'destination')
-            card_y += destination_rect.height + 8
-            self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_small), '区域模式', [self.engine.current_region_mode_label()], action='toggle:region_mode', active=True)
-            card_y += card_h_small + 8
-            self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_small), '任务区域数量', [f'{len(task_regions)} 个区域'])
-            card_y += card_h_small + 8
-            task_rect = pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, self._region_list_section_height(len(task_regions)))
-            self._render_region_list_section(task_rect, f'任务区域列表（{edit_team_label}）', task_regions, 'task')
-            card_y += task_rect.height + 8
+            if not terrain_stage_active:
+                self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_small), '行为区域数量', [f'{len(behavior_regions)} 个区域'])
+                card_y += card_h_small + 8
+                behavior_rect = pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, self._region_list_section_height(len(behavior_regions)))
+                self._render_region_list_section(behavior_rect, f'行为区域列表（{edit_team_label}）', behavior_regions, 'behavior')
+                card_y += behavior_rect.height + 8
+                self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_small), '区域模式', [self.engine.current_region_mode_label()], action='toggle:region_mode', active=True)
+                card_y += card_h_small + 8
             self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, 122), '绘制说明', [
-                '绿色区域表示行为目的地，黄色区域表示触发/任务区域。',
-                '工具栏可切换当前编辑层和红蓝双方。',
+                '绿色区域表示统一的行为区域。',
+                '切到策略页的地形跨越类后，可在这里布置跨越节点 1 到 4，并用滚轮调节点范围。',
+                '地形跨越类不再额外使用行为区域，直接按节点区判定到达。',
+                '工具栏可切换当前红蓝双方。',
                 '矩形/圆形：左键拖拽完成；多边形：左键逐点添加，点回起点或 Enter 收尾。',
                 '点击已有区域可选中并拖拽编辑，右侧列表也可直接选中或删除。',
             ])
             card_y += 130
+        elif self.detail_page == 'implementation':
+            self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, 108), '系统触发说明', implementation_details.get('trigger_lines', []))
+            card_y += 116
+            self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, 132), '系统运行逻辑', implementation_details.get('logic_lines', []))
+            card_y += 140
+            self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, 128), '调用函数与代码入口', implementation_details.get('function_lines', []))
+            card_y += 136
+            self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, 180), '可修改接口', implementation_details.get('interface_lines', []))
+            card_y += 188
+            self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_medium), '你写的触发说明', [edit_values['trigger_note'] or '点击这里填写你自己的触发说明'], action='edit:trigger_note', active=True)
+            card_y += card_h_medium + 8
+            self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_large), '你写的运行逻辑说明', [edit_values['logic_note'] or '点击这里填写你自己的运行逻辑说明'], action='edit:logic_note', active=True)
+            card_y += card_h_large + 8
+            self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_large), '你写的函数说明 / 修改备注', [edit_values['function_note'] or '点击这里填写函数说明、改造思路或代码修改备注'], action='edit:function_note', active=True)
+            card_y += card_h_large + 8
+            self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, 102), '说明', [
+                '上半部分是系统自动解析的插件说明、触发入口、动作入口和代码位置。',
+                '下半部分是你可以直接修改并保存到行为预设里的说明字段。',
+                '如果你要改真正的实现代码，请按上面的文件与函数入口到对应源码里修改。',
+            ])
+            card_y += 110
 
         log_rect = pygame.Rect(viewport_rect.x, card_y + 8, viewport_rect.width, footer_height)
         pygame.draw.rect(self.screen, self.colors['panel_row'], log_rect, border_radius=8)
@@ -1900,8 +2684,21 @@ class BehaviorEditorApp:
         if field == 'preset_name':
             self.engine.preset_name = text.strip() or 'latest_behavior'
             self.engine._persist_live_changes(f'主程序已切换行为预设: {self.engine.preset_name}')
-        elif field in {'label', 'condition_expr'}:
+        elif field in {'label', 'condition_expr', 'brief', 'trigger_note', 'logic_note', 'function_note'}:
             self.engine.set_override_field(field, text)
+        elif str(field).startswith('engage_distance_m:'):
+            try:
+                stage_index = int(str(field).split(':', 1)[1])
+            except ValueError:
+                stage_index = self.selected_strategy_stage_index
+            value = text.strip()
+            if not value:
+                self.engine.set_strategy_field('engage_distance_m', None, stage_index=stage_index)
+            else:
+                try:
+                    self.engine.set_strategy_field('engage_distance_m', float(value), stage_index=stage_index)
+                except ValueError:
+                    self.engine.add_log('触敌距离不是有效数字，已保留原值')
         elif field in {'start_sec', 'end_sec'}:
             value = text.strip()
             if not value:
@@ -1955,13 +2752,13 @@ class BehaviorEditorApp:
                 self.polygon_points = []
             self.region_drag_state = None
             return
-        if action.startswith('edit_layer:'):
-            self.region_edit_target = action.split(':', 1)[1]
-            self._clear_region_selection()
-            return
         if action.startswith('edit_team:'):
             self.region_edit_team = action.split(':', 1)[1]
             self.point_edit_target = None
+            self._clear_region_selection()
+            return
+        if action == 'mirror:to_opponent':
+            self.engine.mirror_current_team_to_opponent(self.region_edit_team)
             self._clear_region_selection()
             return
         if action == 'preview:toggle':
@@ -1976,7 +2773,15 @@ class BehaviorEditorApp:
             self.preview_loop_active = False
             self.sidebar_list_scroll_y = max(0, min(self.sidebar_list_scroll_y, self.sidebar_list_scroll_max))
             self.decision_list_scroll_y = max(0, min(self.decision_list_scroll_y, self.decision_list_scroll_max))
+            self.selected_strategy_stage_index = 0
             self._clear_region_selection()
+            return
+        if action.startswith('decision_move:'):
+            spec = self.engine.selected_spec()
+            if spec is None:
+                return
+            direction = -1 if action.endswith('up') else 1
+            self.engine.move_role_decision(spec['id'], direction)
             return
         if action.startswith('role:'):
             self.engine.selected_role_index = int(action.split(':', 1)[1])
@@ -1984,6 +2789,7 @@ class BehaviorEditorApp:
             self.decision_list_scroll_y = 0
             self.sidebar_list_scroll_y = 0
             self.preview_loop_active = False
+            self.selected_strategy_stage_index = 0
             self._clear_region_selection()
             return
         if action.startswith('decision:'):
@@ -1991,6 +2797,7 @@ class BehaviorEditorApp:
             self.detail_page = 'overview'
             self.panel_scroll_y = 0
             self.preview_loop_active = False
+            self.selected_strategy_stage_index = 0
             self._clear_region_selection()
             return
         if action.startswith('decision_page:'):
@@ -2004,9 +2811,16 @@ class BehaviorEditorApp:
             self.detail_page = action.split(':', 1)[1]
             self.panel_scroll_y = 0
             return
+        if action.startswith('strategy_stage:select:'):
+            self.selected_strategy_stage_index = max(0, min(self.engine.MAX_STRATEGY_STAGES - 1, int(action.rsplit(':', 1)[1])))
+            return
+        if action.startswith('strategy_stage:clear:'):
+            self.engine.clear_strategy_stage(int(action.rsplit(':', 1)[1]))
+            self.selected_strategy_stage_index = max(0, min(self.selected_strategy_stage_index, self.engine.MAX_STRATEGY_STAGES - 1))
+            return
         if action.startswith('select_region:'):
             _, region_kind, raw_index = action.split(':', 2)
-            self.region_edit_target = region_kind
+            self.region_edit_target = 'behavior'
             self.point_edit_target = None
             self._set_selected_region(region_kind, int(raw_index), region_team=self.region_edit_team)
             return
@@ -2026,10 +2840,17 @@ class BehaviorEditorApp:
                 self.point_edit_target = None
             return
         if action.startswith('edit:'):
-            field = action.split(':', 1)[1]
+            parts = action.split(':')
+            field = ':'.join(parts[1:])
             override = self.engine.current_override(create=False) or {}
-            if field in {'label', 'condition_expr'}:
+            if field in {'label', 'condition_expr', 'brief', 'trigger_note', 'logic_note', 'function_note'}:
                 text = str(override.get(field, ''))
+            elif field.startswith('engage_distance_m:'):
+                try:
+                    stage_index = int(field.split(':', 1)[1])
+                except ValueError:
+                    stage_index = self.selected_strategy_stage_index
+                text = self.engine.current_engage_distance_text(stage_index)
             elif field in {'start_sec', 'end_sec'}:
                 text = str((override.get('time_window') or {}).get(field, ''))
             else:
@@ -2042,9 +2863,31 @@ class BehaviorEditorApp:
         if action == 'toggle:region_mode':
             self.engine.cycle_region_mode()
             return
+        if action.startswith('cycle:strategy_task_type:'):
+            self.engine.cycle_strategy_field('task_type', stage_index=int(action.rsplit(':', 1)[1]))
+            return
+        if action.startswith('cycle:destination_mode:'):
+            self.engine.cycle_strategy_field('destination_mode', stage_index=int(action.rsplit(':', 1)[1]))
+            return
+        if action.startswith('cycle:destination_ref:'):
+            self.engine.cycle_strategy_field('destination_ref', stage_index=int(action.rsplit(':', 1)[1]))
+            return
+        if action.startswith('cycle:assault_ref:'):
+            self.engine.cycle_strategy_field('assault_ref', stage_index=int(action.rsplit(':', 1)[1]))
+            return
+        if action.startswith('cycle:assault_follow_priority:'):
+            self.engine.cycle_strategy_field('assault_follow_priority', stage_index=int(action.rsplit(':', 1)[1]))
+            return
+        if action.startswith('cycle:interaction_ref:'):
+            self.engine.cycle_strategy_field('interaction_ref', stage_index=int(action.rsplit(':', 1)[1]))
+            return
+        if action.startswith('cycle:defense_ref:'):
+            self.engine.cycle_strategy_field('defense_ref', stage_index=int(action.rsplit(':', 1)[1]))
+            return
         if action == 'clear_override':
             self.engine.clear_current_override()
             self.point_edit_target = None
+            self.selected_strategy_stage_index = 0
             self._clear_region_selection()
             return
         if action == 'delete_region_at_cursor' and self.mouse_world is not None:
@@ -2057,8 +2900,8 @@ class BehaviorEditorApp:
             return
 
     def finalize_drawn_region(self):
-        add_region = self.engine.add_destination_region if self.region_edit_target == 'destination' else self.engine.add_task_region
-        region_label = '目的地区域' if self.region_edit_target == 'destination' else '任务区域'
+        add_region = self.engine.add_behavior_region
+        region_label = '行为区域'
         if self.shape_mode == 'polygon':
             if len(self.polygon_points) >= 3:
                 add_region({'shape': 'polygon', 'points': [(round(point[0], 1), round(point[1], 1)) for point in self.polygon_points]}, team=self.region_edit_team)
@@ -2121,6 +2964,13 @@ class BehaviorEditorApp:
                         self.drag_current = self._current_draw_target(self.mouse_world)
                 if event.type == pygame.MOUSEWHEEL:
                     mouse_pos = pygame.mouse.get_pos()
+                    if self.point_edit_target is not None and self.map_draw_rect().collidepoint(mouse_pos):
+                        point_spec = self.engine.current_point_target_specs(team=self.region_edit_team).get(self.point_edit_target)
+                        if point_spec is not None:
+                            base_radius = float(point_spec.get('radius', 0.0) or self.engine.ai_controller._strategy_node_default_radius(self.engine.map_manager))
+                            if self.engine.set_point_target_radius(self.point_edit_target, base_radius + float(event.y) * 10.0, team=self.region_edit_team):
+                                self.engine.add_log(f'已调整 {self.point_edit_target} 节点范围')
+                                continue
                     if self.map_draw_rect().collidepoint(mouse_pos):
                         self._zoom_map_around(mouse_pos, event.y)
                         self.mouse_world = self.screen_to_world(mouse_pos)
@@ -2154,8 +3004,7 @@ class BehaviorEditorApp:
                         continue
                     if self.point_edit_target is not None:
                         self.engine.set_point_target(self.point_edit_target, world_point, team=self.region_edit_team)
-                        self.engine.add_log(f'已设置 {self.point_edit_target} 目标点')
-                        self.point_edit_target = None
+                        self.engine.add_log(f'已设置 {self.point_edit_target} 目标点，可继续滚轮调整范围，右键结束')
                         continue
                     if self.shape_mode == 'polygon' and self.polygon_points:
                         world_point = self._current_draw_target(world_point)

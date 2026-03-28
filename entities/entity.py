@@ -84,6 +84,9 @@ class Entity:
         self.power_per_shot = 6.0
         self.autoaim_locked_target_id = None
         self.autoaim_lock_timer = 0.0
+        self.auto_aim_hit_probability = 0.0
+        self.auto_aim_hit_probability_target_id = None
+        self.auto_aim_hit_probability_updated_at = -1e9
         self.shot_cooldown = 0.0
         self.overheat_lock_timer = 0.0
         self.evasive_spin_timer = 0.0
@@ -105,7 +108,9 @@ class Entity:
         self.permanent_eliminated = False
         self.elimination_reason = ''
         self.fort_buff_active = False
+        self.trapezoid_highground_active = False
         self.terrain_buff_timer = 0.0
+        self.fly_slope_airborne_timer = 0.0
         self.supply_cooldown = 0.0
         self.supply_ammo_claimed = 0
         self.exchange_cooldown = 0.0
@@ -137,6 +142,8 @@ class Entity:
         self.hero_deployment_state = 'inactive'
         self.hero_deployment_target_id = None
         self.hero_deployment_hit_probability = 0.0
+        self.hero_deployment_hit_probability_target_id = None
+        self.hero_deployment_hit_probability_updated_at = -1e9
         self.carried_minerals = 0
         self.carried_mineral_type = None
         self.mined_minerals_total = 0

@@ -5,8 +5,10 @@ from control.decision_plugins.catalog import PLUGINS
 
 
 TARGET_DEFS = (
-	{'id': 'primary', 'label': '第一目标点'},
-	{'id': 'secondary', 'label': '第二目标点'},
+	{'id': 'node_1', 'label': '跨越节点 1'},
+	{'id': 'node_2', 'label': '跨越节点 2'},
+	{'id': 'node_3', 'label': '跨越节点 3'},
+	{'id': 'node_4', 'label': '跨越节点 4'},
 )
 
 
@@ -46,9 +48,9 @@ def _pick_step_targets(controller, map_manager, team, facility_type, near_offset
 	)
 	targets = {}
 	if primary is not None:
-		targets['primary'] = (float(primary[0]), float(primary[1]))
+		targets['node_1'] = (float(primary[0]), float(primary[1]))
 	if secondary is not None:
-		targets['secondary'] = (float(secondary[0]), float(secondary[1]))
+		targets['node_2'] = (float(secondary[0]), float(secondary[1]))
 	return targets
 
 
@@ -62,8 +64,8 @@ def terrain_condition(controller, context, role_key, binding):
 
 def terrain_action(controller, context, role_key, binding):
 	targets = _effective_targets(controller, role_key, binding.get('id'), context.map_manager, context.entity.team)
-	primary = targets.get('primary')
-	secondary = targets.get('secondary') or primary
+	primary = targets.get('node_1')
+	secondary = targets.get('node_2') or primary
 	if primary is None and secondary is None:
 		return FAILURE
 	focus_target = context.data.get('target')
@@ -71,7 +73,7 @@ def terrain_action(controller, context, role_key, binding):
 	if primary is not None and not controller._is_target_reached(context.entity, primary, context.map_manager):
 		return controller._set_decision(
 			context,
-			'翻越二级台阶先进入第一目标点，完成接近与预对正',
+			'翻越二级台阶先进入跨越节点 1，完成接近与预对正',
 			target=focus_target,
 			target_point=primary,
 			speed=speed,
@@ -80,7 +82,7 @@ def terrain_action(controller, context, role_key, binding):
 		)
 	return controller._set_decision(
 		context,
-		'翻越二级台阶转入第二目标点，完成高差跨越路线',
+		'翻越二级台阶转入跨越节点 2，完成高差跨越路线',
 		target=focus_target,
 		target_point=secondary,
 		speed=speed,

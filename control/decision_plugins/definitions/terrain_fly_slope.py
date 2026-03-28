@@ -5,8 +5,10 @@ from control.decision_plugins.catalog import PLUGINS
 
 
 TARGET_DEFS = (
-	{'id': 'primary', 'label': '第一目标点'},
-	{'id': 'secondary', 'label': '第二目标点'},
+	{'id': 'node_1', 'label': '跨越节点 1'},
+	{'id': 'node_2', 'label': '跨越节点 2'},
+	{'id': 'node_3', 'label': '跨越节点 3'},
+	{'id': 'node_4', 'label': '跨越节点 4'},
 )
 
 
@@ -38,7 +40,7 @@ def _default_targets(controller, map_manager, team):
 			best_distance = distance
 			slope = facility
 	if slope is None:
-		return {'primary': primary} if primary is not None else {}
+		return {'node_1': primary} if primary is not None else {}
 	direction = _team_direction(team)
 	peak_x = float(slope.get('x2', 0.0)) if direction > 0 else float(slope.get('x1', 0.0))
 	center_y = (float(slope.get('y1', 0.0)) + float(slope.get('y2', 0.0))) * 0.5
@@ -50,9 +52,9 @@ def _default_targets(controller, map_manager, team):
 	)
 	targets = {}
 	if primary is not None:
-		targets['primary'] = (float(primary[0]), float(primary[1]))
+		targets['node_1'] = (float(primary[0]), float(primary[1]))
 	if landing is not None:
-		targets['secondary'] = (float(landing[0]), float(landing[1]))
+		targets['node_2'] = (float(landing[0]), float(landing[1]))
 	return targets
 
 
@@ -67,8 +69,8 @@ def terrain_condition(controller, context, role_key, binding):
 
 def terrain_action(controller, context, role_key, binding):
 	targets = _effective_targets(controller, role_key, binding.get('id'), context.map_manager, context.entity.team)
-	primary = targets.get('primary')
-	secondary = targets.get('secondary') or primary
+	primary = targets.get('node_1')
+	secondary = targets.get('node_2') or primary
 	if primary is None and secondary is None:
 		return FAILURE
 	focus_target = context.data.get('target')
@@ -76,7 +78,7 @@ def terrain_action(controller, context, role_key, binding):
 	if primary is not None and not controller._is_target_reached(context.entity, primary, context.map_manager):
 		return controller._set_decision(
 			context,
-			'飞坡行为先进入第一目标点，对正坡道并准备切入',
+			'飞坡行为先进入跨越节点 1，对正坡道并准备切入',
 			target=focus_target,
 			target_point=primary,
 			speed=speed,
@@ -85,7 +87,7 @@ def terrain_action(controller, context, role_key, binding):
 		)
 	return controller._set_decision(
 		context,
-		'飞坡行为转入第二目标点，完成飞坡落点切换',
+		'飞坡行为转入跨越节点 2，完成飞坡落点切换',
 		target=focus_target,
 		target_point=secondary,
 		speed=speed * 1.05,

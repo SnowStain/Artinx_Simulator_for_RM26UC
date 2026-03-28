@@ -126,6 +126,8 @@ class RendererDetailPopupMixin:
             f"基础冷却: {detail['base_heat_dissipation_rate']:.2f}/s",
             f"地形增益: {detail['terrain_buff_timer']:.2f}s",
             f"堡垒增益: {'是' if detail['fort_buff_active'] else '否'}",
+            f"小能量增益: {detail.get('energy_small_buff_timer', 0.0):.2f}s",
+            f"大能量增益: {detail.get('energy_large_buff_timer', 0.0):.2f}s",
         ]
         if detail.get('is_hero'):
             combat_lines.insert(3, f"部署状态: {self._format_hero_deployment_state(detail.get('hero_deployment_state', 'inactive'))}")
@@ -153,6 +155,10 @@ class RendererDetailPopupMixin:
                     f"当前弹药: {detail['ammo']}",
                     f"17mm 弹量: {detail.get('ammo_17mm', 0)}",
                     f"42mm 弹量: {detail.get('ammo_42mm', 0)}",
+                    f"能量机关: {self._format_energy_state(detail.get('energy_mechanism_state', {}))}",
+                    f"机关窗口: {self._format_energy_window(detail.get('energy_mechanism_state', {}))}",
+                    f"机关计时: {float(detail.get('energy_mechanism_state', {}).get('window_timer', 0.0)):.2f}s",
+                    f"可激活次数: 小 {int(detail.get('energy_mechanism_state', {}).get('small_tokens', 0))} / 大 {int(detail.get('energy_mechanism_state', {}).get('large_tokens', 0))}",
                     f"枪管状态: {'锁定' if detail.get('front_gun_locked') else '可用'}",
                     f"规则射速: {detail['fire_rate_hz']:.2f} 发/s",
                     f"当前射速: {detail['effective_fire_rate_hz']:.2f} 发/s",
@@ -175,6 +181,23 @@ class RendererDetailPopupMixin:
         if buff_labels:
             buff_text = self.tiny_font.render('当前增益: ' + ' / '.join(buff_labels[:4]), True, self.colors['yellow'])
             self.screen.blit(buff_text, (panel_rect.x + 24, panel_rect.bottom - 22))
+
+    def _format_energy_state(self, state):
+        current_state = str((state or {}).get('state', 'inactive') or 'inactive')
+        return {
+            'inactive': '未激活',
+            'activating': '激活中',
+            'activated': '已生效',
+        }.get(current_state, current_state)
+
+    def _format_energy_window(self, state):
+        window_type = str((state or {}).get('window_type', '') or '')
+        if not window_type:
+            return '无'
+        return {
+            'small': '小能量',
+            'large': '大能量',
+        }.get(window_type, window_type)
 
     def _draw_stat_bar(self, x, y, width, label, value, maximum, color, value_text=None):
         bar_rect = pygame.Rect(x, y + 16, width, 12)

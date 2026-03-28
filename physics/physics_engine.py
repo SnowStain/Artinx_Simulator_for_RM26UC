@@ -257,24 +257,12 @@ class PhysicsEngine:
         if not getattr(entity, 'movable', True):
             return
 
-        if self._update_step_climb(entity, map_manager, dt):
-            return
+        if getattr(entity, 'step_climb_state', None):
+            entity.step_climb_state = None
 
         previous = dict(getattr(entity, 'previous_position', entity.position))
         current = entity.position
         step_limit = float(getattr(entity, 'max_terrain_step_height_m', self.default_max_terrain_step_height_m))
-        transition = None
-        if getattr(entity, 'can_climb_steps', False):
-            transition = map_manager.get_step_transition(
-                previous['x'],
-                previous['y'],
-                current['x'],
-                current['y'],
-                max_height_delta_m=step_limit,
-            )
-            if transition is not None:
-                self._begin_step_climb(entity, transition, map_manager, dt)
-                return
 
         path_result = map_manager.evaluate_movement_path(
             previous['x'],
@@ -286,21 +274,25 @@ class PhysicsEngine:
         )
 
         if path_result.get('ok'):
+            if path_result.get('requires_step_alignment', False):
+                desired_heading = float(path_result.get('step_heading_deg', getattr(entity, 'angle', 0.0)))
+                angle_diff = self._normalize_angle_diff(desired_heading - float(getattr(entity, 'angle', 0.0)))
+                if abs(angle_diff) > 10.0:
+                    turn_speed = 360.0 * float(dt)
+                    turn_step = max(-turn_speed, min(turn_speed, angle_diff))
+                    entity.angle = (float(getattr(entity, 'angle', 0.0)) + turn_step) % 360.0
+                    entity.turret_angle = entity.angle
+                    entity.position['x'] = previous['x']
+                    entity.position['y'] = previous['y']
+                    entity.position['z'] = float(path_result.get('start_height_m', previous.get('z', 0.0)))
+                    entity.velocity['vx'] = 0.0
+                    entity.velocity['vy'] = 0.0
+                    entity.velocity['vz'] = 0.0
+                    entity.last_valid_position = dict(entity.position)
+                    return
             entity.position['z'] = float(path_result.get('end_height_m', current.get('z', 0.0)))
             entity.last_valid_position = dict(entity.position)
             return
-
-        if path_result.get('reason') in {'height_delta', 'blocked'}:
-            transition = transition or map_manager.get_step_transition(
-                previous['x'],
-                previous['y'],
-                current['x'],
-                current['y'],
-                max_height_delta_m=step_limit,
-            )
-            if transition is not None and getattr(entity, 'can_climb_steps', False):
-                self._begin_step_climb(entity, transition, map_manager, dt)
-                return
 
         fallback = dict(getattr(entity, 'last_valid_position', previous))
         entity.position['x'] = fallback['x']

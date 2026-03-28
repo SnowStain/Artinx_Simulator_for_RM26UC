@@ -1551,12 +1551,12 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             statuses.append(('发射机构锁死', self.colors['red']))
         target = self._resolve_target_entity(entity)
         if target is not None and entity.is_alive() and self.game_engine is not None:
-            distance = math.hypot(target.position['x'] - entity.position['x'], target.position['y'] - entity.position['y'])
-            hit_probability = self.game_engine.rules_engine.calculate_hit_probability(entity, target, distance)
             if bool(getattr(entity, 'hero_deployment_active', False)) and target.type in {'outpost', 'base'}:
                 motion_label = '部署吊射'
+                hit_probability = float(getattr(entity, 'hero_deployment_hit_probability', 0.0))
             else:
                 motion_label = self.game_engine.rules_engine.describe_target_motion(target)
+                hit_probability = float(getattr(entity, 'auto_aim_hit_probability', 0.0))
             statuses.append((f'{motion_label} {hit_probability * 100:.0f}%', self.colors['white']))
         if not statuses:
             return

@@ -741,10 +741,47 @@ class RulesEngine:
             angle_diff += 360
         return angle_diff
 
+    def _clamp01(self, value):
+        return max(0.0, min(1.0, float(value)))
+
+    def _smoothstep01(self, value):
+        clamped = self._clamp01(value)
+        return clamped * clamped * (3.0 - 2.0 * clamped)
+
     def _desired_turret_angle(self, shooter, target):
         dx = target.position['x'] - shooter.position['x']
         dy = target.position['y'] - shooter.position['y']
         return math.degrees(math.atan2(dy, dx))
+
+    def _stabilize_hit_probability(self, shooter, target, raw_probability, *, field_name, target_field_name, time_field_name):
+        now = float(getattr(self, 'game_time', 0.0))
+        target_id = getattr(target, 'id', None) if target is not None else None
+        previous_probability = float(getattr(shooter, field_name, 0.0))
+        previous_target_id = getattr(shooter, target_field_name, None)
+        previous_updated_at = float(getattr(shooter, time_field_name, -1e9))
+        hold_duration = float(self.rules['shooting'].get('hit_probability_hold_sec', 0.18))
+        zero_decay = float(self.rules['shooting'].get('hit_probability_zero_decay', 0.78))
+        rise_blend = float(self.rules['shooting'].get('hit_probability_rise_blend', 0.55))
+        fall_blend = float(self.rules['shooting'].get('hit_probability_fall_blend', 0.28))
+
+        if target_id is None:
+            stabilized = 0.0
+        elif previous_target_id != target_id:
+            stabilized = float(raw_probability)
+        elif raw_probability > previous_probability:
+            stabilized = previous_probability + (float(raw_probability) - previous_probability) * rise_blend
+        elif raw_probability > 0.0:
+            stabilized = previous_probability + (float(raw_probability) - previous_probability) * fall_blend
+        elif now - previous_updated_at <= hold_duration:
+            stabilized = previous_probability * zero_decay
+        else:
+            stabilized = 0.0
+
+        stabilized = self._clamp01(stabilized)
+        setattr(shooter, field_name, stabilized)
+        setattr(shooter, target_field_name, target_id)
+        setattr(shooter, time_field_name, now)
+        return stabilized
 
     def has_line_of_sight(self, shooter, target):
         map_manager = self._map_manager()
@@ -821,6 +858,23 @@ class RulesEngine:
             return {
                 'valid': False,
                 'distance': float('inf'),
+                'in_range': False,
+                'line_of_sight': False,
+                'angle_diff': 180.0,
+                'within_fov': False,
+                'can_track': False,
+                'can_auto_aim': False,
+            }
+
+        if (
+            getattr(shooter, 'type', None) == 'robot'
+            and getattr(shooter, 'robot_type', '') == '英雄'
+            and getattr(target, 'type', None) in {'outpost', 'base'}
+            and not bool(getattr(shooter, 'trapezoid_highground_active', False))
+        ):
+            return {
+                'valid': True,
+                'distance': float('inf') if distance is None else float(distance),
                 'in_range': False,
                 'line_of_sight': False,
                 'angle_diff': 180.0,
@@ -1039,6 +1093,7 @@ class RulesEngine:
             and getattr(shooter, 'robot_type', '') == '英雄'
             and bool(getattr(shooter, 'hero_deployment_active', False))
             and bool(getattr(shooter, 'hero_deployment_zone_active', False))
+            and bool(getattr(shooter, 'trapezoid_highground_active', False))
             and self._available_ammo(shooter) > 0
         )
 
@@ -1813,6 +1868,9 @@ class RulesEngine:
         damage_taken_mult = float(buff_rules.get('damage_taken_mult', 1.0))
         entity.dynamic_damage_taken_mult *= damage_taken_mult
 
+        if region.get('type') == 'buff_trapezoid_highland':
+            entity.trapezoid_highground_active = True
+
         if buff_rules.get('clear_weak'):
             self._clear_negative_states(entity)
 
@@ -1925,9 +1983,11 @@ class RulesEngine:
 
             self._reset_dynamic_effects(entity)
             entity.fort_buff_active = False
+            entity.trapezoid_highground_active = False
             entity.hero_deployment_zone_active = False
             entity.hero_deployment_target_id = None
             entity.hero_deployment_hit_probability = 0.0
+            entity.fly_slope_airborne_timer = max(0.0, float(getattr(entity, 'fly_slope_airborne_timer', 0.0)) - dt)
             if getattr(entity, 'robot_type', '') != '英雄':
                 entity.hero_deployment_charge = 0.0
                 entity.hero_deployment_active = False
@@ -1945,6 +2005,8 @@ class RulesEngine:
             for region in regions:
                 region_type = region.get('type')
                 if region_type == 'dead_zone':
+                    if float(getattr(entity, 'fly_slope_airborne_timer', 0.0)) > 0.0:
+                        continue
                     self._apply_dead_zone_penalty(entity)
                     break
                 if self._is_respawn_weak(entity) and self._respawn_safe_zone_reached(entity, regions):
@@ -2043,6 +2105,8 @@ class RulesEngine:
         facility_span = max(1.0, max(state['width'], state['height']))
         if state['time'] >= min_hold_time and travel_distance >= facility_span * completion_ratio:
             entity.terrain_buff_timer = self.rules['terrain_cross']['duration']
+            if state.get('facility_type') == 'fly_slope':
+                entity.fly_slope_airborne_timer = max(float(getattr(entity, 'fly_slope_airborne_timer', 0.0)), 2.0)
             self._log(f'{entity.id} 完整通过 {state["facility_type"]}，获得地形增益', entity.team)
 
     def _update_radar_marks(self, entities, map_manager, dt):
@@ -2185,7 +2249,15 @@ class RulesEngine:
             return 0.0
 
         if self._can_use_hero_deployment_fire(shooter) and getattr(target, 'type', None) in {'outpost', 'base'}:
-            return self._calculate_hero_deployment_hit_probability(shooter, target, distance)
+            raw_probability = self._calculate_hero_deployment_hit_probability(shooter, target, distance)
+            return self._stabilize_hit_probability(
+                shooter,
+                target,
+                raw_probability,
+                field_name='hero_deployment_hit_probability',
+                target_field_name='hero_deployment_hit_probability_target_id',
+                time_field_name='hero_deployment_hit_probability_updated_at',
+            )
 
         if distance is None:
             distance = math.hypot(
@@ -2195,9 +2267,16 @@ class RulesEngine:
         max_distance = self.get_range(shooter.type)
         if distance > max_distance:
             return 0.0
-        assessment = self.evaluate_auto_aim_target(shooter, target, distance=distance, require_fov=True)
-        if not assessment.get('can_auto_aim'):
-            return 0.0
+        assessment = self.evaluate_auto_aim_target(shooter, target, distance=distance, require_fov=False)
+        if not assessment.get('can_track'):
+            return self._stabilize_hit_probability(
+                shooter,
+                target,
+                0.0,
+                field_name='auto_aim_hit_probability',
+                target_field_name='auto_aim_hit_probability_target_id',
+                time_field_name='auto_aim_hit_probability_updated_at',
+            )
 
         probability = self._get_auto_aim_accuracy(distance, target)
         if getattr(shooter, 'robot_type', '') == '英雄' and not self._can_use_hero_deployment_fire(shooter):
@@ -2208,7 +2287,24 @@ class RulesEngine:
         probability *= self._hit_probability_multiplier(shooter)
         if self._is_fast_spinning_target(target):
             probability *= float(self.rules['shooting'].get('fast_spin_hit_multiplier', 0.6))
-        return max(0.0, min(1.0, probability))
+        half_fov = max(1.0, float(self.rules['shooting'].get('auto_aim_fov_deg', 50.0)) * 0.5)
+        angle_diff = abs(float(assessment.get('angle_diff', 0.0)))
+        if angle_diff > half_fov:
+            decay_limit = half_fov * max(1.2, float(self.rules['shooting'].get('hit_probability_tracking_decay_fov_mult', 2.4)))
+            min_tracking_mult = self._clamp01(self.rules['shooting'].get('hit_probability_min_tracking_mult', 0.58))
+            if angle_diff >= decay_limit:
+                probability *= min_tracking_mult
+            else:
+                progress = (angle_diff - half_fov) / max(decay_limit - half_fov, 1e-6)
+                probability *= 1.0 - (1.0 - min_tracking_mult) * self._smoothstep01(progress)
+        return self._stabilize_hit_probability(
+            shooter,
+            target,
+            self._clamp01(probability),
+            field_name='auto_aim_hit_probability',
+            target_field_name='auto_aim_hit_probability_target_id',
+            time_field_name='auto_aim_hit_probability_updated_at',
+        )
 
     def _calculate_hero_deployment_hit_probability(self, shooter, target, distance=None):
         if not self._can_use_hero_deployment_fire(shooter):
@@ -2238,27 +2334,40 @@ class RulesEngine:
 
     def _get_auto_aim_accuracy(self, distance, target):
         profile = self.rules['shooting'].get('auto_aim_accuracy', {})
-        motion_type = self.classify_target_motion(target)
         near_limit = self._meters_to_world_units(1.0)
         mid_limit = self._meters_to_world_units(5.0)
+        far_limit = max(mid_limit + 1.0, float(self.auto_aim_max_distance))
+
+        thresholds = self.rules['shooting'].get('motion_thresholds', {})
+        translating_speed = max(self._meters_to_world_units(thresholds.get('translating_target_speed_mps', 0.45)), 1e-6)
+        spinning_speed = max(float(thresholds.get('spinning_angular_velocity_deg', 45.0)), 1e-6)
+        linear_speed = math.hypot(float(target.velocity['vx']), float(target.velocity['vy']))
+        angular_speed = abs(float(getattr(target, 'angular_velocity', 0.0)))
+
+        translating_factor = self._smoothstep01((linear_speed - translating_speed * 0.2) / max(translating_speed * 0.9, 1e-6))
+        spinning_factor = self._smoothstep01((angular_speed - spinning_speed * 0.25) / max(spinning_speed * 0.9, 1e-6))
+
+        near_probability = float(profile.get('near_all', 0.30))
+        mid_fixed = float(profile.get('mid_fixed', 0.60))
+        mid_spin = float(profile.get('mid_spin', mid_fixed))
+        mid_translating = float(profile.get('mid_translating_spin', mid_spin))
+        far_fixed = float(profile.get('far_fixed', 0.10))
+        far_spin = float(profile.get('far_spin', far_fixed))
+        far_translating = float(profile.get('far_translating_spin', far_spin))
+
+        mid_probability = mid_fixed + (mid_spin - mid_fixed) * spinning_factor
+        mid_probability += (mid_translating - mid_probability) * translating_factor
+        far_probability = far_fixed + (far_spin - far_fixed) * spinning_factor
+        far_probability += (far_translating - far_probability) * translating_factor
 
         if distance <= near_limit:
-            return profile.get('near_all', 0.30)
-
+            return near_probability
         if distance <= mid_limit:
-            key = {
-                'fixed': 'mid_fixed',
-                'spin': 'mid_spin',
-                'translating_spin': 'mid_translating_spin',
-            }[motion_type]
-            return profile.get(key, 0.60)
+            blend = self._smoothstep01((float(distance) - near_limit) / max(mid_limit - near_limit, 1e-6))
+            return near_probability + (mid_probability - near_probability) * blend
 
-        key = {
-            'fixed': 'far_fixed',
-            'spin': 'far_spin',
-            'translating_spin': 'far_translating_spin',
-        }[motion_type]
-        return profile.get(key, 0.10)
+        blend = self._smoothstep01((float(distance) - mid_limit) / max(far_limit - mid_limit, 1e-6))
+        return mid_probability + (far_probability - mid_probability) * blend
 
     def classify_target_motion(self, target):
         thresholds = self.rules['shooting'].get('motion_thresholds', {})

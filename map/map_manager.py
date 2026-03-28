@@ -5,6 +5,7 @@ from pygame_compat import pygame
 import math
 import numpy as np
 import os
+import threading
 import time
 from heapq import heappop, heappush
 
@@ -41,6 +42,7 @@ class MapManager:
             'rugged_road': 13,
             'dead_zone': 14,
         }
+        self.terrain_type_by_code = {code: terrain_type for terrain_type, code in self.terrain_code_by_type.items()}
         self.terrain_label_by_code = {
             0: '平地',
             1: '边界',
@@ -85,6 +87,10 @@ class MapManager:
         self._regions_query_cache = {}
         self._regions_query_cache_version = -1
         self._lpa_planner_cache = {}
+        self._path_result_cache = {}
+        self._path_result_cache_lock = threading.Lock()
+        self._path_result_cache_max_entries = max(32, int(config.get('ai', {}).get('path_cache_max_entries', 192)))
+        self._path_failure_cache_ttl_sec = max(0.1, float(config.get('ai', {}).get('path_failure_cache_ttl_sec', 0.35)))
         self._load_facilities_from_config()
         self._load_terrain_grid_from_config()
 
@@ -94,6 +100,8 @@ class MapManager:
         self._regions_query_cache.clear()
         self._regions_query_cache_version = self.raster_version
         self._lpa_planner_cache.clear()
+        with self._path_result_cache_lock:
+            self._path_result_cache.clear()
 
     def _terrain_cell_key(self, grid_x, grid_y):
         return f'{int(grid_x)},{int(grid_y)}'
@@ -791,6 +799,7 @@ class MapManager:
         map_y = int(y)
         if not (0 <= map_x < self.map_width and 0 <= map_y < self.map_height):
             return {
+                'terrain_type': 'boundary',
                 'terrain_code': self.terrain_code_by_type['boundary'],
                 'terrain_label': '边界',
                 'height_m': 0.0,
@@ -801,6 +810,7 @@ class MapManager:
         self._ensure_raster_layers()
         terrain_code = int(self.terrain_type_map[map_y, map_x])
         return {
+            'terrain_type': self.terrain_type_by_code.get(terrain_code, 'flat'),
             'terrain_code': terrain_code,
             'terrain_label': self.terrain_label_by_code.get(terrain_code, '平地'),
             'height_m': round(float(self.height_map[map_y, map_x]), 2),
@@ -1194,20 +1204,24 @@ class MapManager:
         if start == goal:
             return [start_point, end_point]
 
-        planner = self._get_lpa_planner(
+        cache_key = self._path_result_cache_key(start, goal, step, traversal_profile, max_height_delta_m)
+        cached_path = self._get_cached_path_result(cache_key)
+        if cached_path is not None:
+            return cached_path
+
+        path = self._astar_find_path(
+            start=start,
             goal=goal,
+            start_point=start_world,
+            end_point=goal_world,
             step=step,
             max_height_delta_m=max_height_delta_m,
             traversal_profile=traversal_profile,
-        )
-        return self._lpa_find_path(
-            planner=planner,
-            start=start,
-            start_point=start_world,
-            end_point=goal_world,
             max_iterations=max_iterations,
             max_runtime_sec=max_runtime_sec,
         )
+        self._store_path_result(cache_key, path)
+        return path
 
     def _nav_profile_signature(self, traversal_profile, max_height_delta_m):
         traversal_profile = traversal_profile or {}
@@ -1224,6 +1238,48 @@ class MapManager:
             int(self.raster_version),
             self._nav_profile_signature(traversal_profile, max_height_delta_m),
         )
+
+    def _path_result_cache_key(self, start, goal, step, traversal_profile, max_height_delta_m):
+        return (
+            start,
+            goal,
+            int(step),
+            int(self.raster_version),
+            self._nav_profile_signature(traversal_profile, max_height_delta_m),
+        )
+
+    def _get_cached_path_result(self, cache_key):
+        now = time.perf_counter()
+        with self._path_result_cache_lock:
+            entry = self._path_result_cache.get(cache_key)
+            if entry is None:
+                return None
+            retry_after = float(entry.get('retry_after', 0.0))
+            path = tuple(entry.get('path', ()))
+            if not path and retry_after <= now:
+                self._path_result_cache.pop(cache_key, None)
+                return None
+            entry['last_used'] = now
+        return list(path)
+
+    def _store_path_result(self, cache_key, path):
+        now = time.perf_counter()
+        normalized_path = tuple((float(point[0]), float(point[1])) for point in (path or ()))
+        entry = {
+            'path': normalized_path,
+            'retry_after': 0.0 if normalized_path else now + self._path_failure_cache_ttl_sec,
+            'last_used': now,
+        }
+        with self._path_result_cache_lock:
+            self._path_result_cache[cache_key] = entry
+            overflow = len(self._path_result_cache) - self._path_result_cache_max_entries
+            if overflow > 0:
+                ordered_keys = sorted(
+                    self._path_result_cache,
+                    key=lambda key: self._path_result_cache[key].get('last_used', 0.0),
+                )
+                for old_key in ordered_keys[:overflow]:
+                    self._path_result_cache.pop(old_key, None)
 
     def _get_lpa_planner(self, goal, step, max_height_delta_m, traversal_profile=None):
         cache_key = self._planner_cache_key(goal, step, traversal_profile, max_height_delta_m)
@@ -1437,10 +1493,9 @@ class MapManager:
             if self._lpa_is_cell_passable(planner, current) and self._lpa_is_cell_passable(planner, neighbor):
                 if self._is_nav_transition_passable(current, neighbor, planner['step'], traversal_profile=planner['traversal_profile']):
                     height_delta = abs(self._lpa_cell_height(planner, neighbor) - self._lpa_cell_height(planner, current))
-                    can_climb = bool(planner['traversal_profile'].get('can_climb_steps', False))
-                    if height_delta <= planner['max_height_delta_m'] + 1e-6 or (can_climb and self._lpa_transition(planner, current, neighbor) is not None):
-                        current_world = self._nav_cell_center(current, planner['step'])
-                        neighbor_world = self._nav_cell_center(neighbor, planner['step'])
+                    current_world = self._nav_cell_center(current, planner['step'])
+                    neighbor_world = self._nav_cell_center(neighbor, planner['step'])
+                    if height_delta <= planner['max_height_delta_m'] + 1e-6 or self._segment_touches_step_surface(current_world[0], current_world[1], neighbor_world[0], neighbor_world[1]):
                         cost = math.hypot(neighbor_world[0] - current_world[0], neighbor_world[1] - current_world[1])
         cache[cache_key] = cost
         return cost
@@ -1496,6 +1551,93 @@ class MapManager:
         target_world = self._nav_cell_center(target_cell, step)
         return math.hypot(target_world[0] - cell_world[0], target_world[1] - cell_world[1])
 
+    def _astar_find_path(self, start, goal, start_point, end_point, step, max_height_delta_m=0.05, traversal_profile=None, max_iterations=None, max_runtime_sec=None):
+        traversal_profile = traversal_profile or {}
+        iteration_limit = int(max_iterations) if max_iterations is not None else 1200
+        if iteration_limit <= 0:
+            iteration_limit = 1
+        deadline = None
+        if max_runtime_sec is not None:
+            runtime = float(max_runtime_sec)
+            if runtime > 0.0:
+                deadline = time.perf_counter() + runtime
+
+        passable_cache = {}
+        height_cache = {}
+        edge_cost_cache = {}
+
+        def is_passable(cell):
+            if cell in passable_cache:
+                return passable_cache[cell]
+            passable_cache[cell] = self._is_nav_cell_passable(cell, step, traversal_profile=traversal_profile)
+            return passable_cache[cell]
+
+        def cell_height(cell):
+            if cell in height_cache:
+                return height_cache[cell]
+            world = self._nav_cell_center(cell, step)
+            height_cache[cell] = float(self.get_terrain_height_m(world[0], world[1]))
+            return height_cache[cell]
+
+        def edge_cost(current, neighbor):
+            cache_key = (current, neighbor)
+            if cache_key in edge_cost_cache:
+                return edge_cost_cache[cache_key]
+            cost = float('inf')
+            delta_x = int(neighbor[0]) - int(current[0])
+            delta_y = int(neighbor[1]) - int(current[1])
+            if abs(delta_x) <= 1 and abs(delta_y) <= 1 and (delta_x != 0 or delta_y != 0):
+                if is_passable(current) and is_passable(neighbor):
+                    if self._is_nav_transition_passable(current, neighbor, step, traversal_profile=traversal_profile):
+                        current_world = self._nav_cell_center(current, step)
+                        neighbor_world = self._nav_cell_center(neighbor, step)
+                        height_delta = abs(cell_height(neighbor) - cell_height(current))
+                        if height_delta <= float(max_height_delta_m) + 1e-6 or self._segment_touches_step_surface(current_world[0], current_world[1], neighbor_world[0], neighbor_world[1]):
+                            cost = math.hypot(neighbor_world[0] - current_world[0], neighbor_world[1] - current_world[1])
+            edge_cost_cache[cache_key] = cost
+            return cost
+
+        frontier_heap = []
+        start_h = self._nav_heuristic(start, goal, step)
+        heappush(frontier_heap, (start_h, start_h, 0.0, start))
+        came_from = {}
+        g_score = {start: 0.0}
+        closed = set()
+        iterations = 0
+
+        while frontier_heap:
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
+            iterations += 1
+            if iterations > iteration_limit:
+                break
+
+            _, heuristic, current_g, current = heappop(frontier_heap)
+            best_g = float(g_score.get(current, float('inf')))
+            if current_g > best_g + 1e-6:
+                continue
+            if current in closed:
+                continue
+            if current == goal:
+                return self._reconstruct_nav_path(came_from, current, step, start_point, end_point)
+            closed.add(current)
+
+            for neighbor in self._iter_nav_neighbors(current):
+                if neighbor in closed:
+                    continue
+                transition_cost = edge_cost(current, neighbor)
+                if math.isinf(transition_cost):
+                    continue
+                tentative_g = best_g + transition_cost
+                if tentative_g >= float(g_score.get(neighbor, float('inf'))) - 1e-6:
+                    continue
+                neighbor_h = self._nav_heuristic(neighbor, goal, step)
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g
+                heappush(frontier_heap, (tentative_g + neighbor_h, neighbor_h, tentative_g, neighbor))
+
+        return []
+
     def _expand_greedy_frontier(self, frontier_heap, parents, seen, closed, target_cell, step, max_height_delta_m, traversal_profile=None):
         traversal_profile = traversal_profile or {}
         current = None
@@ -1524,8 +1666,7 @@ class MapManager:
             neighbor_world = self._nav_cell_center(neighbor, step)
             neighbor_height = self.get_terrain_height_m(neighbor_world[0], neighbor_world[1])
             if abs(float(neighbor_height) - float(current_height)) > float(max_height_delta_m) + 1e-6:
-                transition = self.get_step_transition(current_world[0], current_world[1], neighbor_world[0], neighbor_world[1])
-                if transition is None or not traversal_profile.get('can_climb_steps', False):
+                if not self._segment_touches_step_surface(current_world[0], current_world[1], neighbor_world[0], neighbor_world[1]):
                     continue
             parents[neighbor] = current
             seen.add(neighbor)
@@ -1755,6 +1896,34 @@ class MapManager:
             'step_height_m': round(step_height_m, 3),
         }
 
+    def _is_step_terrain_type(self, terrain_type):
+        return str(terrain_type) in {'first_step', 'second_step'}
+
+    def _segment_touches_step_surface(self, from_x, from_y, to_x, to_y):
+        sample_points = (
+            (float(from_x), float(from_y)),
+            ((float(from_x) + float(to_x)) * 0.5, (float(from_y) + float(to_y)) * 0.5),
+            (float(to_x), float(to_y)),
+        )
+        for sample_x, sample_y in sample_points:
+            sample = self.sample_raster_layers(sample_x, sample_y)
+            if self._is_step_terrain_type(sample.get('terrain_type', 'flat')):
+                return True
+
+        padding = max(float(self.terrain_grid_cell_size) * 0.4, 4.0)
+        for facility_type in ('first_step', 'second_step'):
+            for facility in self.get_facility_regions(facility_type):
+                if self._segment_intersects_rect_region((from_x, from_y), (to_x, to_y), facility, padding=padding):
+                    return True
+        return False
+
+    def _segment_step_alignment_heading_deg(self, from_x, from_y, to_x, to_y):
+        delta_x = float(to_x) - float(from_x)
+        delta_y = float(to_y) - float(from_y)
+        if abs(delta_x) <= 1e-6 and abs(delta_y) <= 1e-6:
+            return None
+        return math.degrees(math.atan2(delta_y, delta_x))
+
     def _terrain_step_transition(self, from_x, from_y, to_x, to_y, max_height_delta_m=None):
         distance = math.hypot(float(to_x) - float(from_x), float(to_y) - float(from_y))
         max_step_span = max(float(self.terrain_grid_cell_size) * 3.2, 56.0)
@@ -1855,6 +2024,10 @@ class MapManager:
         sample_stride = max(1.0, self.terrain_grid_cell_size * 0.5)
         sample_count = max(1, int(math.ceil(distance / sample_stride)))
         previous_height = float(start_sample['height_m'])
+        previous_x = float(from_x)
+        previous_y = float(from_y)
+        requires_step_alignment = False
+        step_heading_deg = None
 
         for step_index in range(1, sample_count + 1):
             ratio = step_index / sample_count
@@ -1877,14 +2050,21 @@ class MapManager:
                 }
             height_delta = abs(float(sample['height_m']) - previous_height)
             if height_delta > float(max_height_delta_m) + 1e-6:
-                return {
-                    'ok': False,
-                    'reason': 'height_delta',
-                    'start_height_m': start_sample['height_m'],
-                    'end_height_m': sample['height_m'],
-                    'height_delta_m': round(height_delta, 3),
-                }
+                if self._segment_touches_step_surface(previous_x, previous_y, sample_x, sample_y):
+                    requires_step_alignment = True
+                    if step_heading_deg is None:
+                        step_heading_deg = self._segment_step_alignment_heading_deg(previous_x, previous_y, sample_x, sample_y)
+                else:
+                    return {
+                        'ok': False,
+                        'reason': 'height_delta',
+                        'start_height_m': start_sample['height_m'],
+                        'end_height_m': sample['height_m'],
+                        'height_delta_m': round(height_delta, 3),
+                    }
             previous_height = float(sample['height_m'])
+            previous_x = sample_x
+            previous_y = sample_y
 
         return {
             'ok': True,
@@ -1892,6 +2072,8 @@ class MapManager:
             'start_height_m': start_sample['height_m'],
             'end_height_m': end_sample['height_m'],
             'height_delta_m': round(abs(float(end_sample['height_m']) - float(start_sample['height_m'])), 3),
+            'requires_step_alignment': requires_step_alignment,
+            'step_heading_deg': step_heading_deg,
         }
     
     def is_position_valid(self, x, y):
