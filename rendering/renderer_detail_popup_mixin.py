@@ -338,6 +338,7 @@ class RendererDetailPopupMixin:
             'spin': '小陀螺',
             'fast_spin': '高速小陀螺',
             'follow_turret': '跟随云台',
+            'power_off': '断电部署',
         }
         return labels.get(state, state)
 

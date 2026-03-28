@@ -76,8 +76,9 @@ class PhysicsEngine:
         """检查碰撞"""
         if not getattr(entity, 'collidable', True):
             return
+        step_climb_active = bool(getattr(entity, 'step_climb_state', None))
         # 检查与地图的碰撞
-        if not map_manager.is_position_valid_for_radius(
+        if not step_climb_active and not map_manager.is_position_valid_for_radius(
             entity.position['x'],
             entity.position['y'],
             collision_radius=float(getattr(entity, 'collision_radius', 0.0)),
@@ -310,9 +311,7 @@ class PhysicsEngine:
         entity.velocity['vz'] = 0.0
 
     def _resolved_step_climb_duration(self, entity):
-        if getattr(entity, 'robot_type', '') == '步兵':
-            return float(getattr(entity, 'step_climb_duration_sec', self.infantry_step_climb_duration_sec))
-        return float(getattr(entity, 'step_climb_duration_sec', self.default_step_climb_duration_sec))
+        return float(getattr(entity, 'step_climb_duration_sec', self.infantry_step_climb_duration_sec))
 
     def _normalize_angle_diff(self, angle_diff):
         while angle_diff > 180.0:
@@ -329,6 +328,41 @@ class PhysicsEngine:
         if abs(heading_dx) <= 1e-6 and abs(heading_dy) <= 1e-6:
             return float(fallback_angle)
         return math.degrees(math.atan2(heading_dy, heading_dx))
+
+    def _step_rear_contact_ratio(self, entity, start_point, end_point):
+        if start_point is None or end_point is None:
+            return 0.62
+        distance = math.hypot(float(end_point[0]) - float(start_point[0]), float(end_point[1]) - float(start_point[1]))
+        if distance <= 1e-6:
+            return 0.62
+        collision_radius = float(getattr(entity, 'collision_radius', 16.0))
+        ratio = 0.45 + min(0.22, collision_radius / distance)
+        return max(0.52, min(0.68, ratio))
+
+    def _lerp_point(self, start_point, end_point, ratio):
+        return (
+            float(start_point[0]) + (float(end_point[0]) - float(start_point[0])) * float(ratio),
+            float(start_point[1]) + (float(end_point[1]) - float(start_point[1])) * float(ratio),
+        )
+
+    def _configure_step_segment(self, entity, state, map_manager):
+        segment_start = state.get('start_point') or state.get('approach_point')
+        end_point = state.get('end_point') or state.get('top_point')
+        if segment_start is None or end_point is None:
+            return
+        segment_start = (float(segment_start[0]), float(segment_start[1]))
+        end_point = (float(end_point[0]), float(end_point[1]))
+        rear_contact_ratio = self._step_rear_contact_ratio(entity, segment_start, end_point)
+        rear_contact_point = self._lerp_point(segment_start, end_point, rear_contact_ratio)
+        total_duration = max(float(state.get('total_duration', self._resolved_step_climb_duration(entity))), 0.8)
+        state['segment_start_point'] = segment_start
+        state['segment_start_height'] = map_manager.get_terrain_height_m(segment_start[0], segment_start[1])
+        state['rear_contact_ratio'] = rear_contact_ratio
+        state['rear_contact_point'] = rear_contact_point
+        state['rear_contact_height'] = map_manager.get_terrain_height_m(rear_contact_point[0], rear_contact_point[1])
+        state['front_ascent_duration'] = max(0.2, total_duration * 0.42)
+        state['rear_pause_duration'] = 0.5
+        state['rear_ascent_duration'] = max(0.18, total_duration * 0.28)
 
     def _try_lateral_step_probe(self, entity, state, map_manager, candidate_x, candidate_y):
         if not map_manager.is_position_valid_for_radius(
@@ -369,6 +403,7 @@ class PhysicsEngine:
                 end_point,
                 state.get('desired_heading_deg', getattr(entity, 'angle', 0.0)),
             )
+        self._configure_step_segment(entity, state, map_manager)
         state['align_last_abs_diff'] = None
         state['align_stuck_time'] = 0.0
         state['align_probe_index'] = 0
@@ -411,6 +446,7 @@ class PhysicsEngine:
                 state['segment_index'] = 0
                 state['end_point'] = climb_points[0]
                 state['desired_heading_deg'] = self._step_heading_deg(state['start_point'], state['end_point'], getattr(entity, 'angle', 0.0))
+                self._configure_step_segment(entity, state, map_manager)
                 state['align_probe_index'] = 0
                 state['align_stuck_time'] = 0.0
                 state['align_last_abs_diff'] = None
@@ -420,23 +456,24 @@ class PhysicsEngine:
     def _begin_step_climb(self, entity, transition, map_manager, dt):
         state = getattr(entity, 'step_climb_state', None)
         if state is None or state.get('facility_id') != transition.get('facility_id'):
-            start_point = (float(entity.previous_position['x']), float(entity.previous_position['y']))
+            approach_point = transition.get('approach_point')
+            if approach_point is None:
+                start_point = (float(entity.previous_position['x']), float(entity.previous_position['y']))
+            else:
+                start_point = (float(approach_point[0]), float(approach_point[1]))
             segment_points = tuple(
                 (float(point[0]), float(point[1])) for point in transition.get('climb_points', ())
             ) or ((float(transition.get('top_point')[0]), float(transition.get('top_point')[1])),)
             end_point = segment_points[0]
             desired_heading_deg = self._step_heading_deg(start_point, end_point, getattr(entity, 'angle', 0.0))
-            requires_alignment = getattr(entity, 'robot_type', '') != '步兵'
             total_duration = float(getattr(entity, 'step_climb_duration_sec', self._resolved_step_climb_duration(entity)))
-            segment_duration = max(0.18, total_duration / max(1, len(segment_points)))
             entity.step_climb_state = {
                 'facility_id': transition.get('facility_id'),
                 'facility_type': transition.get('facility_type'),
                 'progress': 0.0,
-                'duration': segment_duration,
                 'total_duration': total_duration,
                 'step_limit_m': float(getattr(entity, 'max_terrain_step_height_m', self.default_max_terrain_step_height_m)),
-                'phase': 'align' if requires_alignment else 'climb',
+                'phase': 'front_ascent',
                 'start_point': start_point,
                 'approach_point': transition.get('approach_point'),
                 'top_point': transition.get('top_point'),
@@ -454,13 +491,14 @@ class PhysicsEngine:
                 'climb_stuck_time': 0.0,
                 'climb_last_progress': 0.0,
             }
+            self._configure_step_segment(entity, entity.step_climb_state, map_manager)
         self._update_step_climb(entity, map_manager, dt)
 
     def _update_step_climb(self, entity, map_manager, dt):
         state = getattr(entity, 'step_climb_state', None)
         if not state:
             return False
-        start_point = state.get('start_point') or state.get('approach_point')
+        start_point = state.get('segment_start_point') or state.get('start_point') or state.get('approach_point')
         end_point = state.get('end_point') or state.get('top_point')
         entity.velocity['vx'] = 0.0
         entity.velocity['vy'] = 0.0
@@ -516,38 +554,75 @@ class PhysicsEngine:
                 entity.turret_angle = entity.angle
                 entity.position['x'] = start_point[0]
                 entity.position['y'] = start_point[1]
-                entity.position['z'] = float(state.get('start_height', map_manager.get_terrain_height_m(start_point[0], start_point[1])))
+                entity.position['z'] = float(state.get('segment_start_height', state.get('start_height', map_manager.get_terrain_height_m(start_point[0], start_point[1]))))
                 entity.last_valid_position = dict(entity.position)
                 entity.previous_position = dict(entity.position)
                 return True
-            state['phase'] = 'climb'
+            state['phase'] = 'front_ascent'
             state['progress'] = 0.0
             state['start_point'] = (float(entity.position['x']), float(entity.position['y']))
             state['start_height'] = map_manager.get_terrain_height_m(entity.position['x'], entity.position['y'])
+            self._configure_step_segment(entity, state, map_manager)
             state['align_stuck_time'] = 0.0
             state['align_last_abs_diff'] = None
             state['align_probe_index'] = 0
 
+        phase = state.get('phase', 'front_ascent')
+        desired_heading = float(state.get('desired_heading_deg', getattr(entity, 'angle', 0.0)))
+        if phase == 'rear_pause':
+            hold_point = state.get('rear_contact_point') or end_point or start_point
+            hold_height = float(state.get('rear_contact_height', map_manager.get_terrain_height_m(hold_point[0], hold_point[1])))
+            entity.position['x'] = hold_point[0]
+            entity.position['y'] = hold_point[1]
+            entity.position['z'] = hold_height
+            entity.angle = desired_heading % 360.0
+            entity.turret_angle = entity.angle
+            entity.last_valid_position = dict(entity.position)
+            entity.previous_position = dict(entity.position)
+            state['progress'] = float(state.get('progress', 0.0)) + float(dt)
+            if state['progress'] < float(state.get('rear_pause_duration', 0.5)):
+                return True
+            state['phase'] = 'rear_ascent'
+            state['progress'] = 0.0
+            state['climb_last_progress'] = 0.0
+            state['climb_stuck_time'] = 0.0
+            return True
+
+        motion_start = state.get('segment_start_point', start_point)
+        motion_end = end_point
+        motion_start_height = float(state.get('segment_start_height', state.get('start_height', map_manager.get_terrain_height_m(motion_start[0], motion_start[1]))))
+        motion_end_height = float(state.get('end_height', map_manager.get_terrain_height_m(motion_end[0], motion_end[1]))) if motion_end is not None else motion_start_height
+        duration = float(state.get('front_ascent_duration', self.default_step_climb_duration_sec))
+        if phase == 'front_ascent':
+            motion_end = state.get('rear_contact_point') or end_point
+            motion_end_height = float(state.get('rear_contact_height', motion_end_height))
+            duration = float(state.get('front_ascent_duration', self.default_step_climb_duration_sec))
+        elif phase == 'rear_ascent':
+            motion_start = state.get('rear_contact_point') or motion_start
+            motion_start_height = float(state.get('rear_contact_height', motion_start_height))
+            duration = float(state.get('rear_ascent_duration', self.default_step_climb_duration_sec))
+
         state['progress'] = float(state.get('progress', 0.0)) + float(dt)
-        duration = max(float(state.get('duration', self.default_step_climb_duration_sec)), 1e-6)
+        duration = max(duration, 1e-6)
         ratio = max(0.0, min(1.0, state['progress'] / duration))
-        smooth_ratio = ratio * ratio * (3.0 - 2.0 * ratio)
-        next_x = start_point[0] + (end_point[0] - start_point[0]) * smooth_ratio
-        next_y = start_point[1] + (end_point[1] - start_point[1]) * smooth_ratio
+        motion_ratio = ratio * ratio if phase == 'front_ascent' else (ratio * ratio * (3.0 - 2.0 * ratio))
+        next_x = motion_start[0] + (motion_end[0] - motion_start[0]) * motion_ratio
+        next_y = motion_start[1] + (motion_end[1] - motion_start[1]) * motion_ratio
         if not map_manager.is_position_valid_for_radius(next_x, next_y, collision_radius=float(getattr(entity, 'collision_radius', 0.0))):
             state['climb_stuck_time'] = float(state.get('climb_stuck_time', 0.0)) + float(dt)
             if state['climb_stuck_time'] >= 0.25 and self._reseek_step_entry(entity, state, map_manager):
-                state['phase'] = 'align' if getattr(entity, 'robot_type', '') != '步兵' else 'climb'
+                state['phase'] = 'front_ascent'
                 state['progress'] = 0.0
                 state['start_point'] = (float(entity.position['x']), float(entity.position['y']))
                 state['start_height'] = map_manager.get_terrain_height_m(entity.position['x'], entity.position['y'])
                 state['end_height'] = map_manager.get_terrain_height_m(state['end_point'][0], state['end_point'][1])
+                self._configure_step_segment(entity, state, map_manager)
                 state['climb_stuck_time'] = 0.0
                 state['climb_last_progress'] = 0.0
                 return True
             entity.position['x'] = start_point[0]
             entity.position['y'] = start_point[1]
-            entity.position['z'] = float(state.get('start_height', map_manager.get_terrain_height_m(start_point[0], start_point[1])))
+            entity.position['z'] = float(state.get('segment_start_height', state.get('start_height', map_manager.get_terrain_height_m(start_point[0], start_point[1]))))
             entity.last_valid_position = dict(entity.position)
             entity.previous_position = dict(entity.position)
             return True
@@ -559,11 +634,24 @@ class PhysicsEngine:
         state['climb_last_progress'] = ratio
         entity.position['x'] = next_x
         entity.position['y'] = next_y
-        entity.position['z'] = float(state.get('start_height', 0.0)) + (float(state.get('end_height', 0.0)) - float(state.get('start_height', 0.0))) * smooth_ratio
+        entity.position['z'] = motion_start_height + (motion_end_height - motion_start_height) * motion_ratio
         entity.angle = desired_heading % 360.0
         entity.turret_angle = entity.angle
         entity.last_valid_position = dict(entity.position)
         if ratio < 1.0:
+            return True
+
+        if phase == 'front_ascent':
+            contact_point = state.get('rear_contact_point') or motion_end
+            entity.position['x'] = contact_point[0]
+            entity.position['y'] = contact_point[1]
+            entity.position['z'] = float(state.get('rear_contact_height', motion_end_height))
+            entity.previous_position = dict(entity.position)
+            entity.last_valid_position = dict(entity.position)
+            state['phase'] = 'rear_pause'
+            state['progress'] = 0.0
+            state['climb_last_progress'] = 0.0
+            state['climb_stuck_time'] = 0.0
             return True
 
         segment_points = tuple(state.get('segment_points', ()))
@@ -578,6 +666,8 @@ class PhysicsEngine:
             state['end_point'] = next_end
             state['end_height'] = map_manager.get_terrain_height_m(next_end[0], next_end[1])
             state['desired_heading_deg'] = self._step_heading_deg(state['start_point'], next_end, desired_heading)
+            self._configure_step_segment(entity, state, map_manager)
+            state['phase'] = 'front_ascent'
             state['climb_last_progress'] = 0.0
             state['climb_stuck_time'] = 0.0
             entity.position['x'] = end_point[0]

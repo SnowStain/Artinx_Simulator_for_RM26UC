@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "name": "latest_behavior",
+  "saved_at": "2026-03-28T22:30:56",
+  "roles": {
+    "hero": {
+      "decisions": {},
+      "decision_order": [
+        "recover_after_respawn",
+        "must_restock",
+        "force_push_base",
+        "opening_supply",
+        "hero_opening_highground",
+        "highground_assault",
+        "swarm_attack",
+        "hero_lob_outpost",
+        "hero_lob_base",
+        "terrain_fly_slope",
+        "terrain_first_step",
+        "terrain_second_step",
+        "push_base"
+      ]
+    },
+    "sentry": {
+      "decisions": {},
+      "decision_order": [
+        "return_to_supply_unlock",
+        "recover_after_respawn",
+        "emergency_retreat",
+        "sentry_opening_highground",
+        "sentry_fly_slope",
+        "swarm_attack",
+        "highground_assault",
+        "push_outpost",
+        "teamfight_cover",
+        "terrain_fly_slope",
+        "terrain_first_step",
+        "terrain_second_step"
+      ]
+    },
+    "infantry": {
+      "decisions": {
+        "patrol_key_facilities": {
+          "enabled": false
+        },
+        "emergency_retreat": {
+          "enabled": true
+        }
+      },
+      "decision_order": [
+        "recover_after_respawn",
+        "must_restock",
+        "force_push_base",
+        "emergency_retreat",
+        "opening_supply",
+        "infantry_opening_highground",
+        "swarm_attack",
+        "activate_energy",
+        "highground_assault",
+        "push_outpost",
+        "teamfight_push",
+        "push_base",
+        "terrain_fly_slope",
+        "terrain_first_step",
+        "terrain_second_step",
+        "patrol_key_facilities"
+      ]
+    },
+    "engineer": {
+      "decisions": {},
+      "decision_order": [
+        "recover_after_respawn",
+        "emergency_retreat",
+        "engineer_exchange",
+        "engineer_mine",
+        "terrain_first_step",
+        "terrain_second_step",
+        "engineer_cycle"
+      ]
+    }
+  }
+}

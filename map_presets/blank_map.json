@@ -1,7 +1,7 @@
 {
   "version": 1,
   "name": "blank_map",
-  "saved_at": "2026-03-28T11:17:06",
+  "saved_at": "2026-03-28T21:47:24",
   "map": {
     "image_path": "场地-俯视图.png",
     "origin_x": 0,
@@ -1511,6 +1511,50 @@
         "x2": 1550,
         "y2": 850,
         "height_m": 0.0
+      },
+      {
+        "id": "dead_zone",
+        "type": "dead_zone",
+        "team": "neutral",
+        "shape": "rect",
+        "x1": 765,
+        "y1": 32,
+        "x2": 803,
+        "y2": 90,
+        "height_m": 0.0
+      },
+      {
+        "id": "dead_zone_rect_1",
+        "type": "dead_zone",
+        "team": "neutral",
+        "shape": "rect",
+        "x1": 781,
+        "y1": 789,
+        "x2": 812,
+        "y2": 843,
+        "height_m": 0.0
+      },
+      {
+        "id": "dead_zone_rect_2",
+        "type": "dead_zone",
+        "team": "neutral",
+        "shape": "rect",
+        "x1": 117,
+        "y1": 228,
+        "x2": 181,
+        "y2": 295,
+        "height_m": 0.0
+      },
+      {
+        "id": "dead_zone_rect_3",
+        "type": "dead_zone",
+        "team": "neutral",
+        "shape": "rect",
+        "x1": 1401,
+        "y1": 583,
+        "x2": 1461,
+        "y2": 648,
+        "height_m": 0.0
       }
     ],
     "terrain_grid": {
@@ -1528,6 +1572,15 @@
         {
           "x": 0,
           "y": 2,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 0,
+          "y": 85,
           "type": "custom_terrain",
           "team": "neutral",
           "height_m": 2.0,
@@ -2535,6 +2588,924 @@
         },
         {
           "x": 2,
+          "y": 4,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 5,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 6,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 7,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 8,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 9,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 10,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 11,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 12,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 13,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 14,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 15,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 16,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 17,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 18,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 19,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 20,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 21,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 22,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 23,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 24,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 25,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 26,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 27,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 28,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 29,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 30,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 31,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 32,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 33,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 34,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 35,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 36,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 37,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 38,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 39,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 40,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 41,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 42,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 43,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 44,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 45,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 46,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 47,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 48,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 49,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 50,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 51,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 52,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 53,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 54,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 55,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 56,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 57,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 58,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 59,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 60,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 61,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 62,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 63,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 64,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 65,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 66,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 67,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 68,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 69,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 70,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 71,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 72,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 73,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 74,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 75,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 76,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 77,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 78,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 79,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 80,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 81,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 82,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 83,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 84,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 85,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 86,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 87,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 88,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 89,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 90,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 91,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 92,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 93,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 94,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 95,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 96,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 97,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 98,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 99,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 100,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 101,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 102,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 103,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 104,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
+          "y": 105,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 2,
           "y": 106,
           "type": "custom_terrain",
           "team": "neutral",
@@ -2552,6 +3523,15 @@
           "blocks_vision": false
         },
         {
+          "x": 2,
+          "y": 108,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
           "x": 3,
           "y": 1,
           "type": "custom_terrain",
@@ -2572,6 +3552,24 @@
         {
           "x": 3,
           "y": 3,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 3,
+          "y": 35,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 3,
+          "y": 85,
           "type": "custom_terrain",
           "team": "neutral",
           "height_m": 2.0,
@@ -2643,10 +3641,19 @@
         },
         {
           "x": 4,
+          "y": 35,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 4,
           "y": 85,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -2715,10 +3722,19 @@
         },
         {
           "x": 5,
+          "y": 35,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 5,
           "y": 85,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -2787,10 +3803,19 @@
         },
         {
           "x": 6,
+          "y": 35,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 6,
           "y": 85,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -2859,10 +3884,19 @@
         },
         {
           "x": 7,
+          "y": 35,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 7,
           "y": 85,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -2931,10 +3965,19 @@
         },
         {
           "x": 8,
+          "y": 35,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 8,
           "y": 85,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -3003,10 +4046,19 @@
         },
         {
           "x": 9,
+          "y": 35,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 9,
           "y": 85,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -3067,6 +4119,15 @@
         {
           "x": 10,
           "y": 3,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 10,
+          "y": 35,
           "type": "custom_terrain",
           "team": "neutral",
           "height_m": 2.0,
@@ -3130,6 +4191,15 @@
         {
           "x": 11,
           "y": 3,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 11,
+          "y": 35,
           "type": "custom_terrain",
           "team": "neutral",
           "height_m": 2.0,
@@ -3193,6 +4263,15 @@
         {
           "x": 12,
           "y": 3,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 12,
+          "y": 35,
           "type": "custom_terrain",
           "team": "neutral",
           "height_m": 2.0,
@@ -3256,6 +4335,15 @@
         {
           "x": 13,
           "y": 3,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 13,
+          "y": 35,
           "type": "custom_terrain",
           "team": "neutral",
           "height_m": 2.0,
@@ -5892,6 +6980,240 @@
         },
         {
           "x": 27,
+          "y": 79,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 80,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 81,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 82,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 83,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 84,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 85,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 86,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 87,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 88,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 89,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 90,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 91,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 92,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 93,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 94,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 95,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 96,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 97,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 98,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 99,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 100,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 101,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 102,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 103,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
+          "y": 104,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 27,
           "y": 105,
           "type": "custom_terrain",
           "team": "neutral",
@@ -6219,7 +7541,7 @@
           "y": 79,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6228,7 +7550,7 @@
           "y": 80,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6237,7 +7559,7 @@
           "y": 81,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6246,7 +7568,7 @@
           "y": 82,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6255,7 +7577,7 @@
           "y": 83,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6264,7 +7586,7 @@
           "y": 84,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6273,7 +7595,7 @@
           "y": 85,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6282,7 +7604,7 @@
           "y": 86,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6291,7 +7613,7 @@
           "y": 87,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6300,7 +7622,7 @@
           "y": 88,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6309,7 +7631,7 @@
           "y": 89,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6318,7 +7640,7 @@
           "y": 90,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6327,7 +7649,7 @@
           "y": 91,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6336,7 +7658,7 @@
           "y": 92,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6345,7 +7667,7 @@
           "y": 93,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6354,7 +7676,7 @@
           "y": 94,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6363,7 +7685,7 @@
           "y": 95,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6372,7 +7694,7 @@
           "y": 96,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6381,7 +7703,7 @@
           "y": 97,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6390,7 +7712,7 @@
           "y": 98,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6399,7 +7721,7 @@
           "y": 99,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6408,7 +7730,7 @@
           "y": 100,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6417,7 +7739,7 @@
           "y": 101,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6426,7 +7748,7 @@
           "y": 102,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6435,7 +7757,7 @@
           "y": 103,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -6444,7 +7766,7 @@
           "y": 104,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -103065,6 +104387,15 @@
         },
         {
           "x": 182,
+          "y": 73,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 182,
           "y": 106,
           "type": "custom_terrain",
           "team": "neutral",
@@ -103110,6 +104441,15 @@
         },
         {
           "x": 183,
+          "y": 73,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 183,
           "y": 106,
           "type": "custom_terrain",
           "team": "neutral",
@@ -103173,6 +104513,15 @@
         },
         {
           "x": 184,
+          "y": 73,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 184,
           "y": 106,
           "type": "custom_terrain",
           "team": "neutral",
@@ -103236,6 +104585,15 @@
         },
         {
           "x": 185,
+          "y": 73,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 185,
           "y": 106,
           "type": "custom_terrain",
           "team": "neutral",
@@ -103299,6 +104657,15 @@
         },
         {
           "x": 186,
+          "y": 73,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 186,
           "y": 106,
           "type": "custom_terrain",
           "team": "neutral",
@@ -103371,6 +104738,15 @@
         },
         {
           "x": 187,
+          "y": 73,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 187,
           "y": 106,
           "type": "custom_terrain",
           "team": "neutral",
@@ -103443,6 +104819,15 @@
         },
         {
           "x": 188,
+          "y": 73,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 188,
           "y": 106,
           "type": "custom_terrain",
           "team": "neutral",
@@ -103515,6 +104900,15 @@
         },
         {
           "x": 189,
+          "y": 73,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 189,
           "y": 106,
           "type": "custom_terrain",
           "team": "neutral",
@@ -103587,6 +104981,15 @@
         },
         {
           "x": 190,
+          "y": 73,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 190,
           "y": 106,
           "type": "custom_terrain",
           "team": "neutral",
@@ -103659,6 +105062,15 @@
         },
         {
           "x": 191,
+          "y": 73,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 191,
           "y": 106,
           "type": "custom_terrain",
           "team": "neutral",
@@ -103731,6 +105143,15 @@
         },
         {
           "x": 192,
+          "y": 73,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 192,
           "y": 106,
           "type": "custom_terrain",
           "team": "neutral",
@@ -103788,7 +105209,7 @@
           "y": 16,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -103797,7 +105218,16 @@
           "y": 23,
           "type": "custom_terrain",
           "team": "neutral",
-          "height_m": 0.6,
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 193,
+          "y": 73,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
           "blocks_movement": false,
           "blocks_vision": false
         },
@@ -103857,6 +105287,33 @@
         },
         {
           "x": 194,
+          "y": 16,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 194,
+          "y": 23,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 194,
+          "y": 73,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 194,
           "y": 106,
           "type": "custom_terrain",
           "team": "neutral",
@@ -103902,6 +105359,924 @@
         },
         {
           "x": 195,
+          "y": 4,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 5,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 6,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 7,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 8,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 9,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 10,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 11,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 12,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 13,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 14,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 15,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 16,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 17,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 18,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 19,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 20,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 21,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 22,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 23,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 24,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 25,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 26,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 27,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 28,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 29,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 30,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 31,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 32,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 33,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 34,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 35,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 36,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 37,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 38,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 39,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 40,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 41,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 42,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 43,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 44,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 45,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 46,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 47,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 48,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 49,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 50,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 51,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 52,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 53,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 54,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 55,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 56,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 57,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 58,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 59,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 60,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 61,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 62,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 63,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 64,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 65,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 66,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 67,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 68,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 69,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 70,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 71,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 72,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 73,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 74,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 75,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 76,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 77,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 78,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 79,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 80,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 81,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 82,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 83,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 84,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 85,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 86,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 87,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 88,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 89,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 90,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 91,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 92,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 93,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 94,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 95,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 96,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 97,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 98,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 99,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 100,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 101,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 102,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 103,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 104,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 105,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
           "y": 106,
           "type": "custom_terrain",
           "team": "neutral",
@@ -103912,6 +106287,15 @@
         {
           "x": 195,
           "y": 107,
+          "type": "custom_terrain",
+          "team": "neutral",
+          "height_m": 2.0,
+          "blocks_movement": false,
+          "blocks_vision": false
+        },
+        {
+          "x": 195,
+          "y": 108,
           "type": "custom_terrain",
           "team": "neutral",
           "height_m": 2.0,

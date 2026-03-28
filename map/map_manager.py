@@ -1744,27 +1744,6 @@ class MapManager:
             return None
 
         climb_points = [top_point]
-        if facility.get('type') == 'second_step':
-            depth = max(abs(entry_y - top_y), margin * 1.8)
-            if direction < 0:
-                first_platform_y = int(round(entry_y - max(depth * 0.28, margin * 0.55)))
-                second_contact_y = int(round(entry_y - max(depth * 0.58, margin * 1.05)))
-            else:
-                first_platform_y = int(round(entry_y + max(depth * 0.28, margin * 0.55)))
-                second_contact_y = int(round(entry_y + max(depth * 0.58, margin * 1.05)))
-            intermediate_points = [
-                (int(round(aligned_x)), max(0, min(self.map_height - 1, first_platform_y))),
-                (int(round(aligned_x)), max(0, min(self.map_height - 1, second_contact_y))),
-                top_point,
-            ]
-            climb_points = []
-            seen_points = set()
-            for point in intermediate_points:
-                point_key = (int(point[0]), int(point[1]))
-                if point_key in seen_points:
-                    continue
-                seen_points.add(point_key)
-                climb_points.append(point)
 
         return {
             'facility_id': facility.get('id'),

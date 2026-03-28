@@ -55,6 +55,27 @@ class ConfigManager:
             return None
         return deepcopy(preset_map)
 
+    def _resolve_behavior_preset_path(self, preset_name, config_path=None):
+        if not preset_name:
+            return None
+        preset_ref = str(preset_name).strip()
+        if not preset_ref:
+            return None
+        if os.path.isabs(preset_ref):
+            return preset_ref
+        if not preset_ref.lower().endswith('.json'):
+            preset_ref = f'{preset_ref}.json'
+        return os.path.join(self._workspace_root(config_path), 'behavior_presets', preset_ref)
+
+    def load_behavior_preset(self, preset_name, config_path=None):
+        preset_path = self._resolve_behavior_preset_path(preset_name, config_path)
+        if preset_path is None or not os.path.exists(preset_path):
+            return None
+        payload = self._read_json(preset_path)
+        if not isinstance(payload, dict):
+            return None
+        return deepcopy(payload)
+
     def _apply_map_preset(self, config, config_path=None):
         preset_name = config.get('map', {}).get('preset')
         if not preset_name:
@@ -140,6 +161,9 @@ class ConfigManager:
                 'perf_sample_window': config.get('simulator', {}).get('perf_sample_window', 20000),
                 'perf_log_interval_sec': config.get('simulator', {}).get('perf_log_interval_sec', 5.0),
             },
+            'ai': {
+                'behavior_preset': config.get('ai', {}).get('behavior_preset', ''),
+            },
             'map': map_payload,
             'entities': {
                 'initial_positions': deepcopy(config.get('entities', {}).get('initial_positions', {})),
@@ -178,6 +202,18 @@ class ConfigManager:
         if directory:
             os.makedirs(directory, exist_ok=True)
         payload = self.build_map_preset_payload(config or self.config, preset_name=name)
+        with open(preset_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return preset_path
+
+    def save_behavior_preset(self, preset_name, payload, config_path=None):
+        name = str(preset_name or '').strip()
+        if not name:
+            raise ValueError('preset_name is required')
+        preset_path = self._resolve_behavior_preset_path(name, config_path)
+        directory = os.path.dirname(preset_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
         with open(preset_path, 'w', encoding='utf-8') as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         return preset_path

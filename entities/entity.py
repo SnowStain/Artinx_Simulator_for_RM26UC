@@ -153,6 +153,10 @@ class Entity:
     
     def update(self, dt):
         """更新实体状态"""
+        if getattr(self, 'robot_type', '') == '英雄' and bool(getattr(self, 'hero_deployment_active', False)):
+            self.velocity = {'vx': 0.0, 'vy': 0.0, 'vz': 0.0}
+            self.angular_velocity = 0.0
+
         # 更新位置
         if self.movable:
             self.previous_position = dict(self.position)
@@ -198,6 +202,9 @@ class Entity:
         """设置速度"""
         if not self.movable:
             self.velocity = {'vx': 0, 'vy': 0, 'vz': 0}
+            return
+        if getattr(self, 'robot_type', '') == '英雄' and bool(getattr(self, 'hero_deployment_active', False)):
+            self.velocity = {'vx': 0.0, 'vy': 0.0, 'vz': 0.0}
             return
         self.velocity = {'vx': vx, 'vy': vy, 'vz': vz}
     

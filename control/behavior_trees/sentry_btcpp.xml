@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root BTCPP_format="4" main_tree_to_execute="SentryBehaviorTree">
+  <!--
+    哨兵行为树。
+    Python controller 会读取 decision_id / decision_label / condition_ref / action_ref / fallback 这些自定义属性，
+    用它们作为实际决策顺序与面板显示来源。
+  -->
+  <BehaviorTree ID="SentryBehaviorTree">
+    <ReactiveFallback>
+      <ReactiveSequence decision_id="return_to_supply_unlock" decision_label="回补解锁" condition_ref="front_gun_locked" action_ref="return_to_supply_unlock">
+        <IsFrontGunLockedCondition self_state="{self_state}"/>
+        <SubTree ID="ReturnToSupplyUnlockTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="recover_after_respawn" decision_label="复活回补" condition_ref="recover_after_respawn" action_ref="recover_after_respawn">
+        <ShouldRecoverAfterRespawnCondition self_state="{self_state}"/>
+        <SubTree ID="RecoverAfterRespawnTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="emergency_retreat" decision_label="紧急撤退" condition_ref="critical_state" action_ref="emergency_retreat">
+        <IsCriticalStateCondition self_state="{self_state}"/>
+        <SubTree ID="EmergencyRetreatTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="sentry_opening_highground" decision_label="开局一级台阶飞坡" condition_ref="sentry_opening_highground" action_ref="sentry_opening_highground">
+        <ShouldSentryOpeningHighgroundCondition self_state="{self_state}" game_status="{game_status}" battle_context="{battle_context}"/>
+        <SubTree ID="SentryOpeningFlySlopeTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="sentry_fly_slope" decision_label="飞坡突入" condition_ref="sentry_fly_slope" action_ref="sentry_fly_slope">
+        <ShouldSentryFlySlopeCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="SentryFlySlopeTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="force_push_base" decision_label="推进基地" condition_ref="force_push_base" action_ref="push_base">
+        <ShouldForcePushBaseCondition battle_context="{battle_context}"/>
+        <SubTree ID="PushBaseTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="swarm_attack" decision_label="发现即集火" condition_ref="has_target" action_ref="swarm_attack">
+        <HasEnemyTargetCondition enemy_tracks="{enemy_tracks}"/>
+        <SubTree ID="SwarmAttackTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="protect_hero" decision_label="保护英雄" condition_ref="protect_hero" action_ref="protect_hero">
+        <ShouldProtectHeroCondition team_state="{team_state}" enemy_tracks="{enemy_tracks}"/>
+        <SubTree ID="ProtectHeroTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="highground_assault" decision_label="高地压制" condition_ref="take_enemy_highground" action_ref="highground_assault">
+        <ShouldTakeEnemyHighgroundCondition battle_context="{battle_context}"/>
+        <SubTree ID="HighgroundAssaultTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="support_infantry_push" decision_label="配合步兵推进" condition_ref="support_infantry_push" action_ref="support_infantry_push">
+        <ShouldSupportInfantryPushCondition team_state="{team_state}"/>
+        <SubTree ID="SupportInfantryPushTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="support_engineer" decision_label="护送工程" condition_ref="support_engineer" action_ref="support_engineer">
+        <ShouldSupportEngineerCondition team_state="{team_state}"/>
+        <SubTree ID="SupportEngineerTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="intercept_enemy_engineer" decision_label="拦截敌工" condition_ref="intercept_enemy_engineer" action_ref="intercept_enemy_engineer">
+        <ShouldInterceptEnemyEngineerCondition enemy_tracks="{enemy_tracks}"/>
+        <SubTree ID="InterceptEnemyEngineerTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="push_outpost" decision_label="推进前哨站" condition_ref="push_outpost" action_ref="push_outpost">
+        <ShouldPushOutpostCondition battle_context="{battle_context}"/>
+        <SubTree ID="PushOutpostTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="teamfight_cover" decision_label="团战掩护" condition_ref="teamfight_window" action_ref="teamfight_cover">
+        <HasTeamfightWindowCondition enemy_tracks="{enemy_tracks}"/>
+        <SubTree ID="TeamfightCoverTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="push_base" decision_label="推进基地" condition_ref="push_base" action_ref="push_base">
+        <ShouldPushBaseCondition battle_context="{battle_context}"/>
+        <SubTree ID="PushBaseTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="terrain_fly_slope" decision_label="飞坡" condition_ref="terrain_fly_slope" action_ref="terrain_fly_slope">
+        <ShouldTerrainFlySlopeCondition battle_context="{battle_context}"/>
+        <SubTree ID="TerrainFlySlopeTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="terrain_first_step" decision_label="翻越一级台阶" condition_ref="terrain_first_step" action_ref="terrain_first_step">
+        <ShouldTerrainFirstStepCondition battle_context="{battle_context}"/>
+        <SubTree ID="TerrainFirstStepTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="terrain_second_step" decision_label="翻越二级台阶" condition_ref="terrain_second_step" action_ref="terrain_second_step">
+        <ShouldTerrainSecondStepCondition battle_context="{battle_context}"/>
+        <SubTree ID="TerrainSecondStepTree"/>
+      </ReactiveSequence>
+      <SubTree ID="PatrolKeyFacilitiesTree" decision_id="patrol_key_facilities" decision_label="巡关键设施" action_ref="patrol_key_facilities" fallback="true"/>
+    </ReactiveFallback>
+  </BehaviorTree>
+</root>

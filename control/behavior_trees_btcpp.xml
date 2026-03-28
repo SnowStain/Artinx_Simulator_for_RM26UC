@@ -1,0 +1,716 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root BTCPP_format="4" main_tree_to_execute="BehaviorTree">
+  <!--
+    这是一份面向 ROS2 + BehaviorTree.CPP / Navi2 风格的等价行为树规格。
+    目标：把当前 Python AIController 中的兵种决策序列，整理成可直接映射到 BTCPP 的 XML 结构。
+
+    说明：
+    1. 当前 controller 运行时实际读取的兵种主逻辑，已拆分到 control/behavior_trees/*.xml。
+    2. 本文件保留为总览版聚合规格，便于统一查看公共子树与完整结构。
+
+    自定义消息建议：
+    1. /self_state -> rm_interfaces/msg/SelfState
+    2. /game_status -> rm_interfaces/msg/GameStatus
+    3. /battle_context -> rm_interfaces/msg/BattleContext
+    4. /team_state -> rm_interfaces/msg/TeamStateArray
+    5. /enemy_tracks -> rm_interfaces/msg/EnemyTrackArray
+    6. /global_costmap/costmap -> nav2_msgs/msg/Costmap
+
+    自定义节点命名约定：
+    1. Sub*ActionBTNode：订阅 ROS2 话题并刷新黑板。
+    2. Is*Condition / Should*Condition：读取黑板并做条件判断。
+    3. Compute*GoalActionBTNode：根据当前战场上下文生成 goal_pose / target_info / control_profile。
+    4. Pub*ActionBTNode：下发底盘、云台、火控或姿态命令。
+    5. send_goal：复用 Navi2 风格的共享导航子树。
+
+    黑板关键字段：
+    - {self_state}：自身血量、弹药、枪管锁定、英雄武器模式、复活/虚弱状态。
+    - {game_status}：比赛开始/暂停/结束、剩余时间。
+    - {battle_context}：己方/敌方基地、前哨站、补给区、高地、飞坡、能量机关等语义点。
+    - {team_state}：友军英雄、步兵、工程、哨兵状态。
+    - {enemy_tracks}：敌方目标列表。
+    - {current_location}：当前位姿。
+    - {goal_pose}：导航目标。
+    - {target_info}：射击/跟踪目标。
+  -->
+
+  <BehaviorTree ID="BehaviorTree">
+    <ReactiveSequence>
+      <SubSelfStateActionBTNode topic_name="/self_state" self_state="{self_state}"/>
+      <SubGameStatusActionBTNode topic_name="/game_status" game_status="{game_status}"/>
+      <SubBattleContextActionBTNode topic_name="/battle_context" battle_context="{battle_context}"/>
+      <SubTeamStateActionBTNode topic_name="/team_state" team_state="{team_state}"/>
+      <SubEnemyTrackActionBTNode topic_name="/enemy_tracks" enemy_tracks="{enemy_tracks}"/>
+      <GetCurrentLocationActionBTNode current_location="{current_location}"/>
+      <IsGameStartCondition message="{game_status}"/>
+
+      <!-- 按兵种分发到对应子树。 -->
+      <Fallback>
+        <ReactiveSequence>
+          <IsRoleCondition self_state="{self_state}" role="sentry"/>
+          <SubTree ID="SentryBehaviorTree"
+                   self_state="{self_state}"
+                   game_status="{game_status}"
+                   battle_context="{battle_context}"
+                   team_state="{team_state}"
+                   enemy_tracks="{enemy_tracks}"
+                   current_location="{current_location}"/>
+        </ReactiveSequence>
+        <ReactiveSequence>
+          <IsRoleCondition self_state="{self_state}" role="infantry"/>
+          <SubTree ID="InfantryBehaviorTree"
+                   self_state="{self_state}"
+                   game_status="{game_status}"
+                   battle_context="{battle_context}"
+                   team_state="{team_state}"
+                   enemy_tracks="{enemy_tracks}"
+                   current_location="{current_location}"/>
+        </ReactiveSequence>
+        <ReactiveSequence>
+          <IsRoleCondition self_state="{self_state}" role="hero"/>
+          <SubTree ID="HeroBehaviorTree"
+                   self_state="{self_state}"
+                   game_status="{game_status}"
+                   battle_context="{battle_context}"
+                   team_state="{team_state}"
+                   enemy_tracks="{enemy_tracks}"
+                   current_location="{current_location}"/>
+        </ReactiveSequence>
+        <ReactiveSequence>
+          <IsRoleCondition self_state="{self_state}" role="engineer"/>
+          <SubTree ID="EngineerBehaviorTree"
+                   self_state="{self_state}"
+                   game_status="{game_status}"
+                   battle_context="{battle_context}"
+                   team_state="{team_state}"
+                   enemy_tracks="{enemy_tracks}"
+                   current_location="{current_location}"/>
+        </ReactiveSequence>
+      </Fallback>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <!-- 哨兵：回补解锁/复活回补/紧急撤退/飞坡突入/保护英雄/配合推进等。 -->
+  <BehaviorTree ID="SentryBehaviorTree">
+    <ReactiveFallback>
+      <ReactiveSequence>
+        <IsFrontGunLockedCondition message="{self_state}"/>
+        <SubTree ID="ReturnToSupplyUnlockTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldRecoverAfterRespawnCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="RecoverAfterRespawnTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <IsCriticalStateCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="EmergencyRetreatTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldSentryFlySlopeCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="SentryFlySlopeTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldForcePushBaseCondition battle_context="{battle_context}"/>
+        <SubTree ID="PushBaseTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <HasEnemyTargetCondition enemy_tracks="{enemy_tracks}"/>
+        <SubTree ID="SwarmAttackTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 enemy_tracks="{enemy_tracks}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldProtectHeroCondition self_state="{self_state}" team_state="{team_state}" enemy_tracks="{enemy_tracks}"/>
+        <SubTree ID="ProtectHeroTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 team_state="{team_state}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldTakeEnemyHighgroundCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="HighgroundAssaultTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldSupportInfantryPushCondition self_state="{self_state}" team_state="{team_state}" battle_context="{battle_context}"/>
+        <SubTree ID="SupportInfantryPushTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 team_state="{team_state}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldSupportEngineerCondition self_state="{self_state}" team_state="{team_state}" battle_context="{battle_context}"/>
+        <SubTree ID="SupportEngineerTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 team_state="{team_state}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldInterceptEnemyEngineerCondition self_state="{self_state}" battle_context="{battle_context}" enemy_tracks="{enemy_tracks}"/>
+        <SubTree ID="InterceptEnemyEngineerTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 enemy_tracks="{enemy_tracks}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldPushOutpostCondition battle_context="{battle_context}" enemy_tracks="{enemy_tracks}"/>
+        <SubTree ID="PushOutpostTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <HasTeamfightWindowCondition enemy_tracks="{enemy_tracks}"/>
+        <SubTree ID="TeamfightCoverTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 enemy_tracks="{enemy_tracks}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldPushBaseCondition battle_context="{battle_context}"/>
+        <SubTree ID="PushBaseTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldCrossTerrainCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="CrossTerrainTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <SubTree ID="PatrolKeyFacilitiesTree"
+               self_state="{self_state}"
+               battle_context="{battle_context}"
+               current_location="{current_location}"/>
+    </ReactiveFallback>
+  </BehaviorTree>
+
+  <!-- 步兵：复活回补/补给/集火/能量机关/拦截敌工/抢高地/推进。 -->
+  <BehaviorTree ID="InfantryBehaviorTree">
+    <ReactiveFallback>
+      <ReactiveSequence>
+        <ShouldRecoverAfterRespawnCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="RecoverAfterRespawnTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <MustRestockBeforeCombatCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="OpeningSupplyTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldForcePushBaseCondition battle_context="{battle_context}"/>
+        <SubTree ID="PushBaseTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <IsCriticalStateCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="EmergencyRetreatTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <NeedsSupplyCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="OpeningSupplyTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <HasEnemyTargetCondition enemy_tracks="{enemy_tracks}"/>
+        <SubTree ID="SwarmAttackTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 enemy_tracks="{enemy_tracks}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldActivateEnergyCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="ActivateEnergyTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldInterceptEnemyEngineerCondition self_state="{self_state}" battle_context="{battle_context}" enemy_tracks="{enemy_tracks}"/>
+        <SubTree ID="InterceptEnemyEngineerTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 enemy_tracks="{enemy_tracks}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldTakeEnemyHighgroundCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="HighgroundAssaultTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldPushOutpostCondition battle_context="{battle_context}" enemy_tracks="{enemy_tracks}"/>
+        <SubTree ID="PushOutpostTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <HasTeamfightWindowCondition enemy_tracks="{enemy_tracks}"/>
+        <SubTree ID="TeamfightPushTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 enemy_tracks="{enemy_tracks}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldPushBaseCondition battle_context="{battle_context}"/>
+        <SubTree ID="PushBaseTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldCrossTerrainCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="CrossTerrainTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <SubTree ID="PatrolKeyFacilitiesTree"
+               self_state="{self_state}"
+               battle_context="{battle_context}"
+               current_location="{current_location}"/>
+    </ReactiveFallback>
+  </BehaviorTree>
+
+  <!-- 英雄：复活回补/补给/找掩护/开局高地/抢高地/吊射前哨站/吊射基地。 -->
+  <BehaviorTree ID="HeroBehaviorTree">
+    <ReactiveFallback>
+      <ReactiveSequence>
+        <ShouldRecoverAfterRespawnCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="RecoverAfterRespawnTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <MustRestockBeforeCombatCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="OpeningSupplyTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldForcePushBaseCondition battle_context="{battle_context}"/>
+        <SubTree ID="PushBaseTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <NeedsSupplyCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="OpeningSupplyTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldHeroSeekCoverCondition self_state="{self_state}" battle_context="{battle_context}" enemy_tracks="{enemy_tracks}"/>
+        <SubTree ID="HeroSeekCoverTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldHeroOpeningHighgroundCondition self_state="{self_state}" game_status="{game_status}"/>
+        <SubTree ID="HeroOpeningHighgroundTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 enemy_tracks="{enemy_tracks}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldTakeEnemyHighgroundCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="HighgroundAssaultTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <HasEnemyTargetCondition enemy_tracks="{enemy_tracks}"/>
+        <SubTree ID="SwarmAttackTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 enemy_tracks="{enemy_tracks}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldActivateEnergyCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="ActivateEnergyTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldHeroLobOutpostCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="HeroLobOutpostTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldHeroLobBaseCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="HeroLobBaseTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldCrossTerrainCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="CrossTerrainTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <ShouldPushBaseCondition battle_context="{battle_context}"/>
+        <SubTree ID="PushBaseTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <SubTree ID="PatrolKeyFacilitiesTree"
+               self_state="{self_state}"
+               battle_context="{battle_context}"
+               current_location="{current_location}"/>
+    </ReactiveFallback>
+  </BehaviorTree>
+
+  <!-- 工程：回补/紧急撤退/兑矿/采矿/取矿兑矿循环。 -->
+  <BehaviorTree ID="EngineerBehaviorTree">
+    <ReactiveFallback>
+      <ReactiveSequence>
+        <ShouldRecoverAfterRespawnCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="RecoverAfterRespawnTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <IsCriticalStateCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="EmergencyRetreatTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <NeedsEngineerExchangeCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="EngineerExchangeTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <NeedsEngineerMiningCondition self_state="{self_state}" battle_context="{battle_context}"/>
+        <SubTree ID="EngineerMineTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <SubTree ID="EngineerCycleTree"
+               self_state="{self_state}"
+               battle_context="{battle_context}"
+               current_location="{current_location}"/>
+    </ReactiveFallback>
+  </BehaviorTree>
+
+  <!-- 共享移动包装：先发布底盘控制轮廓，再进入共享 send_goal 子树。 -->
+  <BehaviorTree ID="NavigateGoalTree">
+    <ReactiveSequence>
+      <PubNavigateCommandActionBTNode spin_speed="{spin_speed}" scap_state="{scap_state}" align_chassis_big_yaw="{align_chassis_big_yaw}"/>
+      <SubTree ID="send_goal" goal_pose="{goal_pose}" current_location="{current_location}"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <!-- 共享交战包装：瞄准目标 + 下发底盘轮廓 + 导航到交战锚点。 -->
+  <BehaviorTree ID="EngageGoalTree">
+    <ReactiveSequence>
+      <PubAimCommandActionBTNode target_info="{target_info}" turret_mode="aiming" fire_mode="auto"/>
+      <PubNavigateCommandActionBTNode spin_speed="{spin_speed}" scap_state="{scap_state}" align_chassis_big_yaw="{align_chassis_big_yaw}"/>
+      <SubTree ID="send_goal" goal_pose="{goal_pose}" current_location="{current_location}"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <!-- 共享基础动作树。 -->
+  <BehaviorTree ID="ReturnToSupplyUnlockTree">
+    <ReactiveSequence>
+      <ComputeReturnToSupplyUnlockGoalActionBTNode battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}"/>
+      <SubTree ID="NavigateGoalTree" goal_pose="{goal_pose}" current_location="{current_location}" spin_speed="0.0" scap_state="mobile" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="RecoverAfterRespawnTree">
+    <ReactiveSequence>
+      <ComputeRecoverAfterRespawnGoalActionBTNode battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}"/>
+      <SubTree ID="NavigateGoalTree" goal_pose="{goal_pose}" current_location="{current_location}" spin_speed="0.0" scap_state="mobile" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="EmergencyRetreatTree">
+    <ReactiveSequence>
+      <ComputeEmergencyRetreatGoalActionBTNode battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}"/>
+      <SubTree ID="NavigateGoalTree" goal_pose="{goal_pose}" current_location="{current_location}" spin_speed="0.0" scap_state="defense" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="OpeningSupplyTree">
+    <ReactiveSequence>
+      <ComputeOpeningSupplyGoalActionBTNode self_state="{self_state}" battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}"/>
+      <SubTree ID="NavigateGoalTree" goal_pose="{goal_pose}" current_location="{current_location}" spin_speed="0.0" scap_state="mobile" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <!-- 哨兵飞坡：先到飞坡起始增益点，再满功率冲过死区进入敌侧。 -->
+  <BehaviorTree ID="SentryFlySlopeTree">
+    <ReactiveSequence>
+      <ComputeSentryFlySlopeStartGoalActionBTNode battle_context="{battle_context}" current_location="{current_location}" start_goal_pose="{start_goal_pose}"/>
+      <SubTree ID="NavigateGoalTree" goal_pose="{start_goal_pose}" current_location="{current_location}" spin_speed="0.0" scap_state="attack" align_chassis_big_yaw="1"/>
+      <ComputeSentryFlySlopeLandingGoalActionBTNode battle_context="{battle_context}" current_location="{current_location}" landing_goal_pose="{landing_goal_pose}"/>
+      <PubNavigateCommandActionBTNode spin_speed="0.0" scap_state="attack" align_chassis_big_yaw="1" max_power_ratio="1.0"/>
+      <SubTree ID="send_goal" goal_pose="{landing_goal_pose}" current_location="{current_location}"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="SwarmAttackTree">
+    <ReactiveSequence>
+      <ComputeSwarmAttackGoalActionBTNode self_state="{self_state}" battle_context="{battle_context}" enemy_tracks="{enemy_tracks}" current_location="{current_location}" goal_pose="{goal_pose}" target_info="{target_info}"/>
+      <SubTree ID="EngageGoalTree" goal_pose="{goal_pose}" target_info="{target_info}" current_location="{current_location}" spin_speed="0.8" scap_state="attack" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="ProtectHeroTree">
+    <ReactiveSequence>
+      <ComputeProtectHeroGoalActionBTNode battle_context="{battle_context}" team_state="{team_state}" current_location="{current_location}" goal_pose="{goal_pose}" target_info="{target_info}"/>
+      <SubTree ID="EngageGoalTree" goal_pose="{goal_pose}" target_info="{target_info}" current_location="{current_location}" spin_speed="0.6" scap_state="attack" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="HighgroundAssaultTree">
+    <ReactiveSequence>
+      <ComputeHighgroundAssaultGoalActionBTNode self_state="{self_state}" battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}" target_info="{target_info}"/>
+      <SubTree ID="EngageGoalTree" goal_pose="{goal_pose}" target_info="{target_info}" current_location="{current_location}" spin_speed="0.4" scap_state="attack" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="SupportInfantryPushTree">
+    <ReactiveSequence>
+      <ComputeSupportInfantryPushGoalActionBTNode team_state="{team_state}" battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}"/>
+      <SubTree ID="NavigateGoalTree" goal_pose="{goal_pose}" current_location="{current_location}" spin_speed="0.4" scap_state="attack" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="SupportEngineerTree">
+    <ReactiveSequence>
+      <ComputeSupportEngineerGoalActionBTNode team_state="{team_state}" battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}"/>
+      <SubTree ID="NavigateGoalTree" goal_pose="{goal_pose}" current_location="{current_location}" spin_speed="0.3" scap_state="attack" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="InterceptEnemyEngineerTree">
+    <ReactiveSequence>
+      <ComputeInterceptEnemyEngineerGoalActionBTNode battle_context="{battle_context}" enemy_tracks="{enemy_tracks}" current_location="{current_location}" goal_pose="{goal_pose}" target_info="{target_info}"/>
+      <SubTree ID="EngageGoalTree" goal_pose="{goal_pose}" target_info="{target_info}" current_location="{current_location}" spin_speed="0.5" scap_state="attack" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="PushOutpostTree">
+    <ReactiveSequence>
+      <ComputePushOutpostGoalActionBTNode battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}" target_info="{target_info}"/>
+      <SubTree ID="EngageGoalTree" goal_pose="{goal_pose}" target_info="{target_info}" current_location="{current_location}" spin_speed="0.5" scap_state="attack" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="TeamfightCoverTree">
+    <ReactiveSequence>
+      <ComputeTeamfightCoverGoalActionBTNode battle_context="{battle_context}" enemy_tracks="{enemy_tracks}" current_location="{current_location}" goal_pose="{goal_pose}" target_info="{target_info}"/>
+      <SubTree ID="EngageGoalTree" goal_pose="{goal_pose}" target_info="{target_info}" current_location="{current_location}" spin_speed="0.7" scap_state="attack" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="TeamfightPushTree">
+    <ReactiveSequence>
+      <ComputeTeamfightPushGoalActionBTNode battle_context="{battle_context}" enemy_tracks="{enemy_tracks}" current_location="{current_location}" goal_pose="{goal_pose}" target_info="{target_info}"/>
+      <SubTree ID="EngageGoalTree" goal_pose="{goal_pose}" target_info="{target_info}" current_location="{current_location}" spin_speed="0.6" scap_state="attack" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="PushBaseTree">
+    <ReactiveSequence>
+      <ComputePushBaseGoalActionBTNode battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}" target_info="{target_info}"/>
+      <SubTree ID="EngageGoalTree" goal_pose="{goal_pose}" target_info="{target_info}" current_location="{current_location}" spin_speed="0.4" scap_state="attack" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="CrossTerrainTree">
+    <ReactiveSequence>
+      <ComputeCrossTerrainGoalActionBTNode self_state="{self_state}" battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}"/>
+      <SubTree ID="NavigateGoalTree" goal_pose="{goal_pose}" current_location="{current_location}" spin_speed="0.0" scap_state="mobile" align_chassis_big_yaw="1"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="PatrolKeyFacilitiesTree">
+    <ReactiveSequence>
+      <ComputePatrolKeyFacilitiesGoalActionBTNode battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}"/>
+      <SubTree ID="NavigateGoalTree" goal_pose="{goal_pose}" current_location="{current_location}" spin_speed="0.2" scap_state="mobile" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="ActivateEnergyTree">
+    <ReactiveSequence>
+      <ComputeActivateEnergyGoalActionBTNode battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}"/>
+      <SubTree ID="NavigateGoalTree" goal_pose="{goal_pose}" current_location="{current_location}" spin_speed="0.2" scap_state="mobile" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="HeroSeekCoverTree">
+    <ReactiveSequence>
+      <ComputeHeroSeekCoverGoalActionBTNode battle_context="{battle_context}" enemy_tracks="{enemy_tracks}" current_location="{current_location}" goal_pose="{goal_pose}"/>
+      <SubTree ID="NavigateGoalTree" goal_pose="{goal_pose}" current_location="{current_location}" spin_speed="0.0" scap_state="defense" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <!-- 英雄开局高地：在 BT 层显式分出近战优先 / 远程优先。 -->
+  <BehaviorTree ID="HeroOpeningHighgroundTree">
+    <ReactiveFallback>
+      <ReactiveSequence>
+        <IsHeroMeleePriorityCondition message="{self_state}"/>
+        <SubTree ID="HeroMeleeHighgroundTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+      <ReactiveSequence>
+        <IsHeroRangedPriorityCondition message="{self_state}"/>
+        <SubTree ID="HeroRangedHighgroundTree"
+                 self_state="{self_state}"
+                 battle_context="{battle_context}"
+                 enemy_tracks="{enemy_tracks}"
+                 current_location="{current_location}"/>
+      </ReactiveSequence>
+    </ReactiveFallback>
+  </BehaviorTree>
+
+  <BehaviorTree ID="HeroMeleeHighgroundTree">
+    <ReactiveSequence>
+      <ComputeHeroMeleeHighgroundGoalActionBTNode battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}" target_info="{target_info}"/>
+      <SubTree ID="EngageGoalTree" goal_pose="{goal_pose}" target_info="{target_info}" current_location="{current_location}" spin_speed="0.3" scap_state="attack" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <!-- 远程英雄：先上梯形高地增益区，普通移动命中率按步兵 70%，部署模式再切 80%-30% 专用曲线。 -->
+  <BehaviorTree ID="HeroRangedHighgroundTree">
+    <ReactiveSequence>
+      <ComputeHeroRangedHighgroundGoalActionBTNode battle_context="{battle_context}" enemy_tracks="{enemy_tracks}" current_location="{current_location}" goal_pose="{goal_pose}" target_info="{target_info}"/>
+      <SubTree ID="EngageGoalTree" goal_pose="{goal_pose}" target_info="{target_info}" current_location="{current_location}" spin_speed="0.0" scap_state="attack" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="HeroLobOutpostTree">
+    <ReactiveSequence>
+      <ComputeHeroLobOutpostGoalActionBTNode battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}" target_info="{target_info}"/>
+      <SubTree ID="EngageGoalTree" goal_pose="{goal_pose}" target_info="{target_info}" current_location="{current_location}" spin_speed="0.0" scap_state="attack" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="HeroLobBaseTree">
+    <ReactiveSequence>
+      <ComputeHeroLobBaseGoalActionBTNode battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}" target_info="{target_info}"/>
+      <SubTree ID="EngageGoalTree" goal_pose="{goal_pose}" target_info="{target_info}" current_location="{current_location}" spin_speed="0.0" scap_state="attack" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="EngineerMineTree">
+    <ReactiveSequence>
+      <ComputeEngineerMineGoalActionBTNode battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}"/>
+      <SubTree ID="NavigateGoalTree" goal_pose="{goal_pose}" current_location="{current_location}" spin_speed="0.0" scap_state="mobile" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="EngineerExchangeTree">
+    <ReactiveSequence>
+      <ComputeEngineerExchangeGoalActionBTNode battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}"/>
+      <SubTree ID="NavigateGoalTree" goal_pose="{goal_pose}" current_location="{current_location}" spin_speed="0.0" scap_state="mobile" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="EngineerCycleTree">
+    <ReactiveSequence>
+      <ComputeEngineerCycleGoalActionBTNode battle_context="{battle_context}" current_location="{current_location}" goal_pose="{goal_pose}"/>
+      <SubTree ID="NavigateGoalTree" goal_pose="{goal_pose}" current_location="{current_location}" spin_speed="0.0" scap_state="mobile" align_chassis_big_yaw="0"/>
+    </ReactiveSequence>
+  </BehaviorTree>
+
+  <!-- 共享导航子树：保持 Navi2 / BehaviorTree.CPP 风格，带安全方向兜底。 -->
+  <BehaviorTree ID="send_goal">
+    <ReactiveSequence>
+      <Sequence>
+        <GetCurrentLocationActionBTNode current_location="{current_location}"/>
+        <GetSafeDirectionBTNode topic_name="/global_costmap/costmap"
+                                current_location="{current_location}"
+                                safe_direction="{safe_direction}"/>
+      </Sequence>
+      <Inverter>
+        <KeepRunningUntilFailure>
+          <Inverter>
+            <Fallback>
+              <ReactiveSequence>
+                <SendGoalActionBTNode goal_pose="{goal_pose}"/>
+                <GoalReachedActionAs goal_pose="{goal_pose}" current_location="{current_location}"/>
+              </ReactiveSequence>
+              <Inverter>
+                <Sequence>
+                  <PubVelBTNode safe_direction="{safe_direction}"/>
+                  <Delay delay_msec="500">
+                    <GetCurrentLocationActionBTNode current_location="{current_location}"/>
+                  </Delay>
+                </Sequence>
+              </Inverter>
+            </Fallback>
+          </Inverter>
+        </KeepRunningUntilFailure>
+      </Inverter>
+    </ReactiveSequence>
+  </BehaviorTree>
+</root>

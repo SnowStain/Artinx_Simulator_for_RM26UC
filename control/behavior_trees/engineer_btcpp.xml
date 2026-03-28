@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root BTCPP_format="4" main_tree_to_execute="EngineerBehaviorTree">
+  <BehaviorTree ID="EngineerBehaviorTree">
+    <ReactiveFallback>
+      <ReactiveSequence decision_id="recover_after_respawn" decision_label="复活回补" condition_ref="recover_after_respawn" action_ref="recover_after_respawn">
+        <ShouldRecoverAfterRespawnCondition self_state="{self_state}"/>
+        <SubTree ID="RecoverAfterRespawnTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="emergency_retreat" decision_label="紧急撤退" condition_ref="critical_state" action_ref="emergency_retreat">
+        <IsCriticalStateCondition self_state="{self_state}"/>
+        <SubTree ID="EmergencyRetreatTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="engineer_exchange" decision_label="回家兑矿" condition_ref="engineer_exchange" action_ref="engineer_exchange">
+        <NeedsEngineerExchangeCondition battle_context="{battle_context}"/>
+        <SubTree ID="EngineerExchangeTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="engineer_mine" decision_label="前往采矿" condition_ref="engineer_mine" action_ref="engineer_mine">
+        <NeedsEngineerMiningCondition battle_context="{battle_context}"/>
+        <SubTree ID="EngineerMineTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="terrain_fly_slope" decision_label="飞坡" condition_ref="terrain_fly_slope" action_ref="terrain_fly_slope">
+        <ShouldTerrainFlySlopeCondition battle_context="{battle_context}"/>
+        <SubTree ID="TerrainFlySlopeTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="terrain_first_step" decision_label="翻越一级台阶" condition_ref="terrain_first_step" action_ref="terrain_first_step">
+        <ShouldTerrainFirstStepCondition battle_context="{battle_context}"/>
+        <SubTree ID="TerrainFirstStepTree"/>
+      </ReactiveSequence>
+      <ReactiveSequence decision_id="terrain_second_step" decision_label="翻越二级台阶" condition_ref="terrain_second_step" action_ref="terrain_second_step">
+        <ShouldTerrainSecondStepCondition battle_context="{battle_context}"/>
+        <SubTree ID="TerrainSecondStepTree"/>
+      </ReactiveSequence>
+      <SubTree ID="EngineerCycleTree" decision_id="engineer_cycle" decision_label="取矿兑矿循环" action_ref="engineer_cycle" fallback="true"/>
+    </ReactiveFallback>
+  </BehaviorTree>
+</root>

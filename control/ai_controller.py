@@ -1,15 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import ast
+import json
 import math
+import os
 import random
 import time
+import xml.etree.ElementTree as ET
+from copy import deepcopy
 
 from control.behavior_tree import Action, BehaviorContext, Condition, Selector, Sequence, SUCCESS, FAILURE
+from control.decision_plugins import load_decision_plugins
 
 
 class AIController:
     EMPTY_PATH_PREVIEW = ()
+    ROLE_BEHAVIOR_TREE_FILES = {
+        'sentry': ('sentry_btcpp.xml', 'SentryBehaviorTree'),
+        'infantry': ('infantry_btcpp.xml', 'InfantryBehaviorTree'),
+        'hero': ('hero_btcpp.xml', 'HeroBehaviorTree'),
+        'engineer': ('engineer_btcpp.xml', 'EngineerBehaviorTree'),
+    }
 
     def __init__(self, config):
         self.config = config
@@ -33,8 +45,17 @@ class AIController:
         self._last_ai_update_time = {}
         self._entity_path_state = {}
         self._sentry_fly_slope_state = {}
-        self.role_decision_specs = self._build_role_decision_specs()
-        self.role_trees = self._build_role_trees()
+        self._behavior_tree_dir = os.path.join(os.path.dirname(__file__), 'behavior_trees')
+        self._decision_plugin_catalog = load_decision_plugins()
+        self._behavior_override_payload = {}
+        self._behavior_override_path = None
+        self._behavior_override_mtime = None
+        self._settings_mtime = None
+        self._behavior_reload_check_interval = max(0.1, float(self._ai_config.get('behavior_reload_check_interval_sec', 0.25)))
+        self._last_behavior_reload_check_time = -1.0
+        self.role_decision_specs = {}
+        self.role_trees = {}
+        self._refresh_behavior_runtime_overrides(force=True)
 
     def _entity_update_phase_offset(self, entity_id):
         # 打散同帧集中重算，避免 update_interval 对齐造成周期性卡顿峰值。
@@ -49,33 +70,40 @@ class AIController:
         self._path_replans_remaining -= 1
         return True
 
-    def _decision_spec(self, decision_id, label, condition, action, fallback=False):
-        return {
+    def _decision_spec(self, decision_id, label, condition, action, fallback=False, **metadata):
+        spec = {
             'id': str(decision_id),
             'label': str(label),
             'condition': condition,
             'action': action,
             'fallback': bool(fallback),
         }
+        for key, value in metadata.items():
+            if value is not None:
+                spec[key] = value
+        return spec
 
-    def _build_role_decision_specs(self):
+    def _legacy_default_role_decision_specs(self):
         return {
             'sentry': [
                 self._decision_spec('return_to_supply_unlock', '回补解锁', lambda ctx: getattr(ctx.entity, 'front_gun_locked', False), self._action_return_to_supply_unlock),
                 self._decision_spec('recover_after_respawn', '复活回补', self._should_recover_after_respawn, self._action_recover_after_respawn),
                 self._decision_spec('emergency_retreat', '紧急撤退', self._is_critical_state, self._action_emergency_retreat),
+                self._decision_spec('sentry_opening_highground', '开局一级台阶飞坡', self._should_sentry_opening_highground, self._action_sentry_opening_highground),
                 self._decision_spec('sentry_fly_slope', '飞坡突入', self._should_sentry_fly_slope, self._action_sentry_fly_slope),
                 self._decision_spec('force_push_base', '推进基地', self._should_force_push_base, self._action_push_base),
                 self._decision_spec('swarm_attack', '发现即集火', self._has_target, self._action_swarm_attack),
                 self._decision_spec('protect_hero', '保护英雄', self._should_protect_hero, self._action_protect_hero),
-                self._decision_spec('highground_assault', '抢敌方高地', self._should_take_enemy_highground, self._action_highground_assault),
+                self._decision_spec('highground_assault', '高地压制', self._should_take_enemy_highground, self._action_highground_assault),
                 self._decision_spec('support_infantry_push', '配合步兵推进', self._should_support_infantry_push, self._action_support_infantry_push),
                 self._decision_spec('support_engineer', '护送工程', self._should_support_engineer, self._action_support_engineer),
                 self._decision_spec('intercept_enemy_engineer', '拦截敌工', self._should_intercept_enemy_engineer, self._action_intercept_enemy_engineer),
                 self._decision_spec('push_outpost', '推进前哨站', self._should_push_outpost, self._action_push_outpost),
                 self._decision_spec('teamfight_cover', '团战掩护', self._has_teamfight_window, self._action_teamfight_cover),
                 self._decision_spec('push_base', '推进基地', self._should_push_base, self._action_push_base),
-                self._decision_spec('cross_terrain', '翻越地形', self._should_cross_terrain, self._action_cross_terrain),
+                self._decision_spec('terrain_fly_slope', '飞坡', self._should_terrain_fly_slope, self._action_terrain_fly_slope, default_destination_types=('fly_slope',), terrain_mode='fly_slope'),
+                self._decision_spec('terrain_first_step', '翻越一级台阶', self._should_terrain_first_step, self._action_terrain_first_step, default_destination_types=('first_step',), terrain_mode='first_step'),
+                self._decision_spec('terrain_second_step', '翻越二级台阶', self._should_terrain_second_step, self._action_terrain_second_step, default_destination_types=('second_step',), terrain_mode='second_step'),
                 self._decision_spec('patrol_key_facilities', '巡关键设施', None, self._action_patrol_key_facilities, fallback=True),
             ],
             'infantry': [
@@ -84,14 +112,17 @@ class AIController:
                 self._decision_spec('force_push_base', '推进基地', self._should_force_push_base, self._action_push_base),
                 self._decision_spec('emergency_retreat', '紧急撤退', self._is_critical_state, self._action_emergency_retreat),
                 self._decision_spec('opening_supply', '常规补给', self._needs_supply, self._action_opening_supply),
+                self._decision_spec('infantry_opening_highground', '开局抢高地增益', self._should_infantry_opening_highground, self._action_infantry_opening_highground),
                 self._decision_spec('swarm_attack', '发现即集火', self._has_target, self._action_swarm_attack),
                 self._decision_spec('activate_energy', '激活能量机关', self._should_activate_energy, self._action_activate_energy),
                 self._decision_spec('intercept_enemy_engineer', '拦截敌工', self._should_intercept_enemy_engineer, self._action_intercept_enemy_engineer),
-                self._decision_spec('highground_assault', '抢敌方高地', self._should_take_enemy_highground, self._action_highground_assault),
+                self._decision_spec('highground_assault', '高地压制前哨', self._should_take_enemy_highground, self._action_highground_assault),
                 self._decision_spec('push_outpost', '推进前哨站', self._should_push_outpost, self._action_push_outpost),
                 self._decision_spec('teamfight_push', '团战推进', self._has_teamfight_window, self._action_teamfight_push),
                 self._decision_spec('push_base', '推进基地', self._should_push_base, self._action_push_base),
-                self._decision_spec('cross_terrain', '翻越地形', self._should_cross_terrain, self._action_cross_terrain),
+                self._decision_spec('terrain_fly_slope', '飞坡', self._should_terrain_fly_slope, self._action_terrain_fly_slope, default_destination_types=('fly_slope',), terrain_mode='fly_slope'),
+                self._decision_spec('terrain_first_step', '翻越一级台阶', self._should_terrain_first_step, self._action_terrain_first_step, default_destination_types=('first_step',), terrain_mode='first_step'),
+                self._decision_spec('terrain_second_step', '翻越二级台阶', self._should_terrain_second_step, self._action_terrain_second_step, default_destination_types=('second_step',), terrain_mode='second_step'),
                 self._decision_spec('patrol_key_facilities', '巡关键设施', None, self._action_patrol_key_facilities, fallback=True),
             ],
             'hero': [
@@ -100,13 +131,15 @@ class AIController:
                 self._decision_spec('force_push_base', '推进基地', self._should_force_push_base, self._action_push_base),
                 self._decision_spec('opening_supply', '常规补给', self._needs_supply, self._action_opening_supply),
                 self._decision_spec('hero_seek_cover', '英雄找掩护', self._should_hero_seek_cover, self._action_hero_seek_cover),
-                self._decision_spec('hero_opening_highground', '开局抢高地', self._should_hero_opening_highground, self._action_hero_opening_highground),
-                self._decision_spec('highground_assault', '抢敌方高地', self._should_take_enemy_highground, self._action_highground_assault),
+                self._decision_spec('hero_opening_highground', '开局高地部署', self._should_hero_opening_highground, self._action_hero_opening_highground),
+                self._decision_spec('highground_assault', '近战高地压制', self._should_hero_melee_highground_assault, self._action_highground_assault),
                 self._decision_spec('swarm_attack', '发现即集火', self._has_target, self._action_swarm_attack),
                 self._decision_spec('activate_energy', '激活能量机关', self._should_activate_energy, self._action_activate_energy),
                 self._decision_spec('hero_lob_outpost', '吊射前哨站', self._should_hero_lob_outpost, self._action_hero_lob_outpost),
                 self._decision_spec('hero_lob_base', '吊射基地', self._should_hero_lob_base, self._action_hero_lob_base),
-                self._decision_spec('cross_terrain', '翻越地形', self._should_cross_terrain, self._action_cross_terrain),
+                self._decision_spec('terrain_fly_slope', '飞坡', self._should_terrain_fly_slope, self._action_terrain_fly_slope, default_destination_types=('fly_slope',), terrain_mode='fly_slope'),
+                self._decision_spec('terrain_first_step', '翻越一级台阶', self._should_terrain_first_step, self._action_terrain_first_step, default_destination_types=('first_step',), terrain_mode='first_step'),
+                self._decision_spec('terrain_second_step', '翻越二级台阶', self._should_terrain_second_step, self._action_terrain_second_step, default_destination_types=('second_step',), terrain_mode='second_step'),
                 self._decision_spec('push_base', '推进基地', self._should_push_base, self._action_push_base),
                 self._decision_spec('patrol_key_facilities', '巡关键设施', None, self._action_patrol_key_facilities, fallback=True),
             ],
@@ -115,9 +148,655 @@ class AIController:
                 self._decision_spec('emergency_retreat', '紧急撤退', self._is_critical_state, self._action_emergency_retreat),
                 self._decision_spec('engineer_exchange', '回家兑矿', self._needs_engineer_exchange, self._action_engineer_exchange),
                 self._decision_spec('engineer_mine', '前往采矿', self._needs_engineer_mining, self._action_engineer_mine),
+                self._decision_spec('terrain_fly_slope', '飞坡', self._should_terrain_fly_slope, self._action_terrain_fly_slope, default_destination_types=('fly_slope',), terrain_mode='fly_slope'),
+                self._decision_spec('terrain_first_step', '翻越一级台阶', self._should_terrain_first_step, self._action_terrain_first_step, default_destination_types=('first_step',), terrain_mode='first_step'),
+                self._decision_spec('terrain_second_step', '翻越二级台阶', self._should_terrain_second_step, self._action_terrain_second_step, default_destination_types=('second_step',), terrain_mode='second_step'),
                 self._decision_spec('engineer_cycle', '取矿兑矿循环', None, self._action_engineer_cycle, fallback=True),
             ],
         }
+
+    def _available_plugin_bindings_for_role(self, role_key):
+        bindings = []
+        for plugin_id, plugin in self._decision_plugin_catalog.items():
+            role_config = plugin.get('roles', {}).get(role_key)
+            if not isinstance(role_config, dict):
+                continue
+            bindings.append({
+                'id': plugin_id,
+                'description': str(plugin.get('description', '')),
+                **role_config,
+            })
+        bindings.sort(key=lambda item: (int(item.get('order', 10_000)), str(item.get('id', ''))))
+        return bindings
+
+    def _available_plugin_binding(self, role_key, decision_id):
+        decision_id = str(decision_id)
+        for binding in self._available_plugin_bindings_for_role(role_key):
+            if str(binding.get('id', '')) == decision_id:
+                return binding
+        return None
+
+    def _normalize_behavior_point_targets(self, targets):
+        if not isinstance(targets, dict):
+            return {}
+        normalized = {}
+        for key, value in targets.items():
+            if not isinstance(key, str):
+                continue
+            if not isinstance(value, (list, tuple)) or len(value) < 2:
+                continue
+            try:
+                normalized[key] = (float(value[0]), float(value[1]))
+            except (TypeError, ValueError):
+                continue
+        return normalized
+
+    def get_available_decision_plugins(self, role_key):
+        return [dict(binding) for binding in self._available_plugin_bindings_for_role(role_key)]
+
+    def _role_decision_order_override(self, role_key, available_ids):
+        role_entry = self._behavior_override_roles().get(role_key, {})
+        order = role_entry.get('decision_order') if isinstance(role_entry, dict) else None
+        if order is None:
+            return list(available_ids)
+        if not isinstance(order, list):
+            return list(available_ids)
+        return [str(decision_id) for decision_id in order if str(decision_id) in available_ids]
+
+    def _default_role_decision_specs(self):
+        condition_registry = self._behavior_condition_registry()
+        action_registry = self._behavior_action_registry()
+        specs_by_role = {}
+        for role_key in ('sentry', 'infantry', 'hero', 'engineer'):
+            bindings = self._available_plugin_bindings_for_role(role_key)
+            if not bindings:
+                continue
+            binding_by_id = {binding['id']: binding for binding in bindings}
+            active_ids = self._role_decision_order_override(role_key, binding_by_id)
+            role_specs = []
+            for decision_id in active_ids:
+                binding = binding_by_id.get(decision_id)
+                if binding is None:
+                    continue
+                action = binding.get('action') if callable(binding.get('action')) else None
+                if action is not None:
+                    action = (lambda ctx, plugin_action=action, plugin_binding=dict(binding), plugin_role=role_key: plugin_action(self, ctx, plugin_role, plugin_binding))
+                else:
+                    action_ref = str(binding.get('action_ref', decision_id)).strip()
+                    action = action_registry.get(action_ref)
+                if action is None:
+                    continue
+                condition_ref = str(binding.get('condition_ref', '')).strip()
+                fallback = bool(binding.get('fallback', False) or not condition_ref)
+                condition = binding.get('condition') if callable(binding.get('condition')) else None
+                if condition is not None:
+                    condition = (lambda ctx, plugin_condition=condition, plugin_binding=dict(binding), plugin_role=role_key: plugin_condition(self, ctx, plugin_role, plugin_binding))
+                elif not fallback:
+                    condition = condition_registry.get(condition_ref)
+                if not fallback and condition is None:
+                    continue
+                role_specs.append(self._decision_spec(
+                    decision_id,
+                    str(binding.get('label', decision_id)),
+                    condition,
+                    action,
+                    fallback=fallback,
+                    default_destination_types=tuple(binding.get('default_destination_types', ())),
+                    terrain_mode=binding.get('terrain_mode'),
+                    description=binding.get('description', ''),
+                    editable_targets=tuple(binding.get('editable_targets', ())),
+                ))
+            if role_specs:
+                specs_by_role[role_key] = role_specs
+        return specs_by_role or self._legacy_default_role_decision_specs()
+
+    def _parse_xml_bool(self, raw_value):
+        return str(raw_value or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+
+    def _resolve_behavior_override_path(self):
+        behavior_preset = str(self.config.get('ai', {}).get('behavior_preset', '') or '').strip()
+        workspace_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if behavior_preset:
+            if os.path.isabs(behavior_preset):
+                return behavior_preset
+            preset_ref = behavior_preset if behavior_preset.lower().endswith('.json') else f'{behavior_preset}.json'
+            return os.path.join(workspace_root, 'behavior_presets', preset_ref)
+        fallback_path = os.path.join(workspace_root, 'behavior_presets', 'latest_behavior.json')
+        return fallback_path if os.path.exists(fallback_path) else None
+
+    def _load_behavior_override_payload(self):
+        override_path = self._resolve_behavior_override_path()
+        if override_path is None or not os.path.exists(override_path):
+            return {}
+        try:
+            with open(override_path, 'r', encoding='utf-8') as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError, TypeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _safe_file_mtime(self, file_path):
+        if not file_path or not os.path.exists(file_path):
+            return None
+        try:
+            return os.path.getmtime(file_path)
+        except OSError:
+            return None
+
+    def _reload_behavior_settings_if_needed(self):
+        settings_path = self.config.get('_settings_path')
+        settings_mtime = self._safe_file_mtime(settings_path)
+        if settings_mtime is None or settings_mtime == self._settings_mtime:
+            return False
+        self._settings_mtime = settings_mtime
+        try:
+            with open(settings_path, 'r', encoding='utf-8') as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError, TypeError):
+            return False
+        ai_payload = payload.get('ai', {}) if isinstance(payload, dict) else {}
+        if not isinstance(ai_payload, dict):
+            return False
+        current_preset = str(self.config.get('ai', {}).get('behavior_preset', '') or '').strip()
+        next_preset = str(ai_payload.get('behavior_preset', '') or '').strip()
+        if next_preset == current_preset:
+            return False
+        self.config.setdefault('ai', {})['behavior_preset'] = next_preset
+        return True
+
+    def _refresh_behavior_runtime_overrides(self, force=False):
+        settings_changed = self._reload_behavior_settings_if_needed()
+        override_path = self._resolve_behavior_override_path()
+        override_mtime = self._safe_file_mtime(override_path)
+        changed = bool(
+            force
+            or settings_changed
+            or override_path != self._behavior_override_path
+            or override_mtime != self._behavior_override_mtime
+        )
+        if not changed:
+            return False
+        self._behavior_override_path = override_path
+        self._behavior_override_mtime = override_mtime
+        self._behavior_override_payload = self._load_behavior_override_payload()
+        self.role_decision_specs = self._build_role_decision_specs()
+        self.role_trees = self._build_role_trees()
+        return True
+
+    def _behavior_condition_registry(self):
+        return {
+            'front_gun_locked': lambda ctx: getattr(ctx.entity, 'front_gun_locked', False),
+            'recover_after_respawn': self._should_recover_after_respawn,
+            'critical_state': self._is_critical_state,
+            'sentry_opening_highground': self._should_sentry_opening_highground,
+            'sentry_fly_slope': self._should_sentry_fly_slope,
+            'force_push_base': self._should_force_push_base,
+            'has_target': self._has_target,
+            'protect_hero': self._should_protect_hero,
+            'take_enemy_highground': self._should_take_enemy_highground,
+            'support_infantry_push': self._should_support_infantry_push,
+            'support_engineer': self._should_support_engineer,
+            'intercept_enemy_engineer': self._should_intercept_enemy_engineer,
+            'push_outpost': self._should_push_outpost,
+            'teamfight_window': self._has_teamfight_window,
+            'push_base': self._should_push_base,
+            'cross_terrain': self._should_cross_terrain,
+            'terrain_fly_slope': self._should_terrain_fly_slope,
+            'terrain_first_step': self._should_terrain_first_step,
+            'terrain_second_step': self._should_terrain_second_step,
+            'must_restock': self._must_restock_before_combat,
+            'needs_supply': self._needs_supply,
+            'infantry_opening_highground': self._should_infantry_opening_highground,
+            'activate_energy': self._should_activate_energy,
+            'hero_seek_cover': self._should_hero_seek_cover,
+            'hero_opening_highground': self._should_hero_opening_highground,
+            'hero_melee_highground_assault': self._should_hero_melee_highground_assault,
+            'hero_lob_outpost': self._should_hero_lob_outpost,
+            'hero_lob_base': self._should_hero_lob_base,
+            'engineer_exchange': self._needs_engineer_exchange,
+            'engineer_mine': self._needs_engineer_mining,
+        }
+
+    def _behavior_action_registry(self):
+        return {
+            'return_to_supply_unlock': self._action_return_to_supply_unlock,
+            'recover_after_respawn': self._action_recover_after_respawn,
+            'emergency_retreat': self._action_emergency_retreat,
+            'sentry_opening_highground': self._action_sentry_opening_highground,
+            'sentry_fly_slope': self._action_sentry_fly_slope,
+            'push_base': self._action_push_base,
+            'swarm_attack': self._action_swarm_attack,
+            'protect_hero': self._action_protect_hero,
+            'highground_assault': self._action_highground_assault,
+            'support_infantry_push': self._action_support_infantry_push,
+            'support_engineer': self._action_support_engineer,
+            'intercept_enemy_engineer': self._action_intercept_enemy_engineer,
+            'push_outpost': self._action_push_outpost,
+            'teamfight_cover': self._action_teamfight_cover,
+            'teamfight_push': self._action_teamfight_push,
+            'cross_terrain': self._action_cross_terrain,
+            'terrain_fly_slope': self._action_terrain_fly_slope,
+            'terrain_first_step': self._action_terrain_first_step,
+            'terrain_second_step': self._action_terrain_second_step,
+            'patrol_key_facilities': self._action_patrol_key_facilities,
+            'opening_supply': self._action_opening_supply,
+            'infantry_opening_highground': self._action_infantry_opening_highground,
+            'activate_energy': self._action_activate_energy,
+            'hero_seek_cover': self._action_hero_seek_cover,
+            'hero_opening_highground': self._action_hero_opening_highground,
+            'hero_lob_outpost': self._action_hero_lob_outpost,
+            'hero_lob_base': self._action_hero_lob_base,
+            'engineer_exchange': self._action_engineer_exchange,
+            'engineer_mine': self._action_engineer_mine,
+            'engineer_cycle': self._action_engineer_cycle,
+        }
+
+    def _behavior_override_roles(self):
+        roles = self._behavior_override_payload.get('roles', {})
+        return roles if isinstance(roles, dict) else {}
+
+    def _behavior_override_for_decision(self, role_key, decision_id):
+        role_entry = self._behavior_override_roles().get(role_key, {})
+        decisions = role_entry.get('decisions', {}) if isinstance(role_entry, dict) else {}
+        override = decisions.get(decision_id, {}) if isinstance(decisions, dict) else {}
+        return override if isinstance(override, dict) else {}
+
+    def _behavior_override_time_ok(self, game_time, override):
+        window = override.get('time_window', {}) if isinstance(override, dict) else {}
+        if not isinstance(window, dict):
+            return True
+        start_sec = window.get('start_sec')
+        end_sec = window.get('end_sec')
+        try:
+            if start_sec is not None and str(start_sec) != '' and float(game_time) < float(start_sec):
+                return False
+            if end_sec is not None and str(end_sec) != '' and float(game_time) > float(end_sec):
+                return False
+        except (TypeError, ValueError):
+            return True
+        return True
+
+    def _behavior_override_expression_vars(self, context):
+        entity = context.entity
+        enemy_outpost = context.data.get('enemy_outpost')
+        enemy_base = context.data.get('enemy_base')
+        return {
+            'game_time': float(context.game_time),
+            'ammo': float(getattr(entity, 'ammo', 0)),
+            'health_ratio': float(context.data.get('health_ratio', 1.0)),
+            'heat_ratio': float(context.data.get('heat_ratio', 0.0)),
+            'has_target': bool(context.data.get('target') is not None),
+            'outnumbered': bool(context.data.get('outnumbered', False)),
+            'opening_phase': bool(context.data.get('opening_phase', False)),
+            'base_assault_unlocked': bool(context.data.get('base_assault_unlocked', False)),
+            'front_gun_locked': bool(getattr(entity, 'front_gun_locked', False)),
+            'hero_ranged': bool(self._hero_prefers_ranged(entity)),
+            'hero_melee': bool(self._hero_prefers_melee(entity)),
+            'enemy_outpost_alive': bool(enemy_outpost is not None and enemy_outpost.is_alive()),
+            'enemy_base_alive': bool(enemy_base is not None and enemy_base.is_alive()),
+            'carried_minerals': float(context.data.get('carried_minerals', 0)),
+            'in_supply_zone': bool(self._is_in_facility_zone(entity, context.map_manager, 'supply')),
+            'in_deployment_zone': bool(getattr(entity, 'hero_deployment_zone_active', False)),
+        }
+
+    def _eval_behavior_expr_node(self, node, variables):
+        if isinstance(node, ast.Expression):
+            return self._eval_behavior_expr_node(node.body, variables)
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name):
+            return variables.get(node.id, False)
+        if isinstance(node, ast.BoolOp):
+            values = [bool(self._eval_behavior_expr_node(value, variables)) for value in node.values]
+            if isinstance(node.op, ast.And):
+                return all(values)
+            if isinstance(node.op, ast.Or):
+                return any(values)
+        if isinstance(node, ast.UnaryOp):
+            operand = self._eval_behavior_expr_node(node.operand, variables)
+            if isinstance(node.op, ast.Not):
+                return not bool(operand)
+            if isinstance(node.op, ast.USub):
+                return -float(operand)
+            if isinstance(node.op, ast.UAdd):
+                return float(operand)
+        if isinstance(node, ast.BinOp):
+            left = self._eval_behavior_expr_node(node.left, variables)
+            right = self._eval_behavior_expr_node(node.right, variables)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Div):
+                return left / right
+            if isinstance(node.op, ast.Mod):
+                return left % right
+        if isinstance(node, ast.Compare):
+            left = self._eval_behavior_expr_node(node.left, variables)
+            for operator_node, comparator in zip(node.ops, node.comparators):
+                right = self._eval_behavior_expr_node(comparator, variables)
+                if isinstance(operator_node, ast.Eq):
+                    ok = left == right
+                elif isinstance(operator_node, ast.NotEq):
+                    ok = left != right
+                elif isinstance(operator_node, ast.Gt):
+                    ok = left > right
+                elif isinstance(operator_node, ast.GtE):
+                    ok = left >= right
+                elif isinstance(operator_node, ast.Lt):
+                    ok = left < right
+                elif isinstance(operator_node, ast.LtE):
+                    ok = left <= right
+                elif isinstance(operator_node, ast.In):
+                    ok = left in right
+                elif isinstance(operator_node, ast.NotIn):
+                    ok = left not in right
+                else:
+                    return False
+                if not ok:
+                    return False
+                left = right
+            return True
+        raise ValueError('unsupported expression node')
+
+    def _behavior_override_expression_ok(self, context, override):
+        expression = str(override.get('condition_expr', '') or '').strip()
+        if not expression:
+            return True
+        try:
+            tree = ast.parse(expression, mode='eval')
+            return bool(self._eval_behavior_expr_node(tree, self._behavior_override_expression_vars(context)))
+        except Exception:
+            return False
+
+    def _behavior_override_team_regions(self, override, field_name, team=None):
+        if not isinstance(override, dict):
+            return []
+        regions = []
+        shared_regions = override.get(field_name, [])
+        if isinstance(shared_regions, list):
+            regions.extend(region for region in shared_regions if isinstance(region, dict))
+        if team is not None:
+            by_team = override.get(f'{field_name}_by_team', {})
+            team_regions = by_team.get(team, []) if isinstance(by_team, dict) else []
+            if isinstance(team_regions, list):
+                explicit = [region for region in team_regions if isinstance(region, dict)]
+                if explicit:
+                    return explicit
+        return regions
+
+    def _behavior_override_regions(self, override, team=None):
+        return self._behavior_override_team_regions(override, 'task_regions', team=team)
+
+    def _behavior_override_destination_regions(self, override, team=None):
+        return self._behavior_override_team_regions(override, 'destination_regions', team=team)
+
+    def _behavior_override_point_targets(self, override, team=None):
+        if not isinstance(override, dict):
+            return {}
+        merged = self._normalize_behavior_point_targets(override.get('point_targets', {}))
+        if team is None:
+            return merged
+        by_team = override.get('point_targets_by_team', {})
+        team_targets = by_team.get(team, {}) if isinstance(by_team, dict) else {}
+        merged.update(self._normalize_behavior_point_targets(team_targets))
+        return merged
+
+    def _point_in_behavior_region(self, point, region):
+        if point is None or region is None:
+            return False
+        shape = str(region.get('shape', 'rect'))
+        px = float(point[0])
+        py = float(point[1])
+        if shape == 'circle':
+            radius = max(0.0, float(region.get('radius', 0.0)))
+            cx = float(region.get('cx', region.get('x', 0.0)))
+            cy = float(region.get('cy', region.get('y', 0.0)))
+            return math.hypot(px - cx, py - cy) <= radius
+        if shape == 'polygon':
+            points = region.get('points', [])
+            if len(points) < 3:
+                return False
+            inside = False
+            previous = points[-1]
+            for current in points:
+                x1 = float(previous[0])
+                y1 = float(previous[1])
+                x2 = float(current[0])
+                y2 = float(current[1])
+                intersects = ((y1 > py) != (y2 > py)) and (px < (x2 - x1) * (py - y1) / max((y2 - y1), 1e-6) + x1)
+                if intersects:
+                    inside = not inside
+                previous = current
+            return inside
+        x1 = float(region.get('x1', 0.0))
+        y1 = float(region.get('y1', 0.0))
+        x2 = float(region.get('x2', 0.0))
+        y2 = float(region.get('y2', 0.0))
+        return min(x1, x2) <= px <= max(x1, x2) and min(y1, y2) <= py <= max(y1, y2)
+
+    def _behavior_region_center(self, region):
+        shape = str(region.get('shape', 'rect'))
+        if shape == 'circle':
+            return (float(region.get('cx', region.get('x', 0.0))), float(region.get('cy', region.get('y', 0.0))))
+        if shape == 'polygon':
+            points = region.get('points', [])
+            if not points:
+                return None
+            sum_x = sum(float(point[0]) for point in points)
+            sum_y = sum(float(point[1]) for point in points)
+            return (sum_x / len(points), sum_y / len(points))
+        return (
+            (float(region.get('x1', 0.0)) + float(region.get('x2', 0.0))) * 0.5,
+            (float(region.get('y1', 0.0)) + float(region.get('y2', 0.0))) * 0.5,
+        )
+
+    def _behavior_override_inside_entity(self, context, override):
+        point = (float(context.entity.position['x']), float(context.entity.position['y']))
+        regions = self._behavior_override_regions(override, team=context.entity.team)
+        return any(self._point_in_behavior_region(point, region) for region in regions)
+
+    def _nearest_behavior_override_center(self, context, override):
+        best_point = None
+        best_distance = None
+        for region in self._behavior_override_regions(override, team=context.entity.team):
+            center = self._behavior_region_center(region)
+            if center is None:
+                continue
+            resolved = self._resolve_navigation_target(center, context.map_manager, entity=context.entity) if context.map_manager is not None else center
+            if resolved is None:
+                continue
+            distance = self._distance_to_point(context.entity, resolved)
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_point = (float(resolved[0]), float(resolved[1]))
+        return best_point
+
+    def _behavior_override_destination_center(self, context, override):
+        best_point = None
+        best_distance = None
+        for region in self._behavior_override_destination_regions(override, team=context.entity.team):
+            center = self._behavior_region_center(region)
+            if center is None:
+                continue
+            resolved = self._resolve_navigation_target(center, context.map_manager, entity=context.entity) if context.map_manager is not None else center
+            if resolved is None:
+                continue
+            distance = self._distance_to_point(context.entity, resolved)
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_point = (float(resolved[0]), float(resolved[1]))
+        return best_point
+
+    def _behavior_region_navigation_radius(self, region, entity=None):
+        if region is None:
+            return 0.0
+        shape = str(region.get('shape', 'rect'))
+        if shape == 'circle':
+            radius = max(0.0, float(region.get('radius', 0.0)))
+        elif shape == 'polygon':
+            center = self._behavior_region_center(region)
+            if center is None:
+                radius = 0.0
+            else:
+                radius = max(
+                    (math.hypot(float(point[0]) - center[0], float(point[1]) - center[1]) for point in region.get('points', [])),
+                    default=0.0,
+                )
+        else:
+            width = abs(float(region.get('x2', 0.0)) - float(region.get('x1', 0.0)))
+            height = abs(float(region.get('y2', 0.0)) - float(region.get('y1', 0.0)))
+            radius = max(width, height) * 0.35
+        collision_radius = float(getattr(entity, 'collision_radius', 16.0)) if entity is not None else 0.0
+        return max(radius, collision_radius * 0.6)
+
+    def _behavior_destination_navigation_radius(self, override, entity=None):
+        team = getattr(entity, 'team', None) if entity is not None else None
+        radii = [self._behavior_region_navigation_radius(region, entity=entity) for region in self._behavior_override_destination_regions(override, team=team)]
+        return max(radii, default=0.0)
+
+    def _behavior_override_inside_destination(self, context, override):
+        point = (float(context.entity.position['x']), float(context.entity.position['y']))
+        return any(self._point_in_behavior_region(point, region) for region in self._behavior_override_destination_regions(override, team=context.entity.team))
+
+    def _navigate_to_behavior_override_region(self, context, spec_label, override):
+        region_target = self._nearest_behavior_override_center(context, override)
+        if region_target is None:
+            return FAILURE
+        speed = self._meters_to_world_units(1.8, context.map_manager)
+        summary = f'{spec_label}：先进入任务区域'
+        return self._set_decision(context, summary, target=context.data.get('target'), target_point=region_target, speed=speed, preferred_route={'target': region_target}, turret_state='aiming' if context.data.get('target') else 'searching')
+
+    def _apply_behavior_destination_override(self, context, spec_label, override):
+        if not self._behavior_override_destination_regions(override, team=context.entity.team):
+            return None
+        destination_target = self._behavior_override_destination_center(context, override)
+        if destination_target is None:
+            return FAILURE
+        decision = context.data.get('decision')
+        target = decision.get('target') if isinstance(decision, dict) else context.data.get('target')
+        turret_state = decision.get('turret_state', 'aiming' if target else 'searching') if isinstance(decision, dict) else ('aiming' if target else 'searching')
+        if decision is None or not self._behavior_override_inside_destination(context, override):
+            summary = f'{spec_label}：前往编辑目的地区域'
+            speed = self._meters_to_world_units(1.8, context.map_manager)
+            return self._set_decision(context, summary, target=target, target_point=destination_target, speed=speed, preferred_route={'target': destination_target}, turret_state=turret_state)
+        speed = math.hypot(*decision.get('velocity', (0.0, 0.0)))
+        if speed <= 1e-6:
+            speed = self._meters_to_world_units(1.45, context.map_manager)
+        staged_target = getattr(context.entity, 'ai_navigation_waypoint', None) or destination_target
+        velocity = self.navigate_towards(context.entity, destination_target, speed, context.map_manager)
+        velocity = self._apply_local_avoidance(context.entity, velocity, context.entities, staged_target)
+        decision['summary'] = f"{decision.get('summary', spec_label)}（编辑目的地）"
+        decision['navigation_target'] = destination_target
+        decision['movement_target'] = staged_target
+        decision['navigation_radius'] = self._behavior_destination_navigation_radius(override, entity=context.entity)
+        decision['velocity'] = velocity
+        return SUCCESS
+
+    def _wrap_behavior_override(self, role_key, spec, override):
+        if not override:
+            return spec
+        fallback = bool(spec.get('fallback', False))
+        original_condition = spec.get('condition')
+        original_action = spec.get('action')
+        enabled_state = override.get('enabled', 'default')
+
+        def wrapped_condition(context):
+            if enabled_state is False:
+                return False
+            if not self._behavior_override_time_ok(context.game_time, override):
+                return False
+            if not self._behavior_override_expression_ok(context, override):
+                return False
+            if not fallback and original_condition is not None and not bool(original_condition(context)):
+                return False
+            if str(override.get('region_mode', 'enter_then_execute')) == 'strict_inside' and self._behavior_override_regions(override):
+                return self._behavior_override_inside_entity(context, override)
+            return True
+
+        def wrapped_action(context):
+            if enabled_state is False:
+                return FAILURE
+            if not self._behavior_override_time_ok(context.game_time, override):
+                return FAILURE
+            if not self._behavior_override_expression_ok(context, override):
+                return FAILURE
+            if self._behavior_override_regions(override) and not self._behavior_override_inside_entity(context, override):
+                return self._navigate_to_behavior_override_region(context, override.get('label', spec.get('label', '任务')), override)
+            result = original_action(context)
+            destination_result = self._apply_behavior_destination_override(context, override.get('label', spec.get('label', '任务')), override)
+            if destination_result is not None:
+                return destination_result
+            return result
+
+        wrapped_spec = dict(spec)
+        wrapped_spec['label'] = str(override.get('label', spec.get('label', spec['id'])))
+        wrapped_spec['condition'] = None if fallback else wrapped_condition
+        wrapped_spec['action'] = wrapped_action
+        wrapped_spec['fallback'] = fallback
+        return wrapped_spec
+
+    def _apply_behavior_overrides_to_specs(self, specs_by_role):
+        wrapped_specs = {}
+        for role_key, specs in specs_by_role.items():
+            role_specs = []
+            for spec in specs:
+                override = self._behavior_override_for_decision(role_key, spec['id'])
+                role_specs.append(self._wrap_behavior_override(role_key, spec, override) if override else spec)
+            wrapped_specs[role_key] = role_specs
+        return wrapped_specs
+
+    def _load_role_decision_specs_from_xml(self, role_key, condition_registry, action_registry):
+        file_info = self.ROLE_BEHAVIOR_TREE_FILES.get(role_key)
+        if file_info is None:
+            return None
+        file_name, tree_id = file_info
+        file_path = os.path.join(self._behavior_tree_dir, file_name)
+        if not os.path.exists(file_path):
+            return None
+        root = ET.parse(file_path).getroot()
+        behavior_tree = root.find(f".//BehaviorTree[@ID='{tree_id}']")
+        if behavior_tree is None:
+            return None
+        branch_root = None
+        for child in list(behavior_tree):
+            if child.tag in {'ReactiveFallback', 'Fallback', 'Selector'}:
+                branch_root = child
+                break
+        if branch_root is None:
+            return None
+
+        specs = []
+        for child in list(branch_root):
+            decision_id = str(child.attrib.get('decision_id', '')).strip()
+            if not decision_id:
+                continue
+            label = str(child.attrib.get('decision_label', decision_id)).strip()
+            action_ref = str(child.attrib.get('action_ref', decision_id)).strip()
+            condition_ref = str(child.attrib.get('condition_ref', '')).strip()
+            fallback = self._parse_xml_bool(child.attrib.get('fallback')) or not condition_ref
+            action = action_registry.get(action_ref)
+            if action is None:
+                continue
+            condition = None if fallback else condition_registry.get(condition_ref)
+            if not fallback and condition is None:
+                continue
+            specs.append(self._decision_spec(decision_id, label, condition, action, fallback=fallback))
+        return specs or None
+
+    def _build_role_decision_specs(self):
+        default_specs = self._default_role_decision_specs()
+        if self._decision_plugin_catalog:
+            return self._apply_behavior_overrides_to_specs(default_specs)
+        condition_registry = self._behavior_condition_registry()
+        action_registry = self._behavior_action_registry()
+        loaded_specs = {}
+        for role_key, fallback_specs in default_specs.items():
+            xml_specs = self._load_role_decision_specs_from_xml(role_key, condition_registry, action_registry)
+            loaded_specs[role_key] = xml_specs or fallback_specs
+        return self._apply_behavior_overrides_to_specs(loaded_specs)
 
     def _build_role_trees(self):
         role_trees = {}
@@ -177,6 +856,37 @@ class AIController:
         entity.ai_decision_selected = selected_id
         entity.ai_decision_weights = ranked
         entity.ai_decision_top3 = ranked[:3]
+
+    def get_decision_destination_preview_regions(self, role_key, decision_id, map_manager, team=None):
+        if map_manager is None:
+            return []
+        binding = self._available_plugin_binding(role_key, decision_id)
+        if binding is None:
+            return []
+        preview_regions = binding.get('preview_regions') if callable(binding.get('preview_regions')) else None
+        override = self._behavior_override_for_decision(role_key, decision_id)
+        if preview_regions is not None:
+            result = preview_regions(self, role_key, map_manager, team=team, override=override, binding=dict(binding))
+            if isinstance(result, list):
+                return [deepcopy(region) for region in result if isinstance(region, dict)]
+        facility_types = tuple(binding.get('default_destination_types', ()))
+        regions = []
+        for facility_type in facility_types:
+            regions.extend(deepcopy(map_manager.get_facility_regions(facility_type)))
+        return regions
+
+    def get_decision_point_targets(self, role_key, decision_id, map_manager, team=None):
+        binding = self._available_plugin_binding(role_key, decision_id)
+        override = self._behavior_override_for_decision(role_key, decision_id)
+        targets = {}
+        if binding is not None:
+            preview_points = binding.get('preview_points') if callable(binding.get('preview_points')) else None
+            if preview_points is not None:
+                targets.update(self._normalize_behavior_point_targets(
+                    preview_points(self, role_key, map_manager, team=team, override=override, binding=dict(binding))
+                ))
+        targets.update(self._behavior_override_point_targets(override, team=team))
+        return targets
 
     def _has_combat_ammo(self, entity, rules_engine=None):
         if entity is None:
@@ -388,6 +1098,8 @@ class AIController:
             left = right = (x1 + x2) * 0.5
         if top > bottom:
             top = bottom = (y1 + y2) * 0.5
+        entity_x = float(entity.position['x']) if entity is not None else float(target_point[0])
+        entity_y = float(entity.position['y']) if entity is not None else float(target_point[1])
 
         for point in (
             (left, top),
@@ -399,8 +1111,8 @@ class AIController:
             (left, (top + bottom) * 0.5),
             (right, (top + bottom) * 0.5),
             (
-                min(max(float(entity.position['x']), left), right),
-                min(max(float(entity.position['y']), top), bottom),
+                min(max(entity_x, left), right),
+                min(max(entity_y, top), bottom),
             ),
         ):
             add_candidate(point)
@@ -423,6 +1135,9 @@ class AIController:
         self._set_navigation_overlay_state(entity, waypoint=None, preview=self.EMPTY_PATH_PREVIEW, path_valid=False, region_radius=0.0, traversal_state='idle')
 
     def update(self, entities, map_manager=None, rules_engine=None, game_time=0.0, game_duration=0.0, controlled_entity_ids=None):
+        if self._last_behavior_reload_check_time < 0.0 or game_time - self._last_behavior_reload_check_time >= self._behavior_reload_check_interval:
+            self._last_behavior_reload_check_time = game_time
+            self._refresh_behavior_runtime_overrides()
         controlled_ids = None if controlled_entity_ids is None else set(controlled_entity_ids)
         self._path_replans_remaining = self._path_replans_per_update
         for entity in entities:
@@ -628,9 +1343,14 @@ class AIController:
         entity.chassis_state = decision.get('chassis_state', 'normal')
         entity.turret_state = decision.get('turret_state', 'searching')
         move_x, move_y = decision.get('velocity', (0.0, 0.0))
+        if getattr(entity, 'robot_type', '') == '英雄' and bool(getattr(entity, 'hero_deployment_active', False)):
+            move_x, move_y = 0.0, 0.0
+            entity.chassis_state = 'power_off'
         entity.ai_navigation_velocity = (move_x, move_y)
         entity.set_velocity(move_x, move_y)
         entity.angular_velocity = decision.get('angular_velocity', 0.0)
+        if getattr(entity, 'robot_type', '') == '英雄' and bool(getattr(entity, 'hero_deployment_active', False)):
+            entity.angular_velocity = 0.0
         if float(getattr(entity, 'evasive_spin_timer', 0.0)) > 0.0:
             entity.chassis_state = 'fast_spin'
             spin_direction = float(getattr(entity, 'evasive_spin_direction', 1.0)) or 1.0
@@ -663,6 +1383,14 @@ class AIController:
 
     def _hero_prefers_ranged(self, entity):
         return not self._hero_prefers_melee(entity)
+
+    def _is_in_facility_zone(self, entity, map_manager, facility_type):
+        if entity is None or map_manager is None:
+            return False
+        return any(
+            region.get('team') in {'neutral', entity.team}
+            for region in map_manager.get_regions_at(entity.position['x'], entity.position['y'], region_types={facility_type})
+        )
 
     def _role_key_from_hint(self, entity_type, robot_type):
         if entity_type == 'sentry':
@@ -748,7 +1476,10 @@ class AIController:
             return state['goal']
         if state is not None and state.get('goal') == 'home_stage' and stage_anchor is not None:
             if self._distance_to_point(entity, stage_anchor) <= self._meters_to_world_units(0.9, map_manager):
-                next_goal = 'hero_trapezoid' if role_key == 'hero' else 'infantry_push'
+                if role_key == 'hero':
+                    next_goal = 'hero_trapezoid' if self._hero_prefers_ranged(entity) else 'hero_highground'
+                else:
+                    next_goal = 'infantry_push'
                 state = {
                     'goal': next_goal,
                     'expires_at': max(float(state.get('expires_at', 0.0)), float(game_time) + (18.0 if opening_phase else 12.0)),
@@ -811,7 +1542,19 @@ class AIController:
         return True
 
     def _should_cross_terrain(self, context):
-        return getattr(context.entity, 'terrain_buff_timer', 0.0) <= 0.25
+        return self._best_terrain_traversal_plan(context) is not None
+
+    def _should_terrain_fly_slope(self, context):
+        plan = self._best_terrain_traversal_plan(context)
+        return bool(plan and plan.get('type') == 'fly_slope')
+
+    def _should_terrain_first_step(self, context):
+        plan = self._best_terrain_traversal_plan(context)
+        return bool(plan and plan.get('type') == 'first_step')
+
+    def _should_terrain_second_step(self, context):
+        plan = self._best_terrain_traversal_plan(context)
+        return bool(plan and plan.get('type') == 'second_step')
 
     def _should_recover_after_respawn(self, context):
         entity = context.entity
@@ -907,7 +1650,26 @@ class AIController:
         return context.data.get('role_key') == 'hero' and self._is_opening_phase(context)
 
     def _should_sentry_opening_highground(self, context):
-        return False
+        if context.data.get('role_key') != 'sentry' or not self._is_opening_phase(context):
+            return False
+        if self._sentry_opening_step_anchor(context) is None:
+            return False
+        state = self._sentry_fly_slope_state.get(context.entity.id)
+        return not bool(state and state.get('completed', False))
+
+    def _should_infantry_opening_highground(self, context):
+        if context.data.get('role_key') != 'infantry' or not self._is_opening_phase(context):
+            return False
+        if not self._has_combat_ammo(context.entity, context.rules_engine):
+            return False
+        if self._needs_supply(context):
+            return False
+        return self._infantry_opening_highground_anchor(context) is not None
+
+    def _should_hero_melee_highground_assault(self, context):
+        if context.data.get('role_key') != 'hero' or not self._hero_prefers_melee(context.entity):
+            return False
+        return self._should_take_enemy_highground(context)
 
     def _should_hero_lob_outpost(self, context):
         if context.data.get('role_key') != 'hero':
@@ -1106,6 +1868,12 @@ class AIController:
         remaining_path = path[index:]
         return ((float(entity.position['x']), float(entity.position['y'])),) + tuple(remaining_path)
 
+    def _path_waypoint_index(self, path, preferred_index=1):
+        if not path:
+            return 0
+        minimum_index = 0 if len(path) == 1 else 1
+        return max(minimum_index, min(int(preferred_index), len(path) - 1))
+
     def _pathfinder_distance_scale(self, entity, target_point, map_manager):
         if map_manager is None or target_point is None:
             return 1.0
@@ -1153,7 +1921,7 @@ class AIController:
         if goal == 'home_stage':
             return self._action_move_to_post_supply_stage(context)
         if goal == 'hero_trapezoid':
-            return self._action_hero_trapezoid_highground(context)
+            return self._action_hero_ranged_highground(context)
         if goal == 'hero_lob':
             return self._action_hero_ranged_highground(context)
         if goal == 'hero_highground':
@@ -1180,38 +1948,13 @@ class AIController:
         )
 
     def _action_hero_trapezoid_highground(self, context):
-        hero_anchor = self._find_nearest_facility_center(
-            context.map_manager,
-            context.entity,
-            ['buff_trapezoid_highland', 'second_step', 'fly_slope'],
-        )
-        if hero_anchor is None:
-            return FAILURE
-        target = self._priority_enemy_unit_target(context) or context.data.get('target')
-        speed = self._meters_to_world_units(2.0, context.map_manager)
-        if self._distance_to_point(context.entity, hero_anchor) > self._meters_to_world_units(0.8, context.map_manager):
-            return self._set_decision(
-                context,
-                '英雄补给后直奔梯形高地压制位',
-                target=target,
-                target_point=hero_anchor,
-                speed=speed,
-                preferred_route={'target': hero_anchor},
-                turret_state='aiming' if target is not None else 'searching',
-            )
-        if target is None:
-            return self._set_decision(context, '英雄据守梯形高地等待目标', target_point=hero_anchor, speed=speed * 0.5)
-        return self._safe_pressure_decision(context, target, '英雄占领梯形高地对敌前压', speed, preferred_distance_m=4.0)
+        return self._action_hero_ranged_highground(context)
 
     def _action_infantry_post_supply_plan(self, context):
         enemy_outpost = context.data.get('enemy_outpost')
         target = self.entity_to_target(enemy_outpost, context.entity) if enemy_outpost is not None and enemy_outpost.is_alive() else context.data.get('target')
         speed = self._meters_to_world_units(1.9, context.map_manager)
-        highground = self._find_nearest_facility_center(
-            context.map_manager,
-            context.entity,
-            ['buff_central_highland', 'second_step', 'fly_slope', 'buff_trapezoid_highland'],
-        )
+        highground = self._infantry_opening_highground_anchor(context)
         if highground is not None:
             return self._set_decision(
                 context,
@@ -1241,20 +1984,17 @@ class AIController:
         if self._distance_to_point(context.entity, hero_anchor) > self._meters_to_world_units(0.9, context.map_manager):
             return self._set_decision(
                 context,
-                '远程英雄优先抢占梯形高地增益区，再开始吊射',
+                '远程英雄优先进入己方梯形高地增益区，再开始吊射',
                 target=target,
-                target_point=(target_entity.position['x'], target_entity.position['y']) if getattr(target_entity, 'position', None) is not None else hero_anchor,
+                target_point=hero_anchor,
                 speed=speed,
-                preferred_route={
-                    'target': hero_anchor,
-                    'strategic_target': (target_entity.position['x'], target_entity.position['y']) if getattr(target_entity, 'position', None) is not None else hero_anchor,
-                },
+                preferred_route={'target': hero_anchor},
                 turret_state='aiming' if target is not None else 'searching',
             )
         if target is None:
-            return self._set_decision(context, '远程英雄先吃到梯形高地增益，等待吊射目标暴露', target_point=hero_anchor, speed=speed * 0.5)
+            return self._set_decision(context, '远程英雄先吃到己方梯形高地增益，等待吊射目标暴露', target_point=hero_anchor, speed=speed * 0.5)
         context.data['decision'] = {
-            'summary': '远程英雄占据梯形高地增益区执行吊射',
+            'summary': '远程英雄占据己方梯形高地增益区执行吊射',
             'target': target,
             'aim_point': (target['x'], target['y']),
             'navigation_target': hero_anchor,
@@ -1299,24 +2039,39 @@ class AIController:
         return self._safe_pressure_decision(context, focus_target, '英雄在高地基地侧巡逻并发现目标后立即打击', speed, preferred_distance_m=3.6)
 
     def _action_sentry_opening_highground(self, context):
-        opening_anchor = self._find_nearest_facility_center(
-            context.map_manager,
-            context.entity,
-            ['second_step', 'first_step', 'fly_slope', 'buff_central_highland', 'buff_trapezoid_highland'],
-        )
+        opening_anchor = self._sentry_opening_step_anchor(context)
         if opening_anchor is None:
-            return FAILURE
+            return self._action_sentry_fly_slope(context)
         target_entity = context.data.get('enemy_outpost')
         target = self.entity_to_target(target_entity, context.entity) if target_entity is not None else context.data.get('target')
         speed = self._meters_to_world_units(1.85, context.map_manager)
+        if self._distance_to_point(context.entity, opening_anchor) > self._meters_to_world_units(0.9, context.map_manager):
+            return self._set_decision(
+                context,
+                '哨兵开局先上一节一级台阶，再转入飞坡突入路线',
+                target=target,
+                target_point=opening_anchor,
+                speed=speed,
+                preferred_route={'target': opening_anchor},
+                posture='attack',
+                turret_state='aiming' if target is not None else 'searching',
+            )
+        return self._action_sentry_fly_slope(context)
+
+    def _action_infantry_opening_highground(self, context):
+        opening_anchor = self._infantry_opening_highground_anchor(context)
+        if opening_anchor is None:
+            return FAILURE
+        enemy_outpost = context.data.get('enemy_outpost')
+        target = self.entity_to_target(enemy_outpost, context.entity) if enemy_outpost is not None and enemy_outpost.is_alive() else (self._priority_enemy_unit_target(context) or context.data.get('target'))
+        speed = self._meters_to_world_units(1.95, context.map_manager)
         return self._set_decision(
             context,
-            '哨兵开局直上台阶前往高地压制，不强制补给',
+            '步兵开局直抢高地增益区，并准备压制敌方前哨站',
             target=target,
             target_point=opening_anchor,
             speed=speed,
             preferred_route={'target': opening_anchor},
-            posture='attack',
             turret_state='aiming' if target is not None else 'searching',
         )
 
@@ -1413,12 +2168,19 @@ class AIController:
         return self._set_decision(context, '转入中央能量机关队伍激活位，保持激活窗口直至完成小/大能量机关', target=context.data.get('target'), target_point=anchor, speed=speed, turret_state='aiming' if context.data.get('target') else 'searching')
 
     def _action_cross_terrain(self, context):
-        facility = self._find_best_buff_anchor(context, terrain_only=True)
-        if facility is None:
+        plan = self._best_terrain_traversal_plan(context)
+        if plan is None:
             return FAILURE
-        speed = self._meters_to_world_units(1.8, context.map_manager)
-        center = self.facility_center(facility)
-        return self._set_decision(context, f'主动翻越 {facility.get("type")} 建立侧翼路线', target_point=center, speed=speed)
+        return self._action_terrain_traversal(context, plan.get('type'))
+
+    def _action_terrain_fly_slope(self, context):
+        return self._action_terrain_traversal(context, 'fly_slope')
+
+    def _action_terrain_first_step(self, context):
+        return self._action_terrain_traversal(context, 'first_step')
+
+    def _action_terrain_second_step(self, context):
+        return self._action_terrain_traversal(context, 'second_step')
 
     def _action_support_structures(self, context):
         support_target = context.data.get('own_outpost')
@@ -1734,13 +2496,7 @@ class AIController:
             velocity = self.navigate_towards(context.entity, nav_target, speed, context.map_manager)
             detail = '，当前状态偏危险，先回撤保命'
         elif overprotected:
-            fallback_highground = None
-            if context.data.get('role_key') in {'hero', 'infantry'}:
-                fallback_highground = self._find_nearest_facility_center(
-                    context.map_manager,
-                    context.entity,
-                    ['buff_central_highland', 'buff_trapezoid_highland', 'second_step', 'fly_slope'],
-                )
+            fallback_highground = self._fallback_highground_anchor(context)
             nav_target = fallback_highground or guard_anchor or standoff_anchor
             hold_distance = self._meters_to_world_units(min(5.0, safe_distance_m + 0.6), context.map_manager)
             velocity = self.engage_from_anchor(context.entity, target, nav_target, desired_distance=hold_distance, speed=speed * 0.78, map_manager=context.map_manager)
@@ -2241,6 +2997,73 @@ class AIController:
         via = self._distance_to_point(entity, best) + math.hypot(destination[0] - best[0], destination[1] - best[1])
         return best if via <= direct * 1.15 else None
 
+    def _best_terrain_traversal_plan(self, context, required_type=None):
+        map_manager = context.map_manager
+        if map_manager is None:
+            return None
+        entity = context.entity
+        if float(getattr(entity, 'terrain_buff_timer', 0.0)) > 0.25:
+            return None
+        target = context.data.get('target')
+        target_point = (target['x'], target['y']) if target is not None else context.data.get('energy_anchor') or context.data.get('map_center') or self.get_map_center(map_manager)
+        candidates = []
+        for facility_type in ('fly_slope', 'first_step', 'second_step'):
+            if required_type is not None and facility_type != required_type:
+                continue
+            for facility in map_manager.get_facility_regions(facility_type):
+                if facility.get('team') not in {entity.team, 'neutral'}:
+                    continue
+                if not self._terrain_access_allowed(entity, facility, context.rules_engine):
+                    continue
+                center = self.facility_center(facility)
+                resolved = self._resolve_navigation_target(center, map_manager, entity=entity)
+                if resolved is None:
+                    continue
+                distance_to_entity = self._distance_to_point(entity, resolved)
+                distance_to_target = math.hypot(float(target_point[0]) - float(resolved[0]), float(target_point[1]) - float(resolved[1]))
+                terrain_bias = {'fly_slope': -42.0, 'first_step': -28.0, 'second_step': -20.0}[facility_type]
+                role_bias = 0.0
+                role_key = context.data.get('role_key')
+                if role_key == 'sentry' and facility_type == 'fly_slope':
+                    role_bias -= 18.0
+                if role_key == 'infantry' and facility_type in {'first_step', 'second_step'}:
+                    role_bias -= 12.0
+                if role_key == 'engineer' and facility_type == 'fly_slope':
+                    role_bias += 18.0
+                score = distance_to_entity * 0.58 + distance_to_target * 0.42 + terrain_bias + role_bias
+                candidates.append((score, facility_type, facility, resolved))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0])
+        _, facility_type, facility, resolved = candidates[0]
+        return {
+            'type': facility_type,
+            'facility': facility,
+            'target': (float(resolved[0]), float(resolved[1])),
+        }
+
+    def _action_terrain_traversal(self, context, facility_type):
+        plan = self._best_terrain_traversal_plan(context, required_type=facility_type)
+        if plan is None:
+            return FAILURE
+        summary_map = {
+            'fly_slope': '主动利用飞坡快速换侧并建立侧翼路线',
+            'first_step': '主动翻越一级台阶切入有利地形',
+            'second_step': '主动翻越二级台阶抢占高差路线',
+        }
+        target_point = plan.get('target')
+        speed = self._meters_to_world_units(1.8, context.map_manager)
+        target = context.data.get('target')
+        return self._set_decision(
+            context,
+            summary_map.get(facility_type, '主动翻越地形建立侧翼路线'),
+            target=target,
+            target_point=target_point,
+            speed=speed,
+            preferred_route={'target': target_point},
+            turret_state='aiming' if target is not None else 'searching',
+        )
+
     def _find_best_buff_anchor(self, context, terrain_only=False):
         if context.map_manager is None:
             return None
@@ -2337,6 +3160,36 @@ class AIController:
         candidates.sort(key=lambda item: item[0])
         return self._resolve_navigation_target(candidates[0][1], map_manager, entity=context.entity)
 
+    def _sentry_opening_step_anchor(self, context):
+        map_manager = context.map_manager
+        if map_manager is None:
+            return None
+        return self._find_nearest_facility_center(map_manager, context.entity, ['first_step', 'fly_slope'])
+
+    def _infantry_opening_highground_anchor(self, context):
+        map_manager = context.map_manager
+        if map_manager is None:
+            return None
+        return self._find_nearest_facility_center(
+            map_manager,
+            context.entity,
+            ['buff_central_highland', 'second_step', 'first_step', 'fly_slope'],
+        )
+
+    def _fallback_highground_anchor(self, context):
+        role_key = context.data.get('role_key')
+        if role_key == 'infantry':
+            return self._infantry_opening_highground_anchor(context)
+        if role_key == 'hero':
+            if self._hero_prefers_ranged(context.entity):
+                return self._hero_ranged_highground_anchor(context)
+            return self._outpost_pressure_highground_anchor(context)
+        return self._find_nearest_facility_center(
+            context.map_manager,
+            context.entity,
+            ['buff_central_highland', 'buff_trapezoid_highland', 'second_step', 'first_step', 'fly_slope'],
+        )
+
     def _outpost_pressure_highground_anchor(self, context):
         map_manager = context.map_manager
         if map_manager is None:
@@ -2344,7 +3197,12 @@ class AIController:
         target_entity = context.data.get('enemy_outpost') or context.data.get('enemy_base')
         target_point = (target_entity.position['x'], target_entity.position['y']) if target_entity is not None else self.get_map_center(map_manager)
         candidates = []
-        for facility_type in ('buff_trapezoid_highland', 'buff_central_highland'):
+        role_key = context.data.get('role_key')
+        if role_key == 'infantry':
+            facility_types = ('buff_central_highland',)
+        else:
+            facility_types = ('buff_trapezoid_highland', 'buff_central_highland')
+        for facility_type in facility_types:
             for facility in map_manager.get_facility_regions(facility_type):
                 if facility.get('team') not in {'neutral', context.entity.team}:
                     continue
@@ -2354,7 +3212,8 @@ class AIController:
                 score = distance_target * 0.75 + distance_entity * 0.25
                 candidates.append((score, center))
         if not candidates:
-            return self._find_nearest_facility_center(map_manager, context.entity, ['buff_trapezoid_highland', 'buff_central_highland', 'second_step', 'fly_slope'])
+            fallback_types = ['buff_central_highland', 'second_step', 'first_step', 'fly_slope'] if role_key == 'infantry' else ['buff_trapezoid_highland', 'buff_central_highland', 'second_step', 'first_step', 'fly_slope']
+            return self._find_nearest_facility_center(map_manager, context.entity, fallback_types)
         candidates.sort(key=lambda item: item[0])
         return self._resolve_navigation_target(candidates[0][1], map_manager, entity=context.entity)
 
@@ -2365,7 +3224,7 @@ class AIController:
         trapezoid_anchor = self._find_nearest_facility_center(map_manager, context.entity, ['buff_trapezoid_highland'])
         if trapezoid_anchor is not None:
             return trapezoid_anchor
-        return self._outpost_pressure_highground_anchor(context)
+        return self._hero_deployment_anchor(context)
 
     def _base_side_patrol_anchor(self, entity, map_manager, origin_anchor, enemy_base):
         if origin_anchor is None or enemy_base is None:
@@ -2786,7 +3645,7 @@ class AIController:
             )
         if not need_replan:
             active_path = state_view.get('path', ())
-            active_index = max(1, min(int(state_view.get('index', 1)), max(len(active_path) - 1, 1))) if active_path else 1
+            active_index = self._path_waypoint_index(active_path, state_view.get('index', 1)) if active_path else 0
             deviation_limit = max(
                 18.0,
                 map_manager.terrain_grid_cell_size * 2.2,
@@ -2799,7 +3658,8 @@ class AIController:
         if not need_replan:
             planned_at = float(state_view.get('planned_at', current_time))
             if current_time - planned_at >= max(0.18, self._path_replan_interval * 1.5):
-                active_index = max(1, min(int(state_view.get('index', 1)), max(len(state_view.get('path', ())) - 1, 1))) if state_view.get('path') else 1
+                active_path = state_view.get('path', ())
+                active_index = self._path_waypoint_index(active_path, state_view.get('index', 1)) if active_path else 0
                 path_deviation = self._path_deviation_distance(entity, state_view.get('path', ()), active_index)
                 if path_deviation > max(24.0, map_manager.terrain_grid_cell_size * 2.8):
                     need_replan = True
@@ -2831,8 +3691,8 @@ class AIController:
             }
             self._stuck_state[entity.id] = stuck
         if not need_replan:
-            active_index = max(1, min(int(state.get('index', 1)), max(len(state.get('path', [])) - 1, 1))) if state else 1
             active_path = state.get('path', []) if state else []
+            active_index = self._path_waypoint_index(active_path, state.get('index', 1)) if active_path else 0
             if active_path:
                 probe_distance = self._distance_to_point(entity, active_path[active_index])
                 if probe_distance < float(stuck.get('best_distance', float('inf'))) - max(4.0, map_manager.terrain_grid_cell_size * 0.45):
@@ -2864,7 +3724,7 @@ class AIController:
                 'can_climb_steps': bool(traversal_profile.get('can_climb_steps', False)),
                 'collision_radius': round(float(traversal_profile.get('collision_radius', 0.0)), 2),
                 'path': tuple(path or self.EMPTY_PATH_PREVIEW),
-                'index': 1,
+                'index': self._path_waypoint_index(tuple(path or self.EMPTY_PATH_PREVIEW), 1),
                 'planned_at': current_time,
                 'last_speed': current_speed,
                 'last_wp_distance': 0.0,
@@ -2907,7 +3767,7 @@ class AIController:
                 'last_check_time': current_time,
             }
             return entity.position['x'], entity.position['y']
-        index = max(1, min(int(state.get('index', 1)), max(len(path) - 1, 1)))
+        index = self._path_waypoint_index(path, state.get('index', 1))
         speed_lookahead = current_speed * max(0.08, self._ai_update_interval)
         advance_distance = max(self._arrival_tolerance_world_units(map_manager), map_manager.terrain_grid_cell_size * 1.5 + speed_lookahead)
         while index < len(path) - 1 and self._distance_to_point(entity, path[index]) <= advance_distance:
@@ -2934,13 +3794,13 @@ class AIController:
                 return path[index]
             refreshed_path = self._search_navigation_path(entity, target_point, map_manager, step_limit, traversal_profile)
             state['path'] = tuple(refreshed_path or self.EMPTY_PATH_PREVIEW)
-            state['index'] = 1
+            state['index'] = self._path_waypoint_index(state['path'], 1)
             state['planned_at'] = current_time
             if not state['path']:
                 self._clear_navigation_overlay_state(entity)
                 return float(entity.position['x']), float(entity.position['y'])
             path = state['path']
-            index = max(1, min(int(state.get('index', 1)), max(len(path) - 1, 1)))
+            index = self._path_waypoint_index(path, state.get('index', 1))
             state['last_waypoint'] = path[index]
             state['last_wp_distance'] = self._distance_to_point(entity, path[index])
         stuck = self._stuck_state.get(entity.id, {})

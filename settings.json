@@ -10,6 +10,9 @@
     "perf_sample_window": 20000,
     "perf_log_interval_sec": 5.0
   },
+  "ai": {
+    "behavior_preset": "latest_behavior"
+  },
   "map": {
     "preset": "blank_map"
   },
@@ -18,19 +21,23 @@
       "red": {
         "robot_1": {
           "x": 112,
-          "y": 379
+          "y": 379,
+          "angle": 0
         },
         "robot_2": {
           "x": 213,
-          "y": 491
+          "y": 491,
+          "angle": 0
         },
         "robot_3": {
           "x": 162,
-          "y": 528
+          "y": 528,
+          "angle": 0
         },
         "robot_4": {
           "x": 97,
-          "y": 489
+          "y": 489,
+          "angle": 0
         },
         "robot_7": {
           "x": 239,
@@ -75,6 +82,8 @@
     }
   },
   "rules": {
+    "damage_system": "伤害机制.png",
+    "health_system": "血量机制.png",
     "game_duration": 420,
     "economy": {
       "initial_gold": 400.0,
@@ -1114,8 +1123,6 @@
       },
       "auto_intervention_cost": 50,
       "semi_auto_intervention_cost": 0
-    },
-    "damage_system": "伤害机制.png",
-    "health_system": "血量机制.png"
+    }
   }
 }

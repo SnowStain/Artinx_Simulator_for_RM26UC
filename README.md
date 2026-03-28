@@ -147,6 +147,10 @@ py -3.13 -m venv .venv
 - AI 基于行为树运行。
 - 每个兵种都通过统一的 role_decision_specs 定义“决策 id + 中文标签 + 条件 + 动作 + fallback”。
 - 行为树执行和决策评估使用同一套规格，避免“显示逻辑”和“执行逻辑”脱节。
+- 已补充一份 ROS2 / BehaviorTree.CPP 风格的等价 XML 总览，见 control/behavior_trees_btcpp.xml。
+- 当前 controller 读取的兵种主逻辑已拆分到 control/behavior_trees/sentry_btcpp.xml、control/behavior_trees/infantry_btcpp.xml、control/behavior_trees/hero_btcpp.xml、control/behavior_trees/engineer_btcpp.xml。
+- 对局中的兵种面板仍由 control/ai_controller.py 输出 decision ids / labels / top3，但顺序与标签现在优先跟随上述拆分 XML 装载。
+- 已新增独立行为编辑器 behavior_editor.py，可通过 start_behavior_editor.bat 打开；支持按兵种/决策编辑时间窗口、条件表达式，以及在地图上用矩形/圆形/多边形绘制任务区域，并保存为 behavior_presets/*.json。
 
 ### 2. 当前兵种决策序列
 
