@@ -6,6 +6,7 @@ import os
 import sys
 from copy import deepcopy
 from datetime import datetime
+from types import SimpleNamespace
 
 from pygame_compat import pygame
 
@@ -594,42 +595,57 @@ class BehaviorEditorEngine:
         destination_regions.append(deepcopy(region))
         self._persist_live_changes('已更新目的地区域')
 
-    def remove_region_at_point(self, point, region_kind='task', team=None):
-        region_index, _ = self.region_at_point(point, region_kind=region_kind, team=team)
-        if region_index is None:
+    def remove_region_at_point(self, point, region_kind='destination', team=None, log_message=None):
+        regions = self._editable_regions(region_kind, create=True, team=team)
+        if regions is None:
             return False
-        return self.remove_region_at_index(region_index, region_kind=region_kind, log_message='已删除区域覆盖', team=team)
-
-    def set_point_target(self, target_key, point, team=None):
-        override = self.current_override(create=True)
-        if override is None or point is None:
+        removed = False
+        for index in range(len(regions) - 1, -1, -1):
+            if self.ai_controller._point_in_behavior_region(point, regions[index]):
+                del regions[index]
+                removed = True
+                break
+        if not removed:
             return False
-        if team in {'red', 'blue'}:
-            by_team = override.setdefault('point_targets_by_team', {})
-            targets = by_team.get(team)
-            if not isinstance(targets, dict):
-                targets = {key: [round(value[0], 1), round(value[1], 1)] for key, value in self.current_point_targets(team=team).items()}
-                by_team[team] = targets
-        else:
-            targets = override.setdefault('point_targets', {})
-            if not isinstance(targets, dict):
-                targets = {}
-                override['point_targets'] = targets
-        targets[str(target_key)] = [round(float(point[0]), 1), round(float(point[1]), 1)]
+        field_name = 'destination_regions' if region_kind == 'destination' else 'task_regions'
+        override = self.current_override(create=False)
+        if override is not None and not regions:
+            if team in {'red', 'blue'}:
+                by_team = override.get(f'{field_name}_by_team', {})
+                if isinstance(by_team, dict):
+                    by_team.pop(team, None)
+                    if not by_team:
+                        override.pop(f'{field_name}_by_team', None)
+            else:
+                override.pop(field_name, None)
         self.prune_current_override_if_default()
-        self._persist_live_changes('已更新目标点')
+        self._persist_live_changes(log_message or '已删除逻辑区域')
         return True
 
-    def clear_point_target(self, target_key, team=None):
+    def set_point_target(self, target_id, point, team=None):
+        override = self.current_override(create=True)
+        if override is None:
+            return
+
+        point_targets_by_team = self._normalize_team_point_target_map(override.get('point_targets_by_team', {}))
+        team_targets = point_targets_by_team.setdefault(team, {})
+        team_targets[str(target_id)] = (float(point[0]), float(point[1]))
+
+        override['point_targets_by_team'] = point_targets_by_team
+
+        self.prune_current_override_if_default()
+        self._persist_live_changes('已更新目标点')
+
+    def clear_point_target(self, target_id, team=None):
         override = self.current_override(create=False)
         if override is None:
-            return False
+            return
         removed = False
         if team in {'red', 'blue'}:
             by_team = override.get('point_targets_by_team', {})
             targets = by_team.get(team) if isinstance(by_team, dict) else None
-            if isinstance(targets, dict) and str(target_key) in targets:
-                targets.pop(str(target_key), None)
+            if isinstance(targets, dict) and str(target_id) in targets:
+                targets.pop(str(target_id), None)
                 removed = True
                 if not targets:
                     by_team.pop(team, None)
@@ -637,8 +653,8 @@ class BehaviorEditorEngine:
                     override.pop('point_targets_by_team', None)
         else:
             targets = override.get('point_targets')
-            if isinstance(targets, dict) and str(target_key) in targets:
-                targets.pop(str(target_key), None)
+            if isinstance(targets, dict) and str(target_id) in targets:
+                targets.pop(str(target_id), None)
                 removed = True
                 if not targets:
                     override.pop('point_targets', None)
@@ -760,6 +776,7 @@ class BehaviorEditorApp:
         self.panel_viewport_rect = None
         self.region_edit_target = 'destination'
         self.region_edit_team = 'red'
+        self.map_texture = self.engine.map_manager.map_image
         self.map_cache = None
         self.map_cache_size = None
         map_width = max(1.0, float(getattr(self.engine.map_manager, 'map_width', 1.0) or 1.0))
@@ -767,23 +784,26 @@ class BehaviorEditorApp:
         self.map_zoom = 1.0
         self.map_zoom_min = 1.0
         self.map_zoom_max = 4.0
-        self.map_view_center = (map_width * 0.5, map_height * 0.5)
-        self.mouse_world = None
+        self.map_view_center = (self.map_texture.get_width() // 2, self.map_texture.get_height() // 2)
+        self.map_dragging = False
+        self.map_drag_last_pos = None
+        self.active_text = SimpleNamespace(input=None)
         self.shape_mode = 'rect'
         self.drag_start = None
         self.drag_current = None
         self.polygon_points = []
+        self.region_drag_state = None
         self.selected_region_kind = None
         self.selected_region_index = None
         self.selected_region_team = None
-        self.region_drag_state = None
+        self.mouse_world = None
         self.point_edit_target = None
-        self.active_text_input = None
-        self.click_actions = []
-        self.preview_run_duration_ms = 1400
-        self.preview_pause_duration_ms = 2000
+
         self.preview_loop_active = False
         self.preview_cycle_started_ms = 0
+        self.preview_run_duration_ms = 1800
+        self.preview_pause_duration_ms = 600
+
         self.colors = {
             'bg': (233, 236, 241),
             'toolbar': (26, 31, 38),
@@ -1475,9 +1495,10 @@ class BehaviorEditorApp:
             x = self._toolbar_button(x, label, action, active=active)
 
         preset_rect = pygame.Rect(x + 6, 10, 180, self.toolbar_height - 20)
+        active_input = self.active_text.input or {}
         pygame.draw.rect(self.screen, self.colors['white'], preset_rect, border_radius=6)
-        pygame.draw.rect(self.screen, self.colors['toolbar_button_active'] if self.active_text_input and self.active_text_input.get('field') == 'preset_name' else self.colors['panel_border'], preset_rect, 2, border_radius=6)
-        preset_text = self.active_text_input['text'] if self.active_text_input and self.active_text_input.get('field') == 'preset_name' else self.engine.preset_name
+        pygame.draw.rect(self.screen, self.colors['toolbar_button_active'] if active_input.get('field') == 'preset_name' else self.colors['panel_border'], preset_rect, 2, border_radius=6)
+        preset_text = active_input.get('text', '') if active_input.get('field') == 'preset_name' else self.engine.preset_name
         rendered = self.base_font.render(preset_text or 'latest_behavior', True, self.colors['panel_text'])
         self.screen.blit(rendered, (preset_rect.x + 10, preset_rect.y + 8))
         self.click_actions.append((preset_rect, 'edit:preset_name'))
@@ -1555,7 +1576,12 @@ class BehaviorEditorApp:
                 start = self.world_to_screen((region.get('x1', 0), region.get('y1', 0)))
                 end = self.world_to_screen((region.get('x2', 0), region.get('y2', 0)))
                 if start and end:
-                    rect = pygame.Rect(min(start[0], end[0]), min(start[1], end[1]), abs(end[0] - start[0]), abs(end[1] - start[1]))
+                    rect = pygame.Rect(
+                        min(start[0], end[0]),
+                        min(start[1], end[1]),
+                        abs(end[0] - start[0]),
+                        abs(end[1] - start[1]),
+                    )
                     pygame.draw.rect(self.screen, color, rect, width)
 
     def _render_destination_regions(self):
@@ -1767,11 +1793,12 @@ class BehaviorEditorApp:
         pygame.draw.rect(self.screen, self.colors['panel_border'], viewport_rect, 1, border_radius=8)
         self._draw_scroll_hint(viewport_rect)
 
+        active_input = self.active_text.input or {}
         edit_values = {
-            'label': self.active_text_input['text'] if self.active_text_input and self.active_text_input.get('field') == 'label' else str(override.get('label', '')),
-            'condition_expr': self.active_text_input['text'] if self.active_text_input and self.active_text_input.get('field') == 'condition_expr' else str(override.get('condition_expr', '')),
-            'start_sec': self.active_text_input['text'] if self.active_text_input and self.active_text_input.get('field') == 'start_sec' else str((override.get('time_window') or {}).get('start_sec', '')),
-            'end_sec': self.active_text_input['text'] if self.active_text_input and self.active_text_input.get('field') == 'end_sec' else str((override.get('time_window') or {}).get('end_sec', '')),
+            'label': active_input.get('text', '') if active_input.get('field') == 'label' else str(override.get('label', '')),
+            'condition_expr': active_input.get('text', '') if active_input.get('field') == 'condition_expr' else str(override.get('condition_expr', '')),
+            'start_sec': active_input.get('text', '') if active_input.get('field') == 'start_sec' else str((override.get('time_window') or {}).get('start_sec', '')),
+            'end_sec': active_input.get('text', '') if active_input.get('field') == 'end_sec' else str((override.get('time_window') or {}).get('end_sec', '')),
         }
 
         self._clamp_panel_scroll()
@@ -1866,10 +1893,10 @@ class BehaviorEditorApp:
         self._render_available_decision_sidebar(sidebar_rect)
 
     def commit_text_input(self):
-        if self.active_text_input is None:
+        if self.active_text.input is None:
             return False
-        field = self.active_text_input.get('field')
-        text = str(self.active_text_input.get('text', ''))
+        field = self.active_text.input.get('field')
+        text = str(self.active_text.input.get('text', ''))
         if field == 'preset_name':
             self.engine.preset_name = text.strip() or 'latest_behavior'
             self.engine._persist_live_changes(f'主程序已切换行为预设: {self.engine.preset_name}')
@@ -1884,26 +1911,26 @@ class BehaviorEditorApp:
                     self.engine.set_override_field(field, float(value))
                 except ValueError:
                     self.engine.add_log(f'{field} 不是有效数字，已保留原值')
-        self.active_text_input = None
+        self.active_text.input = None
         return True
 
     def handle_text_input_key(self, event):
-        if self.active_text_input is None:
+        if self.active_text.input is None:
             return False
         if event.key in {pygame.K_RETURN, pygame.K_KP_ENTER}:
             self.commit_text_input()
             return True
         if event.key == pygame.K_ESCAPE:
-            self.active_text_input = None
+            self.active_text.input = None
             return True
         if event.key == pygame.K_BACKSPACE:
-            self.active_text_input['text'] = self.active_text_input.get('text', '')[:-1]
+            self.active_text.input['text'] = self.active_text.input.get('text', '')[:-1]
             return True
         if event.key == pygame.K_DELETE:
-            self.active_text_input['text'] = ''
+            self.active_text.input['text'] = ''
             return True
         if event.unicode and event.unicode.isprintable():
-            self.active_text_input['text'] = self.active_text_input.get('text', '') + event.unicode
+            self.active_text.input['text'] = self.active_text.input.get('text', '') + event.unicode
             return True
         return True
 
@@ -2007,7 +2034,7 @@ class BehaviorEditorApp:
                 text = str((override.get('time_window') or {}).get(field, ''))
             else:
                 text = self.engine.preset_name
-            self.active_text_input = {'field': field, 'text': text}
+            self.active_text.input = {'field': field, 'text': text}
             return
         if action == 'toggle:enabled':
             self.engine.cycle_enabled_state()
@@ -2112,7 +2139,7 @@ class BehaviorEditorApp:
                         continue
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     handled = False
-                    for rect, action in list(self.click_actions):
+                    for rect, action in reversed(self.click_actions):
                         if rect.collidepoint(event.pos):
                             self._handle_action(action)
                             handled = True
@@ -2122,7 +2149,7 @@ class BehaviorEditorApp:
                     world_point = self.screen_to_world(event.pos)
                     self.mouse_world = world_point
                     if world_point is None:
-                        if self.active_text_input is not None:
+                        if self.active_text.input is not None:
                             self.commit_text_input()
                         continue
                     if self.point_edit_target is not None:
