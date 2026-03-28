@@ -35,6 +35,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.edit_mode = 'none'
         self.facility_options = [
             {'id': 'wall', 'type': 'wall', 'team': 'neutral', 'label': '中立墙体'},
+            {'id': 'dead_zone', 'type': 'dead_zone', 'team': 'neutral', 'label': '死区'},
             {'id': 'red_base', 'type': 'base', 'team': 'red', 'label': '红方基地'},
             {'id': 'red_outpost', 'type': 'outpost', 'team': 'red', 'label': '红方前哨站'},
             {'id': 'red_dog_hole', 'type': 'dog_hole', 'team': 'red', 'label': '红方狗洞'},
@@ -158,6 +159,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.facility_overlay_surface = None
         self.facility_overlay_cache_key = None
         self.facility_overlay_size = None
+        self.projectile_overlay_surface = None
+        self.projectile_overlay_size = None
         self.ai_navigation_overlay_surface = None
         self.ai_navigation_overlay_size = None
         self.terrain_3d_window = None
@@ -182,6 +185,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.terrain_view_mode = '3d'
         self.terrain_shape_mode = 'circle'
         self.selected_hud_entity_id = None
+        self.robot_detail_page = 0
         self.robot_detail_rect = None
         self.show_facilities = config.get('simulator', {}).get('show_facilities', False)
         self.show_aim_fov = config.get('simulator', {}).get('show_aim_fov', False)
@@ -626,6 +630,102 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         }
         return fallback_map.get(region_type, region_id or region_type or '未知区域')
 
+    def _region_function_lines(self, region):
+        if region is None:
+            return []
+        region_type = str(region.get('type', ''))
+        region_team = str(region.get('team', 'neutral'))
+        team_label = '己方' if region_team in {'red', 'blue'} else '该区域'
+        descriptions = {
+            'wall': ['阻挡机器人通行', '可按墙高决定是否遮挡视野'],
+            'base': ['主基地目标区域', '敌方前哨被破后这里会成为最终推进目标'],
+            'outpost': ['前置核心目标区域', '前哨失守后会解锁后续推基地阶段'],
+            'supply': [f'{team_label}补给区', '英雄和步兵缺弹时会优先来此补弹'],
+            'fort': [f'{team_label}堡垒区域', '用于据守、卡位和火力覆盖'],
+            'dog_hole': ['低矮穿越通道', '适合隐蔽通过，但会压缩移动路线'],
+            'undulating_road': ['起伏路段', '提供掩体感路线，但机动更复杂'],
+            'rugged_road': ['复杂起伏路段', '用于机动绕行和地形博弈'],
+            'fly_slope': ['飞坡通道', '可快速切换上下层路线'],
+            'first_step': ['一级台阶区域', '用于上台阶过渡'],
+            'second_step': ['二级台阶区域', '用于进入更高台面'],
+            'mining_area': [f'{team_label}取矿区', '工程机器人只会在这里采矿'],
+            'mineral_exchange': [f'{team_label}兑矿区', '工程携矿后会回这里完成兑换'],
+            'energy_mechanism': ['中央能量机关', '满足条件时会来此激活能量机关'],
+            'buff_base': ['基地增益区', '用于基地附近的增益/机制判定'],
+            'buff_outpost': ['前哨增益区', '用于前哨附近的增益/机制判定'],
+            'buff_fort': ['堡垒增益区', '用于堡垒附近的增益/机制判定'],
+            'buff_supply': ['补给增益区', '用于补给区相关增益判定'],
+            'buff_hero_deployment': [f'{team_label}英雄部署区', '英雄只有在这里才能进入部署模式并吊射敌方前哨/基地'],
+            'buff_central_highland': ['中央高地区域', '步兵/英雄会争夺这里建立高点火力'],
+            'buff_trapezoid_highland': [f'{team_label}梯形高地区域', '英雄开局会优先争夺这里建立吊射位'],
+            'buff_terrain_highland_red_start': ['高地跨越路线起点', '仅用于导航/跨越路线提示'],
+            'buff_terrain_highland_red_end': ['高地跨越路线终点', '仅用于导航/跨越路线提示'],
+            'buff_terrain_highland_blue_start': ['高地跨越路线起点', '仅用于导航/跨越路线提示'],
+            'buff_terrain_highland_blue_end': ['高地跨越路线终点', '仅用于导航/跨越路线提示'],
+            'buff_terrain_road_red_start': ['公路跨越路线起点', '仅用于导航/跨越路线提示'],
+            'buff_terrain_road_red_end': ['公路跨越路线终点', '仅用于导航/跨越路线提示'],
+            'buff_terrain_road_blue_start': ['公路跨越路线起点', '仅用于导航/跨越路线提示'],
+            'buff_terrain_road_blue_end': ['公路跨越路线终点', '仅用于导航/跨越路线提示'],
+            'buff_terrain_fly_slope_red_start': ['飞坡跨越路线起点', '仅用于导航/跨越路线提示'],
+            'buff_terrain_fly_slope_red_end': ['飞坡跨越路线终点', '仅用于导航/跨越路线提示'],
+            'buff_terrain_fly_slope_blue_start': ['飞坡跨越路线起点', '仅用于导航/跨越路线提示'],
+            'buff_terrain_fly_slope_blue_end': ['飞坡跨越路线终点', '仅用于导航/跨越路线提示'],
+            'buff_terrain_slope_red_start': ['陡道跨越路线起点', '仅用于导航/跨越路线提示'],
+            'buff_terrain_slope_red_end': ['陡道跨越路线终点', '仅用于导航/跨越路线提示'],
+            'buff_terrain_slope_blue_start': ['陡道跨越路线起点', '仅用于导航/跨越路线提示'],
+            'buff_terrain_slope_blue_end': ['陡道跨越路线终点', '仅用于导航/跨越路线提示'],
+        }
+        return descriptions.get(region_type, ['区域机制说明未定义'])
+
+    def _preferred_hover_region(self, regions):
+        if not regions:
+            return None
+        for region in regions:
+            if region.get('type') != 'boundary':
+                return region
+        return regions[0]
+
+    def _hover_region_at_world(self, map_manager, world_pos):
+        if map_manager is None or world_pos is None:
+            return None
+        return self._preferred_hover_region(map_manager.get_regions_at(world_pos[0], world_pos[1]))
+
+    def _draw_region_hover_card(self, surface, region, anchor_pos, clamp_rect=None):
+        if surface is None or region is None or anchor_pos is None:
+            return
+        label = self._region_display_label(region)
+        team_text = f"队伍: {region.get('team', 'neutral')}"
+        detail = str(region.get('id', ''))
+        function_lines = self._region_function_lines(region)
+        text_surfaces = [
+            self.small_font.render(label, True, self.colors['white']),
+            self.tiny_font.render(detail, True, (214, 220, 228)) if detail else None,
+            self.tiny_font.render(team_text, True, (214, 220, 228)),
+        ]
+        for line in function_lines:
+            text_surfaces.append(self.tiny_font.render(f'功能: {line}', True, (240, 244, 248)))
+        width = max(rendered.get_width() for rendered in text_surfaces if rendered is not None) + 20
+        height = 12
+        for rendered in text_surfaces:
+            if rendered is None:
+                continue
+            height += rendered.get_height() + 4
+        height += 4
+        tooltip = pygame.Surface((width, height), pygame.SRCALPHA)
+        tooltip.fill((18, 24, 30, 228))
+        pygame.draw.rect(tooltip, (245, 247, 250, 180), tooltip.get_rect(), 1, border_radius=8)
+        y = 8
+        for rendered in text_surfaces:
+            if rendered is None:
+                continue
+            tooltip.blit(rendered, (10, y))
+            y += rendered.get_height() + 4
+        if clamp_rect is None:
+            clamp_rect = surface.get_rect()
+        box_x = min(clamp_rect.right - width - 8, max(clamp_rect.x + 8, anchor_pos[0] + 16))
+        box_y = min(clamp_rect.bottom - height - 8, max(clamp_rect.y + 8, anchor_pos[1] + 16))
+        surface.blit(tooltip, (box_x, box_y))
+
     def _point_to_segment_distance(self, point, start, end):
         px, py = point
         x1, y1 = start
@@ -693,6 +793,11 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         if not map_rect.collidepoint(mouse_pos):
             return None
 
+        if self.mouse_world is not None:
+            hovered = self._hover_region_at_world(map_manager, self.mouse_world)
+            if hovered is not None:
+                return hovered
+
         nearest = None
         nearest_distance = None
         for region in map_manager.get_facility_regions():
@@ -710,22 +815,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         region = self._hovered_region(map_manager)
         if region is None:
             return
-        label = self._region_display_label(region)
-        detail = str(region.get('id', ''))
-        text = self.small_font.render(label, True, self.colors['white'])
-        detail_text = self.tiny_font.render(detail, True, (214, 220, 228)) if detail else None
-        width = max(text.get_width(), detail_text.get_width() if detail_text else 0) + 18
-        height = text.get_height() + (detail_text.get_height() + 4 if detail_text else 0) + 14
-        mouse_x, mouse_y = pygame.mouse.get_pos()
-        box_x = min(self.window_width - width - 8, mouse_x + 16)
-        box_y = min(self.window_height - height - 8, mouse_y + 16)
-        tooltip = pygame.Surface((width, height), pygame.SRCALPHA)
-        tooltip.fill((18, 24, 30, 220))
-        pygame.draw.rect(tooltip, (245, 247, 250, 180), tooltip.get_rect(), 1, border_radius=8)
-        tooltip.blit(text, (9, 7))
-        if detail_text is not None:
-            tooltip.blit(detail_text, (9, 7 + text.get_height() + 4))
-        self.screen.blit(tooltip, (box_x, box_y))
+        self._draw_region_hover_card(self.screen, region, pygame.mouse.get_pos(), clamp_rect=self.screen.get_rect())
 
     def _get_scaled_map_surface(self, map_manager, size):
         source = map_manager.map_image or map_manager.map_surface
@@ -1032,7 +1122,49 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         for entity in entities:
             if entity.is_alive() or entity.type in {'robot', 'sentry'}:
                 self.render_entity(entity)
+        self.render_projectile_traces()
         self.render_ai_navigation_overlay(entities)
+        self.render_hero_deployment_overlay(entities)
+
+    def render_projectile_traces(self):
+        if self.viewport is None or self.game_engine is None:
+            return
+        rules_engine = getattr(self.game_engine, 'rules_engine', None)
+        traces = list(getattr(rules_engine, 'projectile_traces', ())) if rules_engine is not None else []
+        if not traces:
+            return
+        size = (self.window_width, self.window_height)
+        if self.projectile_overlay_surface is None or self.projectile_overlay_size != size:
+            self.projectile_overlay_surface = pygame.Surface(size, pygame.SRCALPHA)
+            self.projectile_overlay_size = size
+        overlay = self.projectile_overlay_surface
+        overlay.fill((0, 0, 0, 0))
+        for trace in traces:
+            start = trace.get('start')
+            end = trace.get('end')
+            if start is None or end is None:
+                continue
+            lifetime = max(1e-6, float(trace.get('lifetime', 0.12)))
+            progress = max(0.0, min(1.0, float(trace.get('elapsed', 0.0)) / lifetime))
+            tail_progress = max(0.0, progress - 0.16)
+            tip_world = (
+                float(start[0]) + (float(end[0]) - float(start[0])) * progress,
+                float(start[1]) + (float(end[1]) - float(start[1])) * progress,
+            )
+            tail_world = (
+                float(start[0]) + (float(end[0]) - float(start[0])) * tail_progress,
+                float(start[1]) + (float(end[1]) - float(start[1])) * tail_progress,
+            )
+            tip = self.world_to_screen(tip_world[0], tip_world[1])
+            tail = self.world_to_screen(tail_world[0], tail_world[1])
+            is_large = trace.get('ammo_type') == '42mm'
+            color_rgb = (255, 184, 90) if is_large else (255, 244, 170)
+            alpha = 220 if is_large else 170
+            width = 4 if is_large else 2
+            radius = 4 if is_large else 2
+            pygame.draw.line(overlay, (*color_rgb, alpha), tail, tip, width)
+            pygame.draw.circle(overlay, (*color_rgb, min(255, alpha + 20)), tip, radius)
+        self.screen.blit(overlay, (0, 0))
 
     def render_ai_navigation_overlay(self, entities):
         if self.viewport is None:
@@ -1046,7 +1178,9 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             waypoint = getattr(entity, 'ai_navigation_waypoint', None)
             path_preview = getattr(entity, 'ai_path_preview', ())
             path_valid = bool(getattr(entity, 'ai_navigation_path_valid', False))
+            path_state = getattr(entity, 'ai_navigation_path_state', 'passable')
             velocity = getattr(entity, 'ai_navigation_velocity', (0.0, 0.0))
+            nav_radius = float(getattr(entity, 'ai_navigation_radius', 0.0))
             if navigation_target is None and movement_target is None and waypoint is None and not path_preview:
                 continue
             if not path_valid and waypoint is None and len(path_preview) < 2 and navigation_target is None and movement_target is None:
@@ -1060,7 +1194,13 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 overlay = self.ai_navigation_overlay_surface
                 overlay.fill((0, 0, 0, 0))
 
-            color_rgb = self.colors['red'] if entity.team == 'red' else self.colors['blue']
+            team_color = self.colors['red'] if entity.team == 'red' else self.colors['blue']
+            if path_state == 'blocked':
+                color_rgb = (255, 120, 120)
+            elif path_state == 'step-passable':
+                color_rgb = self.colors['yellow']
+            else:
+                color_rgb = team_color
             arrow_color = (*color_rgb, 178)
             line_color = (*color_rgb, 140)
             center = self.world_to_screen(entity.position['x'], entity.position['y'])
@@ -1080,6 +1220,9 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 pygame.draw.circle(overlay, (*color_rgb, marker_outline_alpha), marker_pos, 11, 2)
                 pygame.draw.line(overlay, (*color_rgb, marker_outline_alpha), (marker_pos[0] - 6, marker_pos[1]), (marker_pos[0] + 6, marker_pos[1]), 2)
                 pygame.draw.line(overlay, (*color_rgb, marker_outline_alpha), (marker_pos[0], marker_pos[1] - 6), (marker_pos[0], marker_pos[1] + 6), 2)
+                if nav_radius > 1.0:
+                    radius_px = max(8, int(nav_radius * self.viewport['scale']))
+                    pygame.draw.circle(overlay, (*color_rgb, 64), marker_pos, radius_px, 1)
 
             arrow_dx = float(velocity[0])
             arrow_dy = float(velocity[1])
@@ -1108,6 +1251,39 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 pygame.draw.polygon(overlay, (*color_rgb, arrow_alpha), [end_pos, left, right])
         if overlay is not None:
             self.screen.blit(overlay, (0, 0))
+
+    def render_hero_deployment_overlay(self, entities):
+        if self.viewport is None or self.game_engine is None:
+            return
+        overlay = None
+        labels = []
+        for entity in entities:
+            if not entity.is_alive() or getattr(entity, 'robot_type', '') != '英雄':
+                continue
+            if not bool(getattr(entity, 'hero_deployment_active', False)):
+                continue
+            target = self._resolve_target_entity(entity)
+            if target is None or target.type not in {'outpost', 'base'} or not target.is_alive():
+                continue
+            if overlay is None:
+                overlay = pygame.Surface((self.window_width, self.window_height), pygame.SRCALPHA)
+            start = self.world_to_screen(entity.position['x'], entity.position['y'])
+            end = self.world_to_screen(target.position['x'], target.position['y'])
+            glow_layers = [
+                ((82, 255, 214, 36), 9),
+                ((82, 255, 214, 72), 5),
+                ((205, 255, 242, 220), 2),
+            ]
+            for color, width in glow_layers:
+                pygame.draw.line(overlay, color, start, end, width)
+            pygame.draw.circle(overlay, (82, 255, 214, 160), end, 10, 2)
+            hit_probability = float(getattr(entity, 'hero_deployment_hit_probability', 0.0))
+            labels.append((f'吊射 {hit_probability * 100:.0f}%', (end[0] + 10, end[1] - 16)))
+        if overlay is not None:
+            self.screen.blit(overlay, (0, 0))
+        for text, pos in labels:
+            label = self.tiny_font.render(text, True, (170, 255, 230))
+            self.screen.blit(label, pos)
 
     def render_entity(self, entity):
         x, y = self.world_to_screen(entity.position['x'], entity.position['y'])
@@ -1368,11 +1544,19 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             statuses.append((buff_label, self.colors['yellow']))
         if getattr(entity, 'carried_minerals', 0) > 0:
             statuses.append((f'矿物 x{int(entity.carried_minerals)}', self.colors['green']))
+        heat_lock_state = getattr(entity, 'heat_lock_state', 'normal')
+        if heat_lock_state == 'cooling_unlock':
+            statuses.append(('热量锁定', self.colors['yellow']))
+        elif heat_lock_state == 'match_locked':
+            statuses.append(('发射机构锁死', self.colors['red']))
         target = self._resolve_target_entity(entity)
         if target is not None and entity.is_alive() and self.game_engine is not None:
             distance = math.hypot(target.position['x'] - entity.position['x'], target.position['y'] - entity.position['y'])
             hit_probability = self.game_engine.rules_engine.calculate_hit_probability(entity, target, distance)
-            motion_label = self.game_engine.rules_engine.describe_target_motion(target)
+            if bool(getattr(entity, 'hero_deployment_active', False)) and target.type in {'outpost', 'base'}:
+                motion_label = '部署吊射'
+            else:
+                motion_label = self.game_engine.rules_engine.describe_target_motion(target)
             statuses.append((f'{motion_label} {hit_probability * 100:.0f}%', self.colors['white']))
         if not statuses:
             return
@@ -1906,6 +2090,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 return False
             if event.key == pygame.K_ESCAPE and self.selected_hud_entity_id is not None:
                 self.selected_hud_entity_id = None
+                self.robot_detail_page = 0
                 self.robot_detail_rect = None
                 return True
             if event.key == pygame.K_ESCAPE and self.edit_mode == 'terrain' and (self.polygon_points or self.slope_region_points):
@@ -2041,6 +2226,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 return True
             if self.selected_hud_entity_id is not None and self.robot_detail_rect is not None and not self.robot_detail_rect.collidepoint(event.pos):
                 self.selected_hud_entity_id = None
+                self.robot_detail_page = 0
                 self.robot_detail_rect = None
                 return True
 
@@ -2147,7 +2333,14 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             return
         if action == 'close_robot_detail':
             self.selected_hud_entity_id = None
+            self.robot_detail_page = 0
             self.robot_detail_rect = None
+            return
+        if action.startswith('robot_detail_page:'):
+            try:
+                self.robot_detail_page = max(0, min(1, int(action.split(':', 1)[1])))
+            except ValueError:
+                self.robot_detail_page = 0
             return
         if action == 'delete_selected_terrain':
             self._delete_selected_terrain_cells(game_engine)
@@ -2178,6 +2371,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         if action.startswith('hud_unit:'):
             entity_id = action.split(':', 1)[1]
             self.selected_hud_entity_id = entity_id or None
+            self.robot_detail_page = 0
             return
         if action.startswith('entity_mode:'):
             _, entity_id, field_name, value = action.split(':', 3)

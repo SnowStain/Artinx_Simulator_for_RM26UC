@@ -127,6 +127,11 @@ class RulesEngine:
                 'ammo_per_shot': 1,
                 'power_per_shot': 6.0,
                 'heat_per_shot': 12.0,
+                'heat_gain_17mm': 10.0,
+                'heat_gain_42mm': 100.0,
+                'heat_detection_hz': 10.0,
+                'heat_soft_lock_margin_17mm': 100.0,
+                'heat_soft_lock_margin_42mm': 200.0,
                 'overheat_lock_duration': 5.0,
                 'armor_center_height_m': 0.15,
                 'turret_axis_height_m': 0.45,
@@ -164,6 +169,14 @@ class RulesEngine:
                 'fast_spin_threshold_deg_per_sec': 300.0,
                 'evasive_spin_duration': 1.8,
                 'evasive_spin_rate_deg': 420.0,
+                'hero_deployment_structure_fire': {
+                    'max_hit_probability': 0.8,
+                    'min_hit_probability': 0.3,
+                    'optimal_distance_m': 6.0,
+                    'falloff_end_distance_m': 24.0,
+                    'target_types': ['outpost', 'base'],
+                },
+                'hero_mobile_accuracy_mult': 0.7,
             },
             'control_modes': {
                 'chassis': {
@@ -498,6 +511,7 @@ class RulesEngine:
         }
         self.terrain_cross_types = {'fly_slope', 'undulating_road', 'first_step', 'second_step', 'dog_hole'}
         self.auto_aim_max_distance = self._meters_to_world_units(self.rules['shooting']['auto_aim_max_distance_m'])
+        self.projectile_traces = []
         self.collision_damage_cooldowns = {}
         self.game_time = 0.0
         self.game_duration = float(self.rules.get('game_duration', 420.0))
@@ -558,6 +572,29 @@ class RulesEngine:
             cooling_mult *= self.rules['terrain_cross']['cooling_mult']
         return base_rate * cooling_mult
 
+    def _heat_gain_per_shot(self, entity):
+        ammo_type = getattr(entity, 'ammo_type', None)
+        shooting_rules = self.rules.get('shooting', {})
+        if ammo_type == '42mm':
+            return float(shooting_rules.get('heat_gain_42mm', 100.0))
+        if ammo_type == '17mm':
+            return float(shooting_rules.get('heat_gain_17mm', 10.0))
+        return float(getattr(entity, 'heat_gain_per_shot', shooting_rules.get('heat_per_shot', 0.0)))
+
+    def _heat_soft_lock_threshold(self, entity):
+        shooting_rules = self.rules.get('shooting', {})
+        ammo_type = getattr(entity, 'ammo_type', None)
+        margin = shooting_rules.get('heat_soft_lock_margin_42mm', 200.0) if ammo_type == '42mm' else shooting_rules.get('heat_soft_lock_margin_17mm', 100.0)
+        return float(getattr(entity, 'max_heat', 0.0)) + float(margin)
+
+    def _set_heat_lock_state(self, entity, state, reason=''):
+        entity.heat_lock_state = state
+        entity.heat_lock_reason = reason if state != 'normal' else ''
+        entity.heat_ui_disabled = state != 'normal'
+        if state != 'normal':
+            entity.fire_control_state = 'idle'
+            entity.auto_aim_locked = False
+
     def get_entity_rule_snapshot(self, entity):
         shooting = self.rules['shooting']
         control_modes = self.rules['control_modes']
@@ -568,7 +605,7 @@ class RulesEngine:
             'effective_fire_rate_hz': float(self.get_effective_fire_rate_hz(entity)),
             'ammo_per_shot': int(getattr(entity, 'ammo_per_shot', shooting['ammo_per_shot'])),
             'power_per_shot': float(self.get_effective_power_per_shot(entity)),
-            'heat_per_shot': float(getattr(entity, 'heat_gain_per_shot', shooting['heat_per_shot'])),
+            'heat_per_shot': float(self._heat_gain_per_shot(entity)),
             'overheat_lock_duration': float(shooting['overheat_lock_duration']),
             'armor_center_height_m': float(shooting['armor_center_height_m']),
             'turret_axis_height_m': float(shooting.get('turret_axis_height_m', shooting.get('camera_height_m', 0.45))),
@@ -602,6 +639,12 @@ class RulesEngine:
         return base_cost * float(chassis_profile.get('power_cost_mult', 1.0))
 
     def get_effective_fire_rate_hz(self, entity):
+        if getattr(entity, 'heat_lock_state', 'normal') != 'normal':
+            return 0.0
+        if getattr(entity, 'robot_type', '') == '英雄' and getattr(entity, 'ammo_type', None) == '42mm':
+            next_shot_heat = self._heat_gain_per_shot(entity)
+            if float(getattr(entity, 'heat', 0.0)) + float(next_shot_heat) > float(getattr(entity, 'max_heat', 0.0)) + 1e-6:
+                return 0.0
         base_rate = float(getattr(entity, 'fire_rate_hz', self.rules['shooting']['fire_rate_hz']))
         chassis_profile = self._chassis_mode_profile(entity)
         gimbal_profile = self._gimbal_mode_profile(entity)
@@ -647,6 +690,10 @@ class RulesEngine:
 
     def _target_armor_height_m(self, target):
         armor_height = float(self.rules.get('shooting', {}).get('armor_center_height_m', 0.15))
+        if getattr(target, 'type', None) == 'outpost':
+            armor_height = max(armor_height, 0.45)
+        elif getattr(target, 'type', None) == 'base':
+            armor_height = max(armor_height, 0.60)
         return self._entity_ground_height_m(target) + armor_height
 
     def _estimate_local_terrain_pitch_rad(self, map_manager, start_x, start_y, end_x, end_y):
@@ -825,12 +872,14 @@ class RulesEngine:
         if game_duration is not None:
             self.game_duration = float(game_duration)
         self._latest_entities = list(entities)
+        self._update_projectile_traces(dt)
         for entity in entities:
             if entity.type in {'robot', 'sentry'}:
                 entity.auto_aim_limit = self.auto_aim_max_distance
         self._update_entity_timers(entities, dt)
         self._update_gold(entities, dt)
         self._update_sentry_posture_and_heat(entities, dt)
+        self._update_heat_mechanism(entities, dt)
 
         if map_manager is not None:
             self._facility_update_accumulator += dt
@@ -888,6 +937,12 @@ class RulesEngine:
 
     def _update_entity_timers(self, entities, dt):
         for entity in entities:
+            refreshed_attackers = []
+            for attacker in list(getattr(entity, 'recent_attackers', [])):
+                attacker['time_left'] = max(0.0, float(attacker.get('time_left', 0.0)) - dt)
+                if attacker['time_left'] > 0.0:
+                    refreshed_attackers.append(attacker)
+            entity.recent_attackers = refreshed_attackers
             self._expire_buff_path_progress(entity)
             entity.shot_cooldown = max(0.0, getattr(entity, 'shot_cooldown', 0.0) - dt)
             entity.overheat_lock_timer = max(0.0, getattr(entity, 'overheat_lock_timer', 0.0) - dt)
@@ -971,12 +1026,101 @@ class RulesEngine:
         self._sync_legacy_ammo(entity)
         return consumed
 
+    def entity_has_barrel(self, entity):
+        if entity.type == 'sentry':
+            return True
+        if entity.type != 'robot':
+            return False
+        return getattr(entity, 'robot_type', '') != '工程'
+
+    def _can_use_hero_deployment_fire(self, shooter):
+        return (
+            getattr(shooter, 'type', None) == 'robot'
+            and getattr(shooter, 'robot_type', '') == '英雄'
+            and bool(getattr(shooter, 'hero_deployment_active', False))
+            and bool(getattr(shooter, 'hero_deployment_zone_active', False))
+            and self._available_ammo(shooter) > 0
+        )
+
+    def _resolve_hero_deployment_target(self, shooter, entities):
+        if not self._can_use_hero_deployment_fire(shooter):
+            return None
+        deployment_rules = self.rules.get('shooting', {}).get('hero_deployment_structure_fire', {})
+        allowed_types = tuple(deployment_rules.get('target_types', ['outpost', 'base']))
+        candidates = []
+        for entity in entities:
+            if entity.team == shooter.team or not entity.is_alive() or entity.type not in allowed_types:
+                continue
+            if entity.type == 'base' and self.is_base_shielded(entity):
+                continue
+            if not self.has_line_of_sight(shooter, entity):
+                continue
+            priority = 0 if entity.type == 'outpost' else 1
+            distance = math.hypot(entity.position['x'] - shooter.position['x'], entity.position['y'] - shooter.position['y'])
+            candidates.append((priority, distance, entity))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return candidates[0][2]
+
     def is_out_of_combat(self, entity):
         disengage_duration = float(self.rules.get('combat', {}).get('disengage_duration', 6.0))
         return (self.game_time - float(getattr(entity, 'last_combat_time', -1e9))) >= disengage_duration
 
     def _mark_in_combat(self, entity):
         entity.last_combat_time = self.game_time
+
+    def _track_recent_attack(self, target, shooter, damage):
+        if target is None or shooter is None:
+            return
+        retained = []
+        for attacker in list(getattr(target, 'recent_attackers', [])):
+            if float(attacker.get('time_left', 0.0)) > 0.0 and attacker.get('id') != getattr(shooter, 'id', None):
+                retained.append(attacker)
+        retained.append({
+            'id': getattr(shooter, 'id', None),
+            'team': getattr(shooter, 'team', None),
+            'type': getattr(shooter, 'type', None),
+            'robot_type': getattr(shooter, 'robot_type', None),
+            'damage': float(damage),
+            'time_left': 2.2,
+        })
+        target.recent_attackers = retained[-6:]
+
+    def _projectile_speed_world_units(self, ammo_type):
+        if ammo_type == '42mm':
+            return self._meters_to_world_units(17.0)
+        return self._meters_to_world_units(23.0)
+
+    def _spawn_projectile_trace(self, shooter, target):
+        if shooter is None or target is None:
+            return
+        ammo_type = getattr(shooter, 'ammo_type', '17mm')
+        start_x = float(shooter.position['x'])
+        start_y = float(shooter.position['y'])
+        end_x = float(target.position['x'])
+        end_y = float(target.position['y'])
+        distance = math.hypot(end_x - start_x, end_y - start_y)
+        speed = max(1.0, self._projectile_speed_world_units(ammo_type))
+        lifetime = min(0.45, max(0.05, distance / speed))
+        self.projectile_traces.append({
+            'team': getattr(shooter, 'team', None),
+            'ammo_type': ammo_type,
+            'start': (start_x, start_y),
+            'end': (end_x, end_y),
+            'elapsed': 0.0,
+            'lifetime': lifetime,
+        })
+        if len(self.projectile_traces) > 96:
+            self.projectile_traces = self.projectile_traces[-96:]
+
+    def _update_projectile_traces(self, dt):
+        active_traces = []
+        for trace in list(getattr(self, 'projectile_traces', [])):
+            trace['elapsed'] = float(trace.get('elapsed', 0.0)) + float(dt)
+            if float(trace.get('elapsed', 0.0)) <= float(trace.get('lifetime', 0.0)):
+                active_traces.append(trace)
+        self.projectile_traces = active_traces
 
     def _queue_pending_rule_event(self, entity, event_type, delay, payload):
         entity.pending_rule_events.append({
@@ -1095,6 +1239,11 @@ class RulesEngine:
             entity.active_buff_labels.append('大能量机关增益')
         if getattr(entity, 'hero_deployment_active', False):
             entity.active_buff_labels.append('英雄部署模式')
+        heat_lock_state = getattr(entity, 'heat_lock_state', 'normal')
+        if heat_lock_state == 'cooling_unlock':
+            entity.active_buff_labels.append('热量锁定')
+        elif heat_lock_state == 'match_locked':
+            entity.active_buff_labels.append('发射机构永久锁定')
         if getattr(entity, 'respawn_invalid_timer', 0.0) > 0.0:
             entity.active_buff_labels.append('复活无效态')
         if self._is_respawn_weak(entity):
@@ -1510,7 +1659,7 @@ class RulesEngine:
         entity.mining_timer += dt
         if entity.mining_timer < max(0.1, entity.mining_target_duration):
             return
-        mined_amount = int(self.rules.get('mining', {}).get('minerals_per_trip', 1))
+        mined_amount = self._minerals_per_trip()
         entity.carried_minerals += mined_amount
         entity.carried_mineral_type = '标准矿石'
         entity.mined_minerals_total = int(getattr(entity, 'mined_minerals_total', 0)) + mined_amount
@@ -1521,6 +1670,8 @@ class RulesEngine:
 
     def _handle_exchange_zone(self, entity, region, dt):
         if getattr(entity, 'robot_type', '') != '工程' or entity.type != 'robot':
+            return
+        if region.get('team') not in {entity.team}:
             return
         if getattr(entity, 'carried_minerals', 0) <= 0:
             entity.exchange_timer = 0.0
@@ -1546,6 +1697,14 @@ class RulesEngine:
         entity.exchange_timer = 0.0
         entity.exchange_target_duration = self._mining_duration(exchange=True)
         self._log(f'{entity.id} 在兑矿区完成兑矿，队伍获得 {gold_gain:.0f} 金币', entity.team)
+
+    def _minerals_per_trip(self):
+        raw = self.rules.get('mining', {}).get('minerals_per_trip', 2)
+        try:
+            amount = int(raw)
+        except (TypeError, ValueError):
+            amount = 2
+        return max(1, min(3, amount))
 
     def _try_purchase_role_ammo(self, entity):
         if entity.type != 'robot' or getattr(entity, 'robot_type', '') not in {'英雄', '步兵'}:
@@ -1712,9 +1871,27 @@ class RulesEngine:
             effective_power_limit = max(0.0, float(getattr(entity, 'max_power', 0.0)) * float(getattr(entity, 'dynamic_power_capacity_mult', 1.0)))
             entity.power = min(float(getattr(entity, 'power', 0.0)), effective_power_limit)
 
-            base_cooling = entity.heat_dissipation_rate * dt
-            desired_cooling = entity.heat_dissipation_rate * total_cooling_mult * dt
-            entity.heat = max(0.0, entity.heat - (desired_cooling - base_cooling))
+    def _update_heat_mechanism(self, entities, dt):
+        detection_hz = max(1.0, float(self.rules.get('shooting', {}).get('heat_detection_hz', 10.0)))
+        tick_interval = 1.0 / detection_hz
+        for entity in entities:
+            if entity.type not in {'robot', 'sentry'}:
+                continue
+            if not entity.is_alive():
+                continue
+            if not self.entity_has_barrel(entity):
+                continue
+            entity.heat_cooling_accumulator = float(getattr(entity, 'heat_cooling_accumulator', 0.0)) + dt
+            tick_count = int(entity.heat_cooling_accumulator / tick_interval)
+            if tick_count <= 0:
+                continue
+            entity.heat_cooling_accumulator -= tick_count * tick_interval
+            cooling_per_tick = self.get_current_cooling_rate(entity) / detection_hz
+            if cooling_per_tick > 0.0:
+                entity.heat = max(0.0, float(getattr(entity, 'heat', 0.0)) - cooling_per_tick * tick_count)
+            if getattr(entity, 'heat_lock_state', 'normal') == 'cooling_unlock' and float(getattr(entity, 'heat', 0.0)) <= 1e-6:
+                self._set_heat_lock_state(entity, 'normal')
+                self._log(f'{entity.id} 发射机构冷却归零，解除热量锁定', entity.team)
 
     def _update_occupied_facilities(self, entities, map_manager):
         for team in ['red', 'blue']:
@@ -1749,6 +1926,8 @@ class RulesEngine:
             self._reset_dynamic_effects(entity)
             entity.fort_buff_active = False
             entity.hero_deployment_zone_active = False
+            entity.hero_deployment_target_id = None
+            entity.hero_deployment_hit_probability = 0.0
             if getattr(entity, 'robot_type', '') != '英雄':
                 entity.hero_deployment_charge = 0.0
                 entity.hero_deployment_active = False
@@ -1765,6 +1944,9 @@ class RulesEngine:
 
             for region in regions:
                 region_type = region.get('type')
+                if region_type == 'dead_zone':
+                    self._apply_dead_zone_penalty(entity)
+                    break
                 if self._is_respawn_weak(entity) and self._respawn_safe_zone_reached(entity, regions):
                     invalid_elapsed = float(getattr(entity, 'respawn_invalid_elapsed', 0.0))
                     invalid_timer = float(getattr(entity, 'respawn_invalid_timer', 0.0))
@@ -1808,12 +1990,27 @@ class RulesEngine:
                 entity.hero_deployment_charge = 0.0
                 entity.hero_deployment_active = False
                 entity.hero_deployment_state = 'inactive'
+                entity.hero_deployment_target_id = None
+                entity.hero_deployment_hit_probability = 0.0
+
+            if not entity.is_alive():
+                entity.traversal_state = None
+                continue
 
             if facility and facility.get('type') in self.terrain_cross_types and self._terrain_access_allowed(entity, facility):
                 self._update_traversal_progress(entity, facility, dt)
             else:
                 self._finish_traversal_if_needed(entity)
                 entity.traversal_state = None
+
+    def _apply_dead_zone_penalty(self, entity):
+        if getattr(entity, 'permanent_eliminated', False):
+            return
+        entity.permanent_eliminated = True
+        entity.elimination_reason = 'dead_zone'
+        entity.health = 0.0
+        entity.front_gun_locked = True
+        self.handle_destroy(entity)
 
     def _update_traversal_progress(self, entity, facility, dt):
         state = getattr(entity, 'traversal_state', None)
@@ -1873,6 +2070,8 @@ class RulesEngine:
                 continue
             if self._is_respawn_weak(shooter):
                 continue
+            if not self.entity_has_barrel(shooter):
+                continue
             if shooter.type == 'sentry' and getattr(shooter, 'front_gun_locked', False):
                 continue
             if getattr(shooter, 'fire_control_state', 'idle') != 'firing':
@@ -1880,6 +2079,8 @@ class RulesEngine:
             if getattr(shooter, 'respawn_timer', 0.0) > 0 or getattr(shooter, 'shot_cooldown', 0.0) > 0:
                 continue
             if getattr(shooter, 'overheat_lock_timer', 0.0) > 0 or self._available_ammo(shooter) <= 0:
+                continue
+            if getattr(shooter, 'heat_lock_state', 'normal') != 'normal':
                 continue
             if self.get_effective_fire_rate_hz(shooter) <= 0.0:
                 continue
@@ -1891,15 +2092,19 @@ class RulesEngine:
             self._consume_shot(shooter)
             distance = math.hypot(target.position['x'] - shooter.position['x'], target.position['y'] - shooter.position['y'])
             hit_probability = self.calculate_hit_probability(shooter, target, distance)
+            self._spawn_projectile_trace(shooter, target)
             if random.random() <= hit_probability:
                 damage = self.calculate_damage(shooter, target)
                 if damage > 0:
                     self._mark_in_combat(shooter)
                     self._mark_in_combat(target)
                     target.take_damage(damage)
+                    self._track_recent_attack(target, shooter, damage)
                     self._trigger_evasive_spin(target, shooter)
 
     def _resolve_autoaim_target(self, shooter, entities):
+        if self._can_use_hero_deployment_fire(shooter):
+            return self._resolve_hero_deployment_target(shooter, entities)
         max_distance = self.get_range(shooter.type)
         locked_target = self._get_locked_autoaim_target(shooter, entities, max_distance)
         if locked_target is not None:
@@ -1955,21 +2160,18 @@ class RulesEngine:
         effective_fire_rate = self.get_effective_fire_rate_hz(shooter)
         shooter.shot_cooldown = 1.0 / max(effective_fire_rate, 1e-6)
         shooter.power = max(0.0, float(getattr(shooter, 'power', 0.0)) - self.get_effective_power_per_shot(shooter))
-        shooter.heat += float(getattr(shooter, 'heat_gain_per_shot', self.rules['shooting']['heat_per_shot']))
+        shooter.heat += self._heat_gain_per_shot(shooter)
         self._mark_in_combat(shooter)
-        if shooter.heat >= shooter.max_heat:
-            shooter.heat = shooter.max_heat
-            was_locked = getattr(shooter, 'overheat_lock_timer', 0.0) > 0.0
-            shooter.overheat_lock_timer = max(
-                float(getattr(shooter, 'overheat_lock_timer', 0.0)),
-                float(self.rules['shooting']['overheat_lock_duration']),
-            )
-            shooter.fire_control_state = 'idle'
-            if not was_locked:
-                self._log(
-                    f'{shooter.id} 枪口过热，发射机构锁定 {self.rules["shooting"]["overheat_lock_duration"]:.1f} 秒',
-                    shooter.team,
-                )
+        soft_limit = float(getattr(shooter, 'max_heat', 0.0))
+        hard_limit = self._heat_soft_lock_threshold(shooter)
+        if shooter.heat > hard_limit + 1e-6:
+            if getattr(shooter, 'heat_lock_state', 'normal') != 'match_locked':
+                self._set_heat_lock_state(shooter, 'match_locked', '热量超过致命阈值')
+                self._log(f'{shooter.id} 热量超过上限保护阈值，发射机构本局永久锁定', shooter.team)
+        elif shooter.heat > soft_limit + 1e-6:
+            if getattr(shooter, 'heat_lock_state', 'normal') == 'normal':
+                self._set_heat_lock_state(shooter, 'cooling_unlock', '热量超限待冷却归零')
+                self._log(f'{shooter.id} 热量超限，发射机构锁定直至热量冷却归零', shooter.team)
 
     def get_range(self, entity_type):
         if entity_type in {'robot', 'sentry'}:
@@ -1981,6 +2183,9 @@ class RulesEngine:
             return 0.0
         if self.is_base_shielded(target):
             return 0.0
+
+        if self._can_use_hero_deployment_fire(shooter) and getattr(target, 'type', None) in {'outpost', 'base'}:
+            return self._calculate_hero_deployment_hit_probability(shooter, target, distance)
 
         if distance is None:
             distance = math.hypot(
@@ -1995,10 +2200,36 @@ class RulesEngine:
             return 0.0
 
         probability = self._get_auto_aim_accuracy(distance, target)
+        if getattr(shooter, 'robot_type', '') == '英雄' and not self._can_use_hero_deployment_fire(shooter):
+            translating_speed = self._meters_to_world_units(self.rules['shooting'].get('motion_thresholds', {}).get('translating_target_speed_mps', 0.45))
+            shooter_speed = math.hypot(float(getattr(shooter, 'velocity', {}).get('vx', 0.0)), float(getattr(shooter, 'velocity', {}).get('vy', 0.0)))
+            if shooter_speed >= translating_speed:
+                probability *= float(self.rules['shooting'].get('hero_mobile_accuracy_mult', 0.7))
         probability *= self._hit_probability_multiplier(shooter)
         if self._is_fast_spinning_target(target):
             probability *= float(self.rules['shooting'].get('fast_spin_hit_multiplier', 0.6))
         return max(0.0, min(1.0, probability))
+
+    def _calculate_hero_deployment_hit_probability(self, shooter, target, distance=None):
+        if not self._can_use_hero_deployment_fire(shooter):
+            return 0.0
+        if target is None or not target.is_alive() or target.team == shooter.team or target.type not in {'outpost', 'base'}:
+            return 0.0
+        if not self.has_line_of_sight(shooter, target):
+            return 0.0
+        if distance is None:
+            distance = math.hypot(target.position['x'] - shooter.position['x'], target.position['y'] - shooter.position['y'])
+        deployment_rules = self.rules.get('shooting', {}).get('hero_deployment_structure_fire', {})
+        max_probability = float(deployment_rules.get('max_hit_probability', 0.8))
+        min_probability = float(deployment_rules.get('min_hit_probability', 0.3))
+        optimal_distance = self._meters_to_world_units(float(deployment_rules.get('optimal_distance_m', 6.0)))
+        falloff_end_distance = self._meters_to_world_units(float(deployment_rules.get('falloff_end_distance_m', 24.0)))
+        if distance <= optimal_distance:
+            return max_probability
+        if distance >= falloff_end_distance:
+            return min_probability
+        progress = (distance - optimal_distance) / max(falloff_end_distance - optimal_distance, 1e-6)
+        return max_probability + (min_probability - max_probability) * progress
 
     def _get_turret_angle_diff(self, shooter, target):
         desired_angle = self._desired_turret_angle(shooter, target)
@@ -2210,6 +2441,12 @@ class RulesEngine:
         entity.hero_deployment_active = False
         entity.hero_deployment_zone_active = False
         entity.hero_deployment_state = 'inactive'
+        entity.hero_deployment_target_id = None
+        entity.hero_deployment_hit_probability = 0.0
+        entity.heat_lock_state = 'normal'
+        entity.heat_lock_reason = ''
+        entity.heat_ui_disabled = False
+        entity.heat_cooling_accumulator = 0.0
         entity.carried_minerals = 0
         entity.mining_timer = 0.0
         entity.exchange_timer = 0.0
@@ -2222,6 +2459,16 @@ class RulesEngine:
             return
 
         if entity.type in {'robot', 'sentry'}:
+            if getattr(entity, 'permanent_eliminated', False):
+                entity.respawn_duration = 0.0
+                entity.respawn_timer = 0.0
+                entity.state = 'destroyed'
+                entity.front_gun_locked = True
+                entity.heat_lock_state = 'permanent_lock'
+                entity.heat_lock_reason = 'dead_zone'
+                entity.heat_ui_disabled = True
+                self._log(f'{entity.id} 进入死区，被直接罚下，本局无法再次上线', entity.team)
+                return
             entity.respawn_duration = self._calculate_respawn_read_duration(entity)
             entity.respawn_timer = entity.respawn_duration
             entity.state = 'respawning'
@@ -2234,6 +2481,8 @@ class RulesEngine:
             self._log(f'{entity.team}前哨站被摧毁！', entity.team)
 
     def _respawn_entity(self, entity, respawn_mode='normal'):
+        if getattr(entity, 'permanent_eliminated', False):
+            return
         respawn_position = dict(getattr(entity, 'respawn_position', entity.position))
         entity.position = respawn_position
         entity.previous_position = dict(respawn_position)
@@ -2280,6 +2529,12 @@ class RulesEngine:
         entity.hero_deployment_active = False
         entity.hero_deployment_zone_active = False
         entity.hero_deployment_state = 'inactive'
+        entity.hero_deployment_target_id = None
+        entity.hero_deployment_hit_probability = 0.0
+        entity.heat_lock_state = 'normal'
+        entity.heat_lock_reason = ''
+        entity.heat_ui_disabled = False
+        entity.heat_cooling_accumulator = 0.0
         entity.carried_minerals = 0
         entity.mining_timer = 0.0
         entity.exchange_timer = 0.0

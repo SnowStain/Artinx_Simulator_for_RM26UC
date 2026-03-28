@@ -122,7 +122,7 @@ class EntityManager:
         entity.can_climb_steps = entity_type in {'robot', 'sentry'}
         if entity_type == 'sentry':
             entity.step_climb_duration_sec = 1.0
-            entity.max_terrain_step_height_m = 0.23
+            entity.max_terrain_step_height_m = 0.35
             entity.collision_radius = 24.0
             entity.wheel_count = 4
             return
@@ -141,22 +141,22 @@ class EntityManager:
             return
         if robot_type == '步兵':
             entity.step_climb_duration_sec = 1.0
-            entity.max_terrain_step_height_m = 0.30
+            entity.max_terrain_step_height_m = 0.35
             entity.collision_radius = 16.0
             entity.wheel_count = 2
         elif robot_type == '英雄':
             entity.step_climb_duration_sec = 1.0
-            entity.max_terrain_step_height_m = 0.23
+            entity.max_terrain_step_height_m = 0.35
             entity.collision_radius = 20.0
             entity.wheel_count = 4
         elif robot_type == '工程':
             entity.step_climb_duration_sec = 1.0
-            entity.max_terrain_step_height_m = 0.23
+            entity.max_terrain_step_height_m = 0.35
             entity.collision_radius = 21.0
             entity.wheel_count = 4
         else:
             entity.step_climb_duration_sec = 1.0
-            entity.max_terrain_step_height_m = 0.23
+            entity.max_terrain_step_height_m = 0.35
             entity.collision_radius = 18.0
             entity.wheel_count = 4
     
@@ -352,6 +352,10 @@ class EntityManager:
                 'target': entity.target,
                 'power': entity.power,
                 'heat': entity.heat,
+                'heat_lock_state': entity.heat_lock_state,
+                'heat_lock_reason': entity.heat_lock_reason,
+                'heat_ui_disabled': entity.heat_ui_disabled,
+                'heat_cooling_accumulator': entity.heat_cooling_accumulator,
                 'ammo': entity.ammo,
                 'allowed_ammo_17mm': entity.allowed_ammo_17mm,
                 'allowed_ammo_42mm': entity.allowed_ammo_42mm,
@@ -383,6 +387,8 @@ class EntityManager:
                 'respawn_mode': entity.respawn_mode,
                 'instant_respawn_count': entity.instant_respawn_count,
                 'death_handled': entity.death_handled,
+                'permanent_eliminated': entity.permanent_eliminated,
+                'elimination_reason': entity.elimination_reason,
                 'fort_buff_active': entity.fort_buff_active,
                 'terrain_buff_timer': entity.terrain_buff_timer,
                 'supply_cooldown': entity.supply_cooldown,
@@ -405,6 +411,8 @@ class EntityManager:
                 'buff_cooldowns': dict(entity.buff_cooldowns),
                     'buff_path_progress': dict(entity.buff_path_progress),
                 'assembly_buff_time_used': entity.assembly_buff_time_used,
+                'hero_deployment_target_id': entity.hero_deployment_target_id,
+                'hero_deployment_hit_probability': entity.hero_deployment_hit_probability,
                 'last_combat_time': entity.last_combat_time,
                 'pending_rule_events': list(entity.pending_rule_events),
                 'front_gun_locked': entity.front_gun_locked,
@@ -431,6 +439,10 @@ class EntityManager:
             entity.target = state.get('target', entity.target)
             entity.power = state.get('power', entity.power)
             entity.heat = state.get('heat', entity.heat)
+            entity.heat_lock_state = state.get('heat_lock_state', entity.heat_lock_state)
+            entity.heat_lock_reason = state.get('heat_lock_reason', entity.heat_lock_reason)
+            entity.heat_ui_disabled = state.get('heat_ui_disabled', entity.heat_ui_disabled)
+            entity.heat_cooling_accumulator = state.get('heat_cooling_accumulator', entity.heat_cooling_accumulator)
             entity.ammo = state.get('ammo', entity.ammo)
             entity.allowed_ammo_17mm = state.get('allowed_ammo_17mm', entity.allowed_ammo_17mm)
             entity.allowed_ammo_42mm = state.get('allowed_ammo_42mm', entity.allowed_ammo_42mm)
@@ -462,6 +474,8 @@ class EntityManager:
             entity.respawn_mode = state.get('respawn_mode', entity.respawn_mode)
             entity.instant_respawn_count = state.get('instant_respawn_count', entity.instant_respawn_count)
             entity.death_handled = state.get('death_handled', entity.death_handled)
+            entity.permanent_eliminated = state.get('permanent_eliminated', entity.permanent_eliminated)
+            entity.elimination_reason = state.get('elimination_reason', entity.elimination_reason)
             entity.fort_buff_active = state.get('fort_buff_active', entity.fort_buff_active)
             entity.terrain_buff_timer = state.get('terrain_buff_timer', entity.terrain_buff_timer)
             entity.supply_cooldown = state.get('supply_cooldown', entity.supply_cooldown)
@@ -484,6 +498,8 @@ class EntityManager:
             entity.buff_cooldowns = dict(state.get('buff_cooldowns', entity.buff_cooldowns))
             entity.buff_path_progress = dict(state.get('buff_path_progress', entity.buff_path_progress))
             entity.assembly_buff_time_used = state.get('assembly_buff_time_used', entity.assembly_buff_time_used)
+            entity.hero_deployment_target_id = state.get('hero_deployment_target_id', entity.hero_deployment_target_id)
+            entity.hero_deployment_hit_probability = state.get('hero_deployment_hit_probability', entity.hero_deployment_hit_probability)
             entity.last_combat_time = state.get('last_combat_time', entity.last_combat_time)
             entity.pending_rule_events = list(state.get('pending_rule_events', entity.pending_rule_events))
             entity.front_gun_locked = state.get('front_gun_locked', entity.front_gun_locked)

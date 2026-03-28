@@ -39,6 +39,7 @@ class MapManager:
             'base': 11,
             'custom_terrain': 12,
             'rugged_road': 13,
+            'dead_zone': 14,
         }
         self.terrain_label_by_code = {
             0: '平地',
@@ -55,6 +56,7 @@ class MapManager:
             11: '基地',
             12: '自定义地形',
             13: '起伏路段',
+            14: '死区',
         }
         self.height_map = None
         self.terrain_type_map = None
@@ -68,6 +70,7 @@ class MapManager:
             'wall',
             'rugged_road',
             'dog_hole',
+            'dead_zone',
             'second_step',
             'first_step',
             'fly_slope',
@@ -81,6 +84,7 @@ class MapManager:
         self._region_query_default_rank = len(self.terrain_priority) + 32
         self._regions_query_cache = {}
         self._regions_query_cache_version = -1
+        self._lpa_planner_cache = {}
         self._load_facilities_from_config()
         self._load_terrain_grid_from_config()
 
@@ -89,6 +93,7 @@ class MapManager:
         self.raster_version += 1
         self._regions_query_cache.clear()
         self._regions_query_cache_version = self.raster_version
+        self._lpa_planner_cache.clear()
 
     def _terrain_cell_key(self, grid_x, grid_y):
         return f'{int(grid_x)},{int(grid_y)}'
@@ -1034,6 +1039,9 @@ class MapManager:
     def upsert_facility_region(self, facility_id, facility_type, x1, y1, x2, y2, team='neutral'):
         """新增或更新矩形设施区域。"""
         existing = self.get_facility_by_id(facility_id)
+        if existing is not None and facility_type == 'dead_zone' and existing.get('type') == facility_type:
+            facility_id = self._next_variant_id(facility_id, 'rect')
+            existing = None
         normalized = {
             'id': facility_id,
             'type': facility_type,
@@ -1186,12 +1194,144 @@ class MapManager:
         if start == goal:
             return [start_point, end_point]
 
-        frontier_heap = []
-        heappush(frontier_heap, (self._nav_heuristic(start, goal, step), start))
-        parents = {}
-        seen = {start}
-        closed = set()
-        iteration_count = 0
+        planner = self._get_lpa_planner(
+            goal=goal,
+            step=step,
+            max_height_delta_m=max_height_delta_m,
+            traversal_profile=traversal_profile,
+        )
+        return self._lpa_find_path(
+            planner=planner,
+            start=start,
+            start_point=start_world,
+            end_point=goal_world,
+            max_iterations=max_iterations,
+            max_runtime_sec=max_runtime_sec,
+        )
+
+    def _nav_profile_signature(self, traversal_profile, max_height_delta_m):
+        traversal_profile = traversal_profile or {}
+        return (
+            round(float(max_height_delta_m), 3),
+            round(float(traversal_profile.get('collision_radius', 0.0)), 2),
+            bool(traversal_profile.get('can_climb_steps', False)),
+        )
+
+    def _planner_cache_key(self, goal, step, traversal_profile, max_height_delta_m):
+        return (
+            goal,
+            int(step),
+            int(self.raster_version),
+            self._nav_profile_signature(traversal_profile, max_height_delta_m),
+        )
+
+    def _get_lpa_planner(self, goal, step, max_height_delta_m, traversal_profile=None):
+        cache_key = self._planner_cache_key(goal, step, traversal_profile, max_height_delta_m)
+        planner = self._lpa_planner_cache.get(cache_key)
+        if planner is None:
+            planner = {
+                'goal': goal,
+                'step': int(step),
+                'traversal_profile': dict(traversal_profile or {}),
+                'max_height_delta_m': float(max_height_delta_m),
+                'g': {},
+                'rhs': {goal: 0.0},
+                'open_heap': [],
+                'inconsistent': {goal},
+                'query_start': goal,
+                'passable_cache': {},
+                'height_cache': {},
+                'edge_cost_cache': {},
+                'transition_cache': {},
+                'last_used': time.perf_counter(),
+            }
+            self._lpa_rebuild_open_heap(planner)
+            self._lpa_planner_cache[cache_key] = planner
+            self._trim_lpa_planner_cache()
+        planner['last_used'] = time.perf_counter()
+        return planner
+
+    def _trim_lpa_planner_cache(self):
+        max_planners = 24
+        if len(self._lpa_planner_cache) <= max_planners:
+            return
+        ordered = sorted(self._lpa_planner_cache.items(), key=lambda item: item[1].get('last_used', 0.0))
+        for cache_key, _ in ordered[:-max_planners]:
+            self._lpa_planner_cache.pop(cache_key, None)
+
+    def _lpa_find_path(self, planner, start, start_point, end_point, max_iterations=None, max_runtime_sec=None):
+        self._lpa_set_query_start(planner, start)
+        solved = self._lpa_compute_shortest_path(
+            planner,
+            start,
+            max_iterations=max_iterations,
+            max_runtime_sec=max_runtime_sec,
+        )
+        if not solved:
+            return []
+        return self._lpa_reconstruct_path(planner, start, start_point, end_point)
+
+    def _lpa_set_query_start(self, planner, start):
+        if planner.get('query_start') == start:
+            return
+        planner['query_start'] = start
+        self._lpa_rebuild_open_heap(planner)
+
+    def _lpa_rebuild_open_heap(self, planner):
+        planner['open_heap'] = []
+        for node in tuple(planner.get('inconsistent', ())):
+            if not self._lpa_is_inconsistent(planner, node):
+                planner['inconsistent'].discard(node)
+                continue
+            key = self._lpa_calculate_key(planner, node)
+            heappush(planner['open_heap'], (key[0], key[1], node))
+
+    def _lpa_g(self, planner, node):
+        return float(planner['g'].get(node, float('inf')))
+
+    def _lpa_rhs(self, planner, node):
+        return float(planner['rhs'].get(node, float('inf')))
+
+    def _lpa_is_inconsistent(self, planner, node):
+        return abs(self._lpa_g(planner, node) - self._lpa_rhs(planner, node)) > 1e-6 or (
+            math.isinf(self._lpa_g(planner, node)) != math.isinf(self._lpa_rhs(planner, node))
+        )
+
+    def _lpa_calculate_key(self, planner, node):
+        query_start = planner.get('query_start') or planner['goal']
+        best = min(self._lpa_g(planner, node), self._lpa_rhs(planner, node))
+        return (
+            best + self._nav_heuristic(node, query_start, planner['step']),
+            best,
+        )
+
+    def _lpa_key_less(self, key_a, key_b):
+        return key_a[0] < key_b[0] - 1e-6 or (
+            abs(key_a[0] - key_b[0]) <= 1e-6 and key_a[1] < key_b[1] - 1e-6
+        )
+
+    def _lpa_peek_open(self, planner):
+        while planner['open_heap']:
+            key1, key2, node = planner['open_heap'][0]
+            if node not in planner['inconsistent']:
+                heappop(planner['open_heap'])
+                continue
+            current_key = self._lpa_calculate_key(planner, node)
+            if abs(key1 - current_key[0]) > 1e-6 or abs(key2 - current_key[1]) > 1e-6:
+                heappop(planner['open_heap'])
+                heappush(planner['open_heap'], (current_key[0], current_key[1], node))
+                continue
+            return key1, key2, node
+        return None
+
+    def _lpa_pop_open(self, planner):
+        top = self._lpa_peek_open(planner)
+        if top is None:
+            return None
+        heappop(planner['open_heap'])
+        return top
+
+    def _lpa_compute_shortest_path(self, planner, start, max_iterations=None, max_runtime_sec=None):
         iteration_limit = int(max_iterations) if max_iterations is not None else 2500
         if iteration_limit <= 0:
             iteration_limit = 1
@@ -1201,32 +1341,155 @@ class MapManager:
             if runtime > 0:
                 deadline = time.perf_counter() + runtime
 
-        while frontier_heap:
+        iteration_count = 0
+        start_key = self._lpa_calculate_key(planner, start)
+        while True:
+            top = self._lpa_peek_open(planner)
+            start_inconsistent = self._lpa_is_inconsistent(planner, start)
+            if top is None:
+                break
+            top_key = (top[0], top[1])
+            start_key = self._lpa_calculate_key(planner, start)
+            if not (self._lpa_key_less(top_key, start_key) or start_inconsistent):
+                break
             iteration_count += 1
             if iteration_count > iteration_limit:
                 break
             if deadline is not None and time.perf_counter() >= deadline:
                 break
-            current = self._expand_greedy_frontier(
-                frontier_heap=frontier_heap,
-                parents=parents,
-                seen=seen,
-                closed=closed,
-                target_cell=goal,
-                step=step,
-                max_height_delta_m=max_height_delta_m,
-                traversal_profile=traversal_profile,
-            )
-            if current == goal:
-                return self._reconstruct_nav_path(
-                    parents,
-                    current,
-                    step,
-                    start_world,
-                    goal_world,
-                )
 
-        return []
+            _, _, node = self._lpa_pop_open(planner)
+            if self._lpa_g(planner, node) > self._lpa_rhs(planner, node):
+                planner['g'][node] = self._lpa_rhs(planner, node)
+                planner['inconsistent'].discard(node)
+                for predecessor in self._lpa_predecessors(planner, node):
+                    self._lpa_update_vertex(planner, predecessor)
+            else:
+                planner['g'][node] = float('inf')
+                planner['inconsistent'].discard(node)
+                self._lpa_update_vertex(planner, node)
+                for predecessor in self._lpa_predecessors(planner, node):
+                    self._lpa_update_vertex(planner, predecessor)
+
+        return not self._lpa_is_inconsistent(planner, start) and not math.isinf(self._lpa_g(planner, start))
+
+    def _lpa_update_vertex(self, planner, node):
+        if node != planner['goal']:
+            best_rhs = float('inf')
+            for successor in self._lpa_successors(planner, node):
+                edge_cost = self._lpa_edge_cost(planner, node, successor)
+                if math.isinf(edge_cost):
+                    continue
+                candidate_rhs = edge_cost + self._lpa_g(planner, successor)
+                if candidate_rhs < best_rhs:
+                    best_rhs = candidate_rhs
+            planner['rhs'][node] = best_rhs
+        if self._lpa_is_inconsistent(planner, node):
+            planner['inconsistent'].add(node)
+            key = self._lpa_calculate_key(planner, node)
+            heappush(planner['open_heap'], (key[0], key[1], node))
+        else:
+            planner['inconsistent'].discard(node)
+
+    def _lpa_is_cell_passable(self, planner, cell):
+        cache = planner['passable_cache']
+        if cell in cache:
+            return cache[cell]
+        passable = self._is_nav_cell_passable(cell, planner['step'], traversal_profile=planner['traversal_profile'])
+        cache[cell] = passable
+        return passable
+
+    def _lpa_cell_height(self, planner, cell):
+        cache = planner['height_cache']
+        if cell in cache:
+            return cache[cell]
+        world = self._nav_cell_center(cell, planner['step'])
+        height = float(self.get_terrain_height_m(world[0], world[1]))
+        cache[cell] = height
+        return height
+
+    def _lpa_transition(self, planner, current, neighbor):
+        key = (current, neighbor)
+        cache = planner['transition_cache']
+        if key in cache:
+            return cache[key]
+        current_world = self._nav_cell_center(current, planner['step'])
+        neighbor_world = self._nav_cell_center(neighbor, planner['step'])
+        transition = self.get_step_transition(
+            current_world[0],
+            current_world[1],
+            neighbor_world[0],
+            neighbor_world[1],
+            max_height_delta_m=planner['max_height_delta_m'],
+        )
+        cache[key] = transition
+        return transition
+
+    def _lpa_edge_cost(self, planner, current, neighbor):
+        cache_key = (current, neighbor)
+        cache = planner['edge_cost_cache']
+        if cache_key in cache:
+            return cache[cache_key]
+        cost = float('inf')
+        delta_x = int(neighbor[0]) - int(current[0])
+        delta_y = int(neighbor[1]) - int(current[1])
+        if abs(delta_x) <= 1 and abs(delta_y) <= 1 and (delta_x != 0 or delta_y != 0):
+            if self._lpa_is_cell_passable(planner, current) and self._lpa_is_cell_passable(planner, neighbor):
+                if self._is_nav_transition_passable(current, neighbor, planner['step'], traversal_profile=planner['traversal_profile']):
+                    height_delta = abs(self._lpa_cell_height(planner, neighbor) - self._lpa_cell_height(planner, current))
+                    can_climb = bool(planner['traversal_profile'].get('can_climb_steps', False))
+                    if height_delta <= planner['max_height_delta_m'] + 1e-6 or (can_climb and self._lpa_transition(planner, current, neighbor) is not None):
+                        current_world = self._nav_cell_center(current, planner['step'])
+                        neighbor_world = self._nav_cell_center(neighbor, planner['step'])
+                        cost = math.hypot(neighbor_world[0] - current_world[0], neighbor_world[1] - current_world[1])
+        cache[cache_key] = cost
+        return cost
+
+    def _lpa_successors(self, planner, node):
+        for neighbor in self._iter_nav_neighbors(node):
+            if not math.isinf(self._lpa_edge_cost(planner, node, neighbor)):
+                yield neighbor
+
+    def _lpa_predecessors(self, planner, node):
+        for neighbor in self._iter_nav_neighbors(node):
+            if not math.isinf(self._lpa_edge_cost(planner, neighbor, node)):
+                yield neighbor
+
+    def _lpa_reconstruct_path(self, planner, start, start_point, end_point):
+        if math.isinf(self._lpa_g(planner, start)):
+            return []
+        cells = [start]
+        current = start
+        visited = {start}
+        max_cells = max(16, math.ceil(self.map_width / planner['step']) * math.ceil(self.map_height / planner['step']))
+        while current != planner['goal'] and len(cells) <= max_cells:
+            best_neighbor = None
+            best_score = float('inf')
+            for neighbor in self._lpa_successors(planner, current):
+                edge_cost = self._lpa_edge_cost(planner, current, neighbor)
+                successor_cost = self._lpa_g(planner, neighbor)
+                if math.isinf(edge_cost) or math.isinf(successor_cost):
+                    continue
+                total_score = edge_cost + successor_cost
+                if total_score < best_score - 1e-6:
+                    best_score = total_score
+                    best_neighbor = neighbor
+                elif abs(total_score - best_score) <= 1e-6 and best_neighbor is not None:
+                    current_goal_distance = self._nav_heuristic(neighbor, planner['goal'], planner['step'])
+                    best_goal_distance = self._nav_heuristic(best_neighbor, planner['goal'], planner['step'])
+                    if current_goal_distance < best_goal_distance:
+                        best_neighbor = neighbor
+            if best_neighbor is None or best_neighbor in visited:
+                return []
+            visited.add(best_neighbor)
+            cells.append(best_neighbor)
+            current = best_neighbor
+        if current != planner['goal']:
+            return []
+        points = [start_point]
+        points.extend(self._nav_cell_center(cell, planner['step']) for cell in cells[1:-1])
+        points.append(end_point)
+        return self._sparsify_nav_path(points, planner['step'])
 
     def _nav_heuristic(self, cell, target_cell, step):
         cell_world = self._nav_cell_center(cell, step)
@@ -1409,6 +1672,25 @@ class MapManager:
         center_y = (facility['y1'] + facility['y2']) / 2.0
         return -1 if center_y >= self.map_height / 2.0 else 1
 
+    def _segment_intersects_rect_region(self, start_point, end_point, region, padding=0.0):
+        x1 = min(float(region['x1']), float(region['x2'])) - float(padding)
+        x2 = max(float(region['x1']), float(region['x2'])) + float(padding)
+        y1 = min(float(region['y1']), float(region['y2'])) - float(padding)
+        y2 = max(float(region['y1']), float(region['y2'])) + float(padding)
+        start = (float(start_point[0]), float(start_point[1]))
+        end = (float(end_point[0]), float(end_point[1]))
+        if x1 <= start[0] <= x2 and y1 <= start[1] <= y2:
+            return True
+        if x1 <= end[0] <= x2 and y1 <= end[1] <= y2:
+            return True
+        edges = (
+            ((x1, y1), (x2, y1)),
+            ((x2, y1), (x2, y2)),
+            ((x2, y2), (x1, y2)),
+            ((x1, y2), (x1, y1)),
+        )
+        return any(self._segments_intersect(start, end, edge_start, edge_end) for edge_start, edge_end in edges)
+
     def _step_transition_for_facility(self, facility, from_x, from_y, to_x, to_y, max_height_delta_m=None):
         if facility.get('type') not in {'first_step', 'second_step'}:
             return None
@@ -1428,22 +1710,25 @@ class MapManager:
 
         if direction < 0:
             entry_y = float(facility['y2'])
+            top_y = float(facility['y1'])
             moving_ok = float(to_y) < float(from_y)
-            crossing_ok = float(from_y) >= entry_y - margin and float(to_y) <= entry_y + margin
+            crossing_ok = float(from_y) >= entry_y - margin and float(to_y) <= top_y + margin
             near_entry = abs(float(from_y) - entry_y) <= margin * 1.6 or abs(float(to_y) - entry_y) <= margin * 1.6
+            near_top = abs(float(from_y) - top_y) <= margin * 1.6 or abs(float(to_y) - top_y) <= margin * 1.6
             approach_point = (int(round(aligned_x)), int(min(self.map_height - 1, float(facility['y2']) + margin)))
             top_point = (int(round(aligned_x)), int(min(float(facility['y2']) - 1.0, float(facility['y1']) + margin)))
         else:
             entry_y = float(facility['y1'])
+            top_y = float(facility['y2'])
             moving_ok = float(to_y) > float(from_y)
-            crossing_ok = float(from_y) <= entry_y + margin and float(to_y) >= entry_y - margin
+            crossing_ok = float(from_y) <= entry_y + margin and float(to_y) >= top_y - margin
             near_entry = abs(float(from_y) - entry_y) <= margin * 1.6 or abs(float(to_y) - entry_y) <= margin * 1.6
+            near_top = abs(float(from_y) - top_y) <= margin * 1.6 or abs(float(to_y) - top_y) <= margin * 1.6
             approach_point = (int(round(aligned_x)), int(max(0, float(facility['y1']) - margin)))
             top_point = (int(round(aligned_x)), int(max(float(facility['y1']) + 1.0, float(facility['y2']) - margin)))
 
-        if not moving_ok or not (crossing_ok or near_entry):
-            return None
-        if not self._in_rect(to_x, to_y, facility):
+        crosses_stair = self._segment_intersects_rect_region((from_x, from_y), (to_x, to_y), facility, padding=margin * 0.4)
+        if not moving_ok or not crosses_stair or not (crossing_ok or (near_entry and near_top)):
             return None
 
         approach_height_m = self.get_terrain_height_m(approach_point[0], approach_point[1])
@@ -1451,14 +1736,42 @@ class MapManager:
         step_height_m = abs(float(top_height_m) - float(approach_height_m))
         if step_height_m <= 1e-3:
             return None
-        if max_height_delta_m is not None and step_height_m > float(max_height_delta_m) + 1e-6:
+        allowed_height = float(max_height_delta_m) if max_height_delta_m is not None else None
+        if facility.get('type') == 'second_step' and allowed_height is not None:
+            # 二级台阶允许更大的高度差，避免卡在第二级边缘。
+            allowed_height *= 1.35
+        if allowed_height is not None and step_height_m > allowed_height + 1e-6:
             return None
+
+        climb_points = [top_point]
+        if facility.get('type') == 'second_step':
+            depth = max(abs(entry_y - top_y), margin * 1.8)
+            if direction < 0:
+                first_platform_y = int(round(entry_y - max(depth * 0.28, margin * 0.55)))
+                second_contact_y = int(round(entry_y - max(depth * 0.58, margin * 1.05)))
+            else:
+                first_platform_y = int(round(entry_y + max(depth * 0.28, margin * 0.55)))
+                second_contact_y = int(round(entry_y + max(depth * 0.58, margin * 1.05)))
+            intermediate_points = [
+                (int(round(aligned_x)), max(0, min(self.map_height - 1, first_platform_y))),
+                (int(round(aligned_x)), max(0, min(self.map_height - 1, second_contact_y))),
+                top_point,
+            ]
+            climb_points = []
+            seen_points = set()
+            for point in intermediate_points:
+                point_key = (int(point[0]), int(point[1]))
+                if point_key in seen_points:
+                    continue
+                seen_points.add(point_key)
+                climb_points.append(point)
 
         return {
             'facility_id': facility.get('id'),
             'facility_type': facility.get('type'),
             'approach_point': approach_point,
             'top_point': top_point,
+            'climb_points': tuple(climb_points),
             'direction': direction,
             'step_height_m': round(step_height_m, 3),
         }

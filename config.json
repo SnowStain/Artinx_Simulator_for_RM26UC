@@ -65,6 +65,7 @@
     "collision_damping": 0.8,
     "step_height": 15,
     "slope_limit": 30,
+    "normal_max_terrain_step_height_m": 0.35,
     "power_system": {
       "hero": {"max_power": 100, "power_recovery_rate": 1.0},
       "engineer": {"max_power": 80, "power_recovery_rate": 1.2},
@@ -84,6 +85,11 @@
     "game_duration": 420
   },
   "ai": {
+    "path_replan_interval_sec": 0.5,
+    "controller_worker_threads": 1,
+    "path_replans_per_update": 1,
+    "pathfinder_total_budget_ms": 12.0,
+    "pathfinder_max_attempts": 6,
     "strategy": {
       "infantry": {
         "behavior": "patrol",

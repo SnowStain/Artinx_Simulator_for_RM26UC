@@ -1,7 +1,7 @@
 {
   "version": 1,
   "name": "blank_map",
-  "saved_at": "2026-03-27T15:13:22",
+  "saved_at": "2026-03-28T11:17:06",
   "map": {
     "image_path": "场地-俯视图.png",
     "origin_x": 0,
@@ -834,35 +834,6 @@
         "height_m": 0.0
       },
       {
-        "id": "buff_hero_deployment_red_poly_1",
-        "type": "buff_hero_deployment",
-        "team": "red",
-        "shape": "polygon",
-        "points": [
-          [
-            735,
-            291
-          ],
-          [
-            670,
-            281
-          ],
-          [
-            620,
-            333
-          ],
-          [
-            685,
-            374
-          ]
-        ],
-        "x1": 620,
-        "y1": 281,
-        "x2": 735,
-        "y2": 374,
-        "height_m": 0.0
-      },
-      {
         "id": "buff_supply_red_poly_2",
         "type": "buff_supply",
         "team": "red",
@@ -1155,35 +1126,6 @@
         "y1": 422,
         "x2": 889,
         "y2": 518,
-        "height_m": 0.0
-      },
-      {
-        "id": "buff_hero_deployment_blue_poly_1",
-        "type": "buff_hero_deployment",
-        "team": "blue",
-        "shape": "polygon",
-        "points": [
-          [
-            955,
-            542
-          ],
-          [
-            890,
-            499
-          ],
-          [
-            834,
-            549
-          ],
-          [
-            904,
-            593
-          ]
-        ],
-        "x1": 834,
-        "y1": 499,
-        "x2": 955,
-        "y2": 593,
         "height_m": 0.0
       },
       {

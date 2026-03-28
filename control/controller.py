@@ -14,7 +14,7 @@ class Controller:
         self.config = config
         self.manual_controller = ManualController(config)
         ai_config = config.get('ai', {})
-        configured_workers = int(ai_config.get('controller_worker_threads', 2))
+        configured_workers = int(ai_config.get('controller_worker_threads', 1))
         cpu_count = os.cpu_count() or 2
         self._ai_worker_threads = max(1, min(configured_workers, cpu_count))
 

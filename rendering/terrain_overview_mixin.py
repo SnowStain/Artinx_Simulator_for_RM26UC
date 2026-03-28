@@ -466,6 +466,12 @@ class TerrainOverviewMixin:
         editor_top = footer_y + 28
         editor_rect = pygame.Rect(18, editor_top, width - 36, max(220, height - editor_top - bottom_margin))
         self._render_terrain_overview_editor(surface, game_engine, editor_rect)
+        hover_world = self._terrain_overview_hover_world(game_engine)
+        if hover_world is not None:
+            hovered_region = self._hover_region_at_world(map_manager, hover_world)
+            if hovered_region is not None:
+                self.mouse_world = hover_world
+                self._draw_region_hover_card(surface, hovered_region, self.terrain_overview_mouse_pos, clamp_rect=surface.get_rect())
         return surface
 
     def _draw_surface_button(self, surface, rect, label, active):
@@ -1429,6 +1435,16 @@ class TerrainOverviewMixin:
         world_x = max(0, min(map_manager.map_width - 1, int(local_x * map_manager.map_width)))
         world_y = max(0, min(map_manager.map_height - 1, int(local_y * map_manager.map_height)))
         return world_x, world_y
+
+    def _terrain_overview_hover_world(self, game_engine):
+        pos = self.terrain_overview_mouse_pos
+        if pos is None:
+            return None
+        map_manager = game_engine.map_manager
+        world = self._terrain_overview_pos_to_world(pos, map_manager)
+        if world is not None:
+            return world
+        return self._terrain_scene_pos_to_world(pos, game_engine)
 
     def _drag_terrain_view_from_overview(self, pos, map_manager):
         world_pos = self._terrain_overview_pos_to_world(pos, map_manager)

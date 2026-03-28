@@ -42,6 +42,11 @@ class Entity:
         self.max_heat = 100
         self.heat_gain_per_shot = 10
         self.heat_dissipation_rate = 5
+        self.heat_managed_by_rules = True
+        self.heat_lock_state = 'normal'
+        self.heat_lock_reason = ''
+        self.heat_ui_disabled = False
+        self.heat_cooling_accumulator = 0.0
         self.gimbal_mode = 'cooling_priority'
         self.hero_weapon_mode = 'ranged_priority'
         
@@ -66,8 +71,13 @@ class Entity:
         self.ai_movement_target = None
         self.ai_navigation_waypoint = None
         self.ai_path_preview = ()
+        self.ai_navigation_subgoals = ()
         self.ai_navigation_path_valid = False
+        self.ai_navigation_radius = 0.0
         self.ai_navigation_velocity = (0.0, 0.0)
+        self.ai_decision_weights = ()
+        self.ai_decision_top3 = ()
+        self.ai_decision_selected = ''
         self.search_angular_speed = 36.0
         self.fire_rate_hz = 8.0
         self.ammo_per_shot = 1
@@ -92,6 +102,8 @@ class Entity:
         self.respawn_mode = 'normal'
         self.instant_respawn_count = 0
         self.death_handled = False
+        self.permanent_eliminated = False
+        self.elimination_reason = ''
         self.fort_buff_active = False
         self.terrain_buff_timer = 0.0
         self.supply_cooldown = 0.0
@@ -100,7 +112,7 @@ class Entity:
         self.last_combat_time = -1e9
         self.pending_rule_events = []
         self.traversal_state = None
-        self.max_terrain_step_height_m = 0.23
+        self.max_terrain_step_height_m = 0.35
         self.can_climb_steps = True
         self.step_climb_duration_sec = 2.0
         self.step_climb_state = None
@@ -123,6 +135,8 @@ class Entity:
         self.hero_deployment_active = False
         self.hero_deployment_zone_active = False
         self.hero_deployment_state = 'inactive'
+        self.hero_deployment_target_id = None
+        self.hero_deployment_hit_probability = 0.0
         self.carried_minerals = 0
         self.carried_mineral_type = None
         self.mined_minerals_total = 0
@@ -135,6 +149,7 @@ class Entity:
         self.mining_zone_id = None
         self.exchange_zone_id = None
         self.role_purchase_cooldown = 0.0
+        self.recent_attackers = []
     
     def update(self, dt):
         """更新实体状态"""
@@ -166,11 +181,12 @@ class Entity:
         if self.power > power_capacity:
             self.power = power_capacity
         
-        # 更新枪管热量（消散）
-        cooling_mult = max(0.0, float(getattr(self, 'dynamic_cooling_mult', 1.0)))
-        self.heat -= self.heat_dissipation_rate * cooling_mult * dt
-        if self.heat< 0:
-            self.heat = 0
+        # 热量由规则引擎按 10Hz 规则统一处理，避免与实体逐帧冷却叠加。
+        if not bool(getattr(self, 'heat_managed_by_rules', True)):
+            cooling_mult = max(0.0, float(getattr(self, 'dynamic_cooling_mult', 1.0)))
+            self.heat -= self.heat_dissipation_rate * cooling_mult * dt
+            if self.heat < 0:
+                self.heat = 0
     
     def set_position(self, x, y, z=0):
         """设置位置"""

@@ -5,6 +5,7 @@ import math
 import pygame
 import time
 import threading
+from copy import deepcopy
 
 import json
 import os
@@ -40,6 +41,8 @@ class GameEngine:
         self.logs = []
         self.max_logs = 10
         self._auto_aim_update_interval = float(self.config.get('ai', {}).get('auto_aim_update_interval_sec', 0.08))
+        self._auto_aim_switch_score_ratio = float(self.config.get('ai', {}).get('auto_aim_switch_score_ratio', 1.18))
+        self._auto_aim_switch_score_bonus = float(self.config.get('ai', {}).get('auto_aim_switch_score_bonus', 90.0))
         self._last_auto_aim_update = {}
         self._frame_index = 0
         perf_window = int(max(30, self.config.get('simulator', {}).get('perf_sample_window', 20000)))
@@ -63,6 +66,10 @@ class GameEngine:
         self.paused = True
         self.match_started = False
         self._game_over_announced = False
+        self._configured_initial_positions = deepcopy(self.config.get('entities', {}).get('initial_positions', {}))
+
+    def _restore_initial_positions_config(self):
+        self.config.setdefault('entities', {})['initial_positions'] = deepcopy(self._configured_initial_positions)
 
     def _create_systems(self):
         old_controller = getattr(self, 'controller', None)
@@ -106,6 +113,7 @@ class GameEngine:
     def start_new_match(self):
         """按当前配置重开一局。"""
         self.config['rules'] = RulesEngine.build_rule_config(self.config.get('rules', {}))
+        self._restore_initial_positions_config()
         self._create_systems()
         self._reset_runtime_state()
         self._perf_log_session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -131,6 +139,7 @@ class GameEngine:
         self.config['map']['facilities'] = self.map_manager.export_facilities_config()
         self.config['map']['terrain_grid'] = self.map_manager.export_terrain_grid_config()
         self.config['entities']['initial_positions'] = self.entity_manager.export_initial_positions()
+        self._configured_initial_positions = deepcopy(self.config['entities']['initial_positions'])
         self.config['rules'] = RulesEngine.build_rule_config(self.config.get('rules', {}))
         if self.config_manager is not None:
             self.config_manager.config = self.config
@@ -386,34 +395,78 @@ class GameEngine:
                 entity.target = None
                 entity.auto_aim_locked = False
                 entity.fire_control_state = 'idle'
+                self._clear_auto_aim_lock(entity)
                 continue
             if entity.type == 'sentry' and getattr(entity, 'front_gun_locked', False):
                 entity.target = None
                 entity.auto_aim_locked = False
                 entity.fire_control_state = 'idle'
+                self._clear_auto_aim_lock(entity)
                 continue
             if not self.entity_has_barrel(entity):
                 entity.target = None
                 entity.auto_aim_locked = False
                 entity.fire_control_state = 'idle'
+                self._clear_auto_aim_lock(entity)
                 entity.ai_decision = '工程仅保留机械臂，不参与自动射击'
                 continue
             entity.auto_aim_track_speed_deg_per_sec = track_speed
+            entity.hero_deployment_target_id = None
+            entity.hero_deployment_hit_probability = 0.0
             last_update = float(self._last_auto_aim_update.get(entity.id, -1e9))
             cached_target = self._resolve_cached_target_entity(entity)
             should_refresh_target = (self.game_time - last_update) >= self._auto_aim_update_interval
+            base_decision = getattr(entity, 'ai_decision', '')
+
+            if self.rules_engine._can_use_hero_deployment_fire(entity):
+                deployment_target = self.rules_engine._resolve_hero_deployment_target(entity, self.entity_manager.entities)
+                if deployment_target is not None:
+                    distance = self._distance(entity, deployment_target)
+                    entity.target = {
+                        'id': deployment_target.id,
+                        'type': deployment_target.type,
+                        'x': deployment_target.position['x'],
+                        'y': deployment_target.position['y'],
+                        'distance': distance,
+                    }
+                    entity.hero_deployment_target_id = deployment_target.id
+                    desired_angle = self.rules_engine._desired_turret_angle(entity, deployment_target)
+                    current_angle = getattr(entity, 'turret_angle', entity.angle)
+                    angle_diff = self.rules_engine._normalize_angle_diff(desired_angle - current_angle)
+                    max_step = track_speed * self.dt
+                    if abs(angle_diff) <= max_step:
+                        entity.turret_angle = desired_angle
+                    else:
+                        entity.turret_angle = (current_angle + max_step * (1 if angle_diff > 0 else -1)) % 360
+                    hit_probability = self.rules_engine.calculate_hit_probability(entity, deployment_target, distance)
+                    entity.hero_deployment_hit_probability = hit_probability
+                    entity.auto_aim_locked = False
+                    effective_fire_rate = self.rules_engine.get_effective_fire_rate_hz(entity)
+                    entity.fire_control_state = 'firing' if hit_probability > 0.0 and getattr(entity, 'ammo', 0) > 0 and effective_fire_rate > 0 else 'idle'
+                    deploy_text = f'部署吊射 {deployment_target.id}，命中率 {hit_probability * 100:.0f}%'
+                    entity.ai_decision = f'{base_decision} | {deploy_text}' if base_decision else deploy_text
+                else:
+                    entity.target = None
+                    entity.auto_aim_locked = False
+                    entity.fire_control_state = 'idle'
+                    wait_text = '部署模式待机，当前无可视敌方前哨/基地'
+                    entity.ai_decision = f'{base_decision} | {wait_text}' if base_decision else wait_text
+                continue
+
             if should_refresh_target:
                 target = self._select_auto_aim_target(entity, max_distance)
                 self._last_auto_aim_update[entity.id] = self.game_time
             else:
-                target = cached_target
-            base_decision = getattr(entity, 'ai_decision', '')
+                target = cached_target or self._resolve_locked_auto_aim_target_entity(entity, max_distance)
             if target is None:
                 entity.target = None
                 entity.auto_aim_locked = False
                 entity.fire_control_state = 'idle'
+                self._clear_auto_aim_lock(entity)
                 entity.ai_decision = f'{base_decision} | 未发现满足地形可视条件的目标' if base_decision else '未发现满足地形可视条件的目标'
                 continue
+
+            self._refresh_auto_aim_lock(entity, target)
 
             distance = self._distance(entity, target)
             entity.target = {
@@ -437,12 +490,18 @@ class GameEngine:
             effective_fire_rate = self.rules_engine.get_effective_fire_rate_hz(entity)
             entity.fire_control_state = 'firing' if entity.auto_aim_locked and getattr(entity, 'ammo', 0) > 0 and effective_fire_rate > 0 else 'idle'
             if entity.auto_aim_locked:
-                lock_text = f'自瞄锁定 {target.id}'
+                lock_text = f'锁定高价值目标 {target.id}'
             else:
-                lock_text = f'跟踪 {target.id}，角差 {assessment.get("angle_diff", 0.0):.1f}°'
+                lock_text = f'跟踪高价值目标 {target.id}，角差 {assessment.get("angle_diff", 0.0):.1f}°'
             entity.ai_decision = f'{base_decision} | {lock_text}' if base_decision else lock_text
 
     def _resolve_cached_target_entity(self, shooter):
+        locked_target = self._resolve_locked_auto_aim_target_entity(
+            shooter,
+            getattr(self.rules_engine, 'auto_aim_max_distance', 0.0),
+        )
+        if locked_target is not None:
+            return locked_target
         target_state = getattr(shooter, 'target', None)
         if not isinstance(target_state, dict):
             return None
@@ -458,6 +517,112 @@ class GameEngine:
         if not self.rules_engine.can_track_target(shooter, target, distance):
             return None
         return target
+
+    def _clear_auto_aim_lock(self, shooter):
+        shooter.autoaim_locked_target_id = None
+        shooter.autoaim_lock_timer = 0.0
+
+    def _refresh_auto_aim_lock(self, shooter, target):
+        if shooter is None or target is None:
+            self._clear_auto_aim_lock(shooter)
+            return
+        shooter.autoaim_locked_target_id = target.id
+        shooter.autoaim_lock_timer = max(
+            0.05,
+            float(self.rules_engine.rules.get('shooting', {}).get('autoaim_lock_duration', 0.6)),
+        )
+
+    def _resolve_locked_auto_aim_target_entity(self, shooter, max_distance):
+        target_id = getattr(shooter, 'autoaim_locked_target_id', None)
+        if target_id is None or float(getattr(shooter, 'autoaim_lock_timer', 0.0)) <= 0.0:
+            return None
+        target = self.entity_manager.get_entity(target_id)
+        if target is None or not target.is_alive() or target.team == shooter.team:
+            self._clear_auto_aim_lock(shooter)
+            return None
+        distance = self._distance(shooter, target)
+        if distance > max_distance:
+            self._clear_auto_aim_lock(shooter)
+            return None
+        assessment = self.rules_engine.evaluate_auto_aim_target(shooter, target, distance=distance, require_fov=False)
+        if not assessment.get('can_track', False):
+            self._clear_auto_aim_lock(shooter)
+            return None
+        return target
+
+    def _auto_aim_role_key(self, entity):
+        if entity.type == 'sentry':
+            return 'sentry'
+        if entity.type == 'outpost':
+            return 'outpost'
+        if entity.type == 'base':
+            return 'base'
+        return {
+            '英雄': 'hero',
+            '工程': 'engineer',
+            '步兵': 'infantry',
+        }.get(getattr(entity, 'robot_type', ''), 'infantry')
+
+    def _auto_aim_target_score(self, shooter, target, max_distance, assessment=None):
+        if target is None:
+            return float('-inf')
+        if assessment is None:
+            distance = self._distance(shooter, target)
+            assessment = self.rules_engine.evaluate_auto_aim_target(shooter, target, distance=distance, require_fov=False)
+        if not assessment.get('can_track', False):
+            return float('-inf')
+
+        role_key = self._auto_aim_role_key(target)
+        threat_score = {
+            'hero': 320.0,
+            'sentry': 300.0,
+            'infantry': 240.0,
+            'engineer': 100.0,
+            'outpost': 150.0,
+            'base': 110.0,
+        }.get(role_key, 160.0)
+        distance = float(assessment.get('distance', self._distance(shooter, target)))
+        distance_score = max(0.0, 1.0 - distance / max(max_distance, 1e-6)) * 190.0
+        hp_ratio = 1.0
+        if float(getattr(target, 'max_health', 0.0)) > 0.0:
+            hp_ratio = max(0.0, min(1.0, float(getattr(target, 'health', 0.0)) / float(target.max_health)))
+        finish_score = (1.0 - hp_ratio) * 150.0
+        pressure_score = 0.0
+        if getattr(shooter, 'last_damage_source_id', None) == target.id:
+            pressure_score += 120.0
+        target_state = getattr(target, 'target', None)
+        if isinstance(target_state, dict) and target_state.get('id') == shooter.id:
+            pressure_score += 95.0
+        if getattr(target, 'fire_control_state', 'idle') == 'firing':
+            pressure_score += 70.0
+        if bool(getattr(target, 'respawn_weak_active', False)):
+            finish_score += 35.0
+        if assessment.get('can_auto_aim', False):
+            pressure_score += 65.0
+        elif assessment.get('within_fov', False):
+            pressure_score += 25.0
+        return threat_score + distance_score + finish_score + pressure_score
+
+    def _tracked_auto_aim_candidates(self, shooter, max_distance):
+        candidates = []
+        has_combat_target = False
+        for entity in self.entity_manager.entities:
+            if entity.team == shooter.team or not entity.is_alive():
+                continue
+            distance = self._distance(shooter, entity)
+            if distance > max_distance:
+                continue
+            assessment = self.rules_engine.evaluate_auto_aim_target(shooter, entity, distance=distance, require_fov=False)
+            if not assessment.get('can_track', False):
+                continue
+            if entity.type in {'robot', 'sentry'}:
+                has_combat_target = True
+            score = self._auto_aim_target_score(shooter, entity, max_distance, assessment=assessment)
+            candidates.append((score, distance, entity))
+        if has_combat_target:
+            candidates = [candidate for candidate in candidates if candidate[2].type in {'robot', 'sentry'}]
+        candidates.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+        return candidates
 
     def _stabilize_entity_positions(self):
         if self.map_manager is None:
@@ -490,20 +655,22 @@ class GameEngine:
             entity.respawn_position = dict(entity.position)
 
     def _select_auto_aim_target(self, shooter, max_distance):
-        nearest = None
-        nearest_distance = None
-        for entity in self.entity_manager.entities:
-            if entity.team == shooter.team or not entity.is_alive():
-                continue
-            distance = self._distance(shooter, entity)
-            if distance > max_distance:
-                continue
-            if not self.rules_engine.can_track_target(shooter, entity, distance):
-                continue
-            if nearest_distance is None or distance < nearest_distance:
-                nearest = entity
-                nearest_distance = distance
-        return nearest
+        locked_target = self._resolve_locked_auto_aim_target_entity(shooter, max_distance)
+        candidates = self._tracked_auto_aim_candidates(shooter, max_distance)
+        if not candidates:
+            return locked_target
+
+        best_target = candidates[0][2]
+        best_score = candidates[0][0]
+        if locked_target is not None and locked_target.id != best_target.id:
+            locked_score = self._auto_aim_target_score(shooter, locked_target, max_distance)
+            switch_threshold = locked_score * self._auto_aim_switch_score_ratio + self._auto_aim_switch_score_bonus
+            if best_score < switch_threshold:
+                self._refresh_auto_aim_lock(shooter, locked_target)
+                return locked_target
+
+        self._refresh_auto_aim_lock(shooter, best_target)
+        return best_target
 
     def _distance(self, entity_a, entity_b):
         return ((entity_a.position['x'] - entity_b.position['x']) ** 2 + (entity_a.position['y'] - entity_b.position['y']) ** 2) ** 0.5
@@ -709,6 +876,11 @@ class GameEngine:
         if entity is None:
             return None
 
+        def _point_or_none(point):
+            if point is None:
+                return None
+            return (float(point[0]), float(point[1]))
+
         label_map = {
             'robot_1': '1 英雄',
             'robot_2': '2 工程',
@@ -775,6 +947,7 @@ class GameEngine:
             'position_y': float(entity.position.get('y', 0.0)),
             'position_z': float(entity.position.get('z', 0.0)),
             'is_hero': getattr(entity, 'robot_type', '') == '英雄',
+            'hero_has_ammo': getattr(entity, 'robot_type', '') != '英雄' or int(getattr(entity, 'ammo', 0)) > 0,
             'sentry_mode': getattr(entity, 'sentry_mode', 'auto'),
             'state': entity.state,
             'alive': entity.is_alive(),
@@ -786,6 +959,16 @@ class GameEngine:
             'mode_labels': mode_labels,
             'target_id': target.id if target is not None else None,
             'chassis_state': getattr(entity, 'chassis_state', 'normal'),
+            'decision_summary': getattr(entity, 'ai_decision', ''),
+            'decision_selected_id': getattr(entity, 'ai_decision_selected', ''),
+            'decision_weights': [dict(item) for item in getattr(entity, 'ai_decision_weights', ())],
+            'decision_top3': [dict(item) for item in getattr(entity, 'ai_decision_top3', ())],
+            'navigation_target': _point_or_none(getattr(entity, 'ai_navigation_target', None)),
+            'movement_target': _point_or_none(getattr(entity, 'ai_movement_target', None)),
+            'navigation_waypoint': _point_or_none(getattr(entity, 'ai_navigation_waypoint', None)),
+            'navigation_subgoals': [_point_or_none(point) for point in getattr(entity, 'ai_navigation_subgoals', ())[:6]],
+            'navigation_path_preview': [_point_or_none(point) for point in getattr(entity, 'ai_path_preview', ())[:10]],
+            'navigation_path_valid': bool(getattr(entity, 'ai_navigation_path_valid', False)),
             'health': float(entity.health),
             'max_health': float(entity.max_health),
             'ammo': int(getattr(entity, 'ammo', 0)),
@@ -803,6 +986,10 @@ class GameEngine:
             'heat': float(getattr(entity, 'heat', 0.0)),
             'max_heat': float(getattr(entity, 'max_heat', heat_rule.get('max_heat', 0.0))),
             'heat_limit': float(getattr(entity, 'max_heat', heat_rule.get('max_heat', 0.0))),
+            'heat_soft_lock_threshold': float(self.rules_engine._heat_soft_lock_threshold(entity)) if self.entity_has_barrel(entity) else 0.0,
+            'heat_lock_state': getattr(entity, 'heat_lock_state', 'normal'),
+            'heat_lock_reason': getattr(entity, 'heat_lock_reason', ''),
+            'heat_ui_disabled': bool(getattr(entity, 'heat_ui_disabled', False)),
             'heat_gain_per_shot': float(rule_snapshot['heat_per_shot']),
             'base_heat_dissipation_rate': float(getattr(entity, 'heat_dissipation_rate', heat_rule.get('heat_dissipation_rate', 0.0))),
             'current_cooling_rate': float(rule_snapshot['current_cooling_rate']),
@@ -826,6 +1013,8 @@ class GameEngine:
             'hero_deployment_active': bool(getattr(entity, 'hero_deployment_active', False)),
             'hero_deployment_state': getattr(entity, 'hero_deployment_state', 'inactive'),
             'hero_deployment_charge': float(getattr(entity, 'hero_deployment_charge', 0.0)),
+            'hero_deployment_target_id': getattr(entity, 'hero_deployment_target_id', None),
+            'hero_deployment_hit_probability': float(getattr(entity, 'hero_deployment_hit_probability', 0.0)),
             'hero_deployment_delay': float(self.rules_engine.rules.get('buff_zones', {}).get('buff_hero_deployment', {}).get('activation_delay_sec', 2.0)),
             'fire_control_state': getattr(entity, 'fire_control_state', 'idle'),
             'fire_rate_hz': float(rule_snapshot['fire_rate_hz']),
