@@ -32,17 +32,57 @@ def create_terrain_scene_backend(name):
 
 
 def _sample_terrain_scene_data(renderer, map_manager, map_rgb):
+    full_grid_width, full_grid_height = map_manager._grid_dimensions()
+    max_scene_cells = max(12000, int(getattr(renderer, 'terrain_scene_max_cells', 90000)))
+    scene_step = max(1, int(math.ceil(math.sqrt(max((full_grid_width * full_grid_height) / max(max_scene_cells, 1), 1.0)))))
+    cache_key = (
+        int(getattr(map_manager, 'raster_version', 0)),
+        float(map_manager.terrain_grid_cell_size),
+        int(map_manager.map_width),
+        int(map_manager.map_height),
+        int(scene_step),
+        id(map_rgb) if map_rgb is not None else None,
+        str(getattr(renderer, 'terrain_editor_tool', 'terrain')),
+    )
+    if getattr(renderer, 'terrain_scene_sample_cache_key', None) == cache_key:
+        cached = getattr(renderer, 'terrain_scene_sample_cache', None)
+        if cached is not None:
+            return cached
+
     layers = map_manager.get_raster_layers()
     height_map = layers['height_map']
     terrain_type_map = layers['terrain_type_map']
-    grid_width, grid_height = map_manager._grid_dimensions()
-    cell_size = max(map_manager.terrain_grid_cell_size, 1)
-    center_xs = np.minimum(map_manager.map_width - 1, np.arange(grid_width, dtype=np.int32) * cell_size + cell_size // 2)
-    center_ys = np.minimum(map_manager.map_height - 1, np.arange(grid_height, dtype=np.int32) * cell_size + cell_size // 2)
+    grid_width = max(1, int(math.ceil(full_grid_width / scene_step)))
+    grid_height = max(1, int(math.ceil(full_grid_height / scene_step)))
+    base_cell_size = max(float(map_manager.terrain_grid_cell_size), 1.0)
+    cell_size = base_cell_size * scene_step
+    world_center_xs = np.minimum(
+        map_manager.map_width - 1,
+        (np.arange(grid_width, dtype=np.float32) * scene_step + scene_step * 0.5) * base_cell_size,
+    )
+    world_center_ys = np.minimum(
+        map_manager.map_height - 1,
+        (np.arange(grid_height, dtype=np.float32) * scene_step + scene_step * 0.5) * base_cell_size,
+    )
+    center_xs = np.clip(
+        (world_center_xs / max(float(map_manager.runtime_cell_width_world), 1e-6)).astype(np.int32),
+        0,
+        max(0, int(map_manager.runtime_grid_width) - 1),
+    )
+    center_ys = np.clip(
+        (world_center_ys / max(float(map_manager.runtime_cell_height_world), 1e-6)).astype(np.int32),
+        0,
+        max(0, int(map_manager.runtime_grid_height) - 1),
+    )
     sampled_heights = height_map[np.ix_(center_ys, center_xs)]
     sampled_codes = terrain_type_map[np.ix_(center_ys, center_xs)]
     if map_rgb is not None:
-        sampled_base_colors = map_rgb[np.ix_(center_ys, center_xs)]
+        sampled_base_colors = map_rgb[
+            np.ix_(
+                np.clip(world_center_ys.astype(np.int32), 0, map_rgb.shape[0] - 1),
+                np.clip(world_center_xs.astype(np.int32), 0, map_rgb.shape[1] - 1),
+            )
+        ]
     else:
         sampled_base_colors = np.full((grid_height, grid_width, 3), 214, dtype=np.uint8)
 
@@ -50,39 +90,139 @@ def _sample_terrain_scene_data(renderer, map_manager, map_rgb):
         sampled_heights = np.zeros_like(sampled_heights)
         sampled_codes = np.zeros_like(sampled_codes)
 
-    blended_colors = np.empty((grid_height, grid_width, 3), dtype=np.uint8)
-    for grid_y in range(grid_height):
-        for grid_x in range(grid_width):
-            terrain_code = int(sampled_codes[grid_y, grid_x])
-            base_color = sampled_base_colors[grid_y, grid_x]
-            overlay_color = renderer._terrain_color_by_code(terrain_code)
-            if terrain_code == 0:
-                blended_colors[grid_y, grid_x] = base_color
-            else:
-                blended_colors[grid_y, grid_x] = [
-                    min(255, int(base_color[index] * 0.38 + overlay_color[index] * 0.62))
-                    for index in range(3)
-                ]
+    color_lut = getattr(renderer, 'terrain_scene_color_lut', None)
+    if color_lut is None:
+        color_lut = np.zeros((256, 3), dtype=np.uint8)
+        for terrain_code in range(256):
+            color_lut[terrain_code] = renderer._terrain_color_by_code(terrain_code)
+        renderer.terrain_scene_color_lut = color_lut
 
-    return {
+    blended_colors = sampled_base_colors.copy()
+    non_flat_mask = sampled_codes != 0
+    if np.any(non_flat_mask):
+        overlay_colors = color_lut[sampled_codes]
+        source_colors = blended_colors.astype(np.float32)
+        blended = source_colors * 0.45 + overlay_colors.astype(np.float32) * 0.55
+        blended_colors[non_flat_mask] = np.clip(blended[non_flat_mask], 0, 255).astype(np.uint8)
+
+    data = {
         'grid_width': grid_width,
         'grid_height': grid_height,
         'cell_size': cell_size,
+        'scene_step': scene_step,
         'sampled_heights': sampled_heights,
         'sampled_codes': sampled_codes,
         'sampled_base_colors': sampled_base_colors,
         'blended_colors': blended_colors,
     }
+    renderer.terrain_scene_sample_cache_key = cache_key
+    renderer.terrain_scene_sample_cache = data
+    return data
 
 
-def _terrain_scene_focus_grid(renderer, map_manager, grid_width, grid_height):
+def _terrain_scene_focus_grid(renderer, map_manager, grid_width, grid_height, scene_step=1):
     focus_world = getattr(renderer, 'terrain_scene_focus_world', None)
     if focus_world is None:
         return (grid_width - 1) / 2.0, (grid_height - 1) / 2.0
-    focus_grid_x, focus_grid_y = map_manager._world_to_grid(focus_world[0], focus_world[1])
+    sampled_cell_size = max(float(map_manager.terrain_grid_cell_size) * max(1, int(scene_step)), 1e-6)
+    focus_grid_x = int(math.floor(float(focus_world[0]) / sampled_cell_size))
+    focus_grid_y = int(math.floor(float(focus_world[1]) / sampled_cell_size))
     focus_grid_x = max(0, min(grid_width - 1, focus_grid_x))
     focus_grid_y = max(0, min(grid_height - 1, focus_grid_y))
     return float(focus_grid_x), float(focus_grid_y)
+
+
+def _terrain_scene_perspective_matrix(fov_y, aspect, near, far):
+    factor = 1.0 / math.tan(fov_y / 2.0)
+    matrix = np.zeros((4, 4), dtype='f4')
+    matrix[0, 0] = factor / max(aspect, 1e-6)
+    matrix[1, 1] = factor
+    matrix[2, 2] = (far + near) / (near - far)
+    matrix[2, 3] = (2.0 * far * near) / (near - far)
+    matrix[3, 2] = -1.0
+    return matrix
+
+
+def _terrain_scene_look_at(eye, target, up):
+    forward = target - eye
+    forward /= max(np.linalg.norm(forward), 1e-6)
+    right = np.cross(forward, up)
+    right /= max(np.linalg.norm(right), 1e-6)
+    true_up = np.cross(right, forward)
+
+    matrix = np.identity(4, dtype='f4')
+    matrix[0, :3] = right
+    matrix[1, :3] = true_up
+    matrix[2, :3] = -forward
+    matrix[0, 3] = -np.dot(right, eye)
+    matrix[1, 3] = -np.dot(true_up, eye)
+    matrix[2, 3] = np.dot(forward, eye)
+    return matrix
+
+
+def build_terrain_scene_camera_state(renderer, map_manager, size, grid_width, grid_height, max_height, scene_step=1):
+    width, height = int(size[0]), int(size[1])
+    aspect = width / max(height, 1)
+    scene_zoom = max(1.0, float(getattr(renderer, 'terrain_scene_zoom', 1.0)))
+    distance = (max(float(grid_width), float(grid_height)) * 1.28 + max_height * 2.4 + 6.0) / scene_zoom
+    yaw = renderer.terrain_3d_camera_yaw
+    pitch = max(0.20, min(1.15, renderer.terrain_3d_camera_pitch))
+    focus_grid_x, focus_grid_y = _terrain_scene_focus_grid(renderer, map_manager, grid_width, grid_height, scene_step=scene_step)
+    target = np.array([
+        focus_grid_x - grid_width / 2.0 + 0.5,
+        max_height * 0.18 + float(getattr(renderer, 'terrain_3d_camera_focus_height', 0.0)),
+        focus_grid_y - grid_height / 2.0 + 0.5,
+    ], dtype='f4')
+    camera = np.array([
+        math.sin(yaw) * math.cos(pitch) * distance,
+        math.sin(pitch) * distance + max_height * 0.55 + 2.0,
+        math.cos(yaw) * math.cos(pitch) * distance,
+    ], dtype='f4')
+    camera += target
+    projection = _terrain_scene_perspective_matrix(math.radians(52.0), aspect, 0.1, max(distance * 4.0, 200.0))
+    view = _terrain_scene_look_at(camera, target, np.array([0.0, 1.0, 0.0], dtype='f4'))
+    return {
+        'target': target,
+        'camera': camera,
+        'projection': projection,
+        'view': view,
+        'mvp': projection @ view,
+        'distance': distance,
+        'pitch': pitch,
+        'yaw': yaw,
+        'focus_grid_x': focus_grid_x,
+        'focus_grid_y': focus_grid_y,
+        'max_height': max_height,
+    }
+
+
+def _append_face(vertices, p0, p1, p2, p3, color):
+    vertices.extend((*p0, *color, *p1, *color, *p2, *color))
+    vertices.extend((*p0, *color, *p2, *color, *p3, *color))
+
+
+def _extrude_cell_box_vertices(vertices, x0, x1, y0, y1, z0, z1, top_color):
+    bottom_color = [max(0.0, channel * 0.52) for channel in top_color]
+    left_color = [max(0.0, channel * 0.68) for channel in top_color]
+    right_color = [max(0.0, channel * 0.82) for channel in top_color]
+    front_color = [max(0.0, channel * 0.76) for channel in top_color]
+    back_color = [max(0.0, channel * 0.60) for channel in top_color]
+
+    top_nw = (x0, y1, z0)
+    top_ne = (x1, y1, z0)
+    top_se = (x1, y1, z1)
+    top_sw = (x0, y1, z1)
+    bottom_nw = (x0, y0, z0)
+    bottom_ne = (x1, y0, z0)
+    bottom_se = (x1, y0, z1)
+    bottom_sw = (x0, y0, z1)
+
+    _append_face(vertices, top_nw, top_ne, top_se, top_sw, top_color)
+    _append_face(vertices, bottom_sw, bottom_se, bottom_ne, bottom_nw, bottom_color)
+    _append_face(vertices, top_sw, top_nw, bottom_nw, bottom_sw, left_color)
+    _append_face(vertices, top_ne, top_se, bottom_se, bottom_ne, right_color)
+    _append_face(vertices, top_nw, top_ne, bottom_ne, bottom_nw, back_color)
+    _append_face(vertices, top_se, top_sw, bottom_sw, bottom_se, front_color)
 
 
 class SoftwareTerrainSceneBackend:
@@ -113,11 +253,13 @@ class SoftwareTerrainSceneBackend:
         yaw_sin = math.sin(renderer.terrain_3d_camera_yaw)
         pitch = max(0.18, min(1.15, renderer.terrain_3d_camera_pitch))
         scene_zoom = max(1.0, float(getattr(renderer, 'terrain_scene_zoom', 1.0)))
-        center_offset_x, center_offset_y = _terrain_scene_focus_grid(renderer, map_manager, grid_width, grid_height)
+        center_offset_x, center_offset_y = _terrain_scene_focus_grid(renderer, map_manager, grid_width, grid_height, scene_step=data['scene_step'])
+        exaggeration = max(1.0, float(getattr(renderer, 'terrain_scene_vertical_exaggeration', 5.0)))
+        base_thickness = 0.16 * max(1.0, exaggeration * 0.55)
 
         def build_entries(tile_width):
             depth_scale = max(3.0, tile_width * 0.95)
-            height_scale = max(10.0, tile_width * 4.4)
+            height_scale = max(10.0, tile_width * 4.4) * exaggeration
             half_w = max(2.0, tile_width * 0.50)
             half_d = max(2.0, tile_width * 0.28 * pitch)
             entries = []
@@ -136,12 +278,26 @@ class SoftwareTerrainSceneBackend:
                     depth = local_x * yaw_sin + local_y * yaw_cos
                     screen_x = rotated_x * tile_width
                     screen_y = depth * depth_scale * pitch
-                    height_px = height_m * height_scale
-                    min_x = min(min_x, screen_x - half_w)
-                    max_x = max(max_x, screen_x + half_w)
-                    min_y = min(min_y, screen_y - half_d - height_px)
-                    max_y = max(max_y, screen_y + half_d)
-                    entries.append((depth, screen_x, screen_y, height_px, top_color, half_w, half_d))
+                    top_y = screen_y - height_m * height_scale
+                    bottom_y = screen_y + base_thickness * height_scale
+                    top = [
+                        (screen_x, top_y - half_d),
+                        (screen_x + half_w, top_y),
+                        (screen_x, top_y + half_d),
+                        (screen_x - half_w, top_y),
+                    ]
+                    bottom = [
+                        (screen_x, bottom_y - half_d),
+                        (screen_x + half_w, bottom_y),
+                        (screen_x, bottom_y + half_d),
+                        (screen_x - half_w, bottom_y),
+                    ]
+                    for point_x, point_y in top + bottom:
+                        min_x = min(min_x, point_x)
+                        max_x = max(max_x, point_x)
+                        min_y = min(min_y, point_y)
+                        max_y = max(max_y, point_y)
+                    entries.append((depth, screen_x, screen_y, top_y, bottom_y, top_color, half_w, half_d))
 
             return entries, (min_x, max_x, min_y, max_y)
 
@@ -160,29 +316,54 @@ class SoftwareTerrainSceneBackend:
         offset_y = (height - (bounds[3] - bounds[2])) / 2.0 - bounds[2]
 
         cell_entries.sort(key=lambda item: item[0])
-        for _, screen_x, screen_y, height_px, top_color, half_w, half_d in cell_entries:
+        for _, screen_x, screen_y, top_y, bottom_y, top_color, half_w, half_d in cell_entries:
             screen_x += offset_x
-            screen_y += offset_y
+            top_y += offset_y
+            bottom_y += offset_y
             top = [
-                (round(screen_x), round(screen_y - half_d - height_px)),
-                (round(screen_x + half_w), round(screen_y - height_px)),
-                (round(screen_x), round(screen_y + half_d - height_px)),
-                (round(screen_x - half_w), round(screen_y - height_px)),
+                (round(screen_x), round(top_y - half_d)),
+                (round(screen_x + half_w), round(top_y)),
+                (round(screen_x), round(top_y + half_d)),
+                (round(screen_x - half_w), round(top_y)),
+            ]
+            bottom = [
+                (round(screen_x), round(bottom_y - half_d)),
+                (round(screen_x + half_w), round(bottom_y)),
+                (round(screen_x), round(bottom_y + half_d)),
+                (round(screen_x - half_w), round(bottom_y)),
             ]
             left = [
-                (round(screen_x - half_w), round(screen_y - height_px)),
-                (round(screen_x), round(screen_y + half_d - height_px)),
-                (round(screen_x), round(screen_y + half_d)),
-                (round(screen_x - half_w), round(screen_y)),
+                top[3],
+                top[2],
+                bottom[2],
+                bottom[3],
             ]
             right = [
-                (round(screen_x + half_w), round(screen_y - height_px)),
-                (round(screen_x), round(screen_y + half_d - height_px)),
-                (round(screen_x), round(screen_y + half_d)),
-                (round(screen_x + half_w), round(screen_y)),
+                top[1],
+                top[2],
+                bottom[2],
+                bottom[1],
             ]
+            front = [
+                top[2],
+                top[3],
+                bottom[3],
+                bottom[2],
+            ]
+            back = [
+                top[0],
+                top[1],
+                bottom[1],
+                bottom[0],
+            ]
+            bottom_color = tuple(max(0, int(channel * 0.52)) for channel in top_color)
             left_color = tuple(max(0, int(channel * 0.70)) for channel in top_color)
             right_color = tuple(max(0, int(channel * 0.86)) for channel in top_color)
+            front_color = tuple(max(0, int(channel * 0.78)) for channel in top_color)
+            back_color = tuple(max(0, int(channel * 0.62)) for channel in top_color)
+            pygame.draw.polygon(surface, bottom_color, bottom)
+            pygame.draw.polygon(surface, back_color, back)
+            pygame.draw.polygon(surface, front_color, front)
             pygame.draw.polygon(surface, left_color, left)
             pygame.draw.polygon(surface, right_color, right)
             pygame.draw.polygon(surface, top_color, top)
@@ -226,7 +407,7 @@ class ModernGLTerrainSceneBackend:
         self.vbo = None
         self.vao = None
         self.geometry_key = None
-        self.scene_bounds = (1.0, 1.0, 1.0)
+        self.scene_bounds = (1.0, 1.0, 1.0, 1)
         self.status_label = 'moderngl'
 
     def render_scene(self, renderer, game_engine, size, map_rgb=None):
@@ -237,34 +418,27 @@ class ModernGLTerrainSceneBackend:
         self._ensure_framebuffer((width, height))
         self._ensure_geometry(renderer, game_engine.map_manager, map_rgb)
 
-        aspect = width / max(height, 1)
-        grid_width, grid_height, max_height = self.scene_bounds
-        scene_zoom = max(1.0, float(getattr(renderer, 'terrain_scene_zoom', 1.0)))
-        distance = (max(grid_width, grid_height) * 1.28 + max_height * 2.4 + 6.0) / scene_zoom
-        yaw = renderer.terrain_3d_camera_yaw
-        pitch = max(0.20, min(1.15, renderer.terrain_3d_camera_pitch))
-        focus_grid_x, focus_grid_y = _terrain_scene_focus_grid(renderer, game_engine.map_manager, int(grid_width), int(grid_height))
-        target = np.array([
-            focus_grid_x - grid_width / 2.0 + 0.5,
-            max_height * 0.18,
-            focus_grid_y - grid_height / 2.0 + 0.5,
-        ], dtype='f4')
-        camera = np.array([
-            math.sin(yaw) * math.cos(pitch) * distance,
-            math.sin(pitch) * distance + max_height * 0.55 + 2.0,
-            math.cos(yaw) * math.cos(pitch) * distance,
-        ], dtype='f4')
-        camera += target
-
-        projection = self._perspective_matrix(math.radians(52.0), aspect, 0.1, max(distance * 4.0, 200.0))
-        view = self._look_at(camera, target, np.array([0.0, 1.0, 0.0], dtype='f4'))
-        mvp = projection @ view
+        grid_width, grid_height, max_height, scene_step = self.scene_bounds
+        mvp = build_terrain_scene_camera_state(
+            renderer,
+            game_engine.map_manager,
+            size,
+            int(grid_width),
+            int(grid_height),
+            float(max_height),
+            scene_step=int(scene_step),
+        )['mvp']
 
         self.framebuffer.use()
         self.framebuffer.clear(0.87, 0.90, 0.94, 1.0)
         self.ctx.enable(moderngl.DEPTH_TEST)
-        self.ctx.enable(moderngl.CULL_FACE)
-        self.program['u_mvp'].write(mvp.astype('f4').tobytes())
+        # Top faces are generated as a single-sided height field. In the current
+        # camera/axis convention, enabling face culling can reject the entire map.
+        self.ctx.disable(moderngl.CULL_FACE)
+        # CPU-side matrix math here is built in row-major form and also reused by
+        # the picking path. ModernGL/OpenGL uniforms are consumed as column-major,
+        # so transpose before upload to keep GPU rendering aligned with CPU math.
+        self.program['u_mvp'].write(mvp.T.astype('f4').tobytes())
         self.program['u_light_dir'].value = (0.35, 0.92, 0.28)
         self.vao.render(moderngl.TRIANGLES)
 
@@ -281,34 +455,33 @@ class ModernGLTerrainSceneBackend:
         self.framebuffer_size = size
 
     def _ensure_geometry(self, renderer, map_manager, map_rgb):
-        geometry_key = (map_manager.raster_version, map_manager.terrain_grid_cell_size)
+        data = _sample_terrain_scene_data(renderer, map_manager, map_rgb)
+        scene_step = int(data.get('scene_step', 1))
+        geometry_key = (map_manager.raster_version, map_manager.terrain_grid_cell_size, scene_step)
         if self.geometry_key == geometry_key and self.vao is not None:
             return
 
-        data = _sample_terrain_scene_data(renderer, map_manager, map_rgb)
         grid_width = data['grid_width']
         grid_height = data['grid_height']
         sampled_heights = data['sampled_heights']
         blended_colors = data['blended_colors']
         center_offset_x = grid_width / 2.0
         center_offset_y = grid_height / 2.0
-        vertical_scale = 0.82
+        exaggeration = max(1.0, float(getattr(renderer, 'terrain_scene_vertical_exaggeration', 5.0)))
+        vertical_scale = 0.82 * exaggeration
+        base_thickness = 0.16 * max(1.0, exaggeration * 0.55)
         vertices = []
 
         for grid_y in range(grid_height):
             for grid_x in range(grid_width):
                 top_color = [channel / 255.0 for channel in blended_colors[grid_y, grid_x]]
-                height_value = float(sampled_heights[grid_y, grid_x]) * vertical_scale
+                top_y = float(sampled_heights[grid_y, grid_x]) * vertical_scale
+                bottom_y = -base_thickness
                 x0 = grid_x - center_offset_x
                 x1 = x0 + 1.0
                 z0 = grid_y - center_offset_y
                 z1 = z0 + 1.0
-                p0 = (x0, height_value, z0)
-                p1 = (x1, height_value, z0)
-                p2 = (x1, height_value, z1)
-                p3 = (x0, height_value, z1)
-                vertices.extend((*p0, *top_color, *p1, *top_color, *p2, *top_color))
-                vertices.extend((*p0, *top_color, *p2, *top_color, *p3, *top_color))
+                _extrude_cell_box_vertices(vertices, x0, x1, bottom_y, top_y, z0, z1, top_color)
 
         vertex_array = np.array(vertices, dtype='f4')
         if self.vao is not None:
@@ -323,32 +496,13 @@ class ModernGLTerrainSceneBackend:
         self.scene_bounds = (
             max(1.0, float(grid_width)),
             max(1.0, float(grid_height)),
-            max(1.0, float(np.max(sampled_heights) * vertical_scale)),
+            max(1.0, float(np.max(sampled_heights) * vertical_scale + base_thickness)),
+            int(scene_step),
         )
         self.geometry_key = geometry_key
 
     def _perspective_matrix(self, fov_y, aspect, near, far):
-        f = 1.0 / math.tan(fov_y / 2.0)
-        matrix = np.zeros((4, 4), dtype='f4')
-        matrix[0, 0] = f / max(aspect, 1e-6)
-        matrix[1, 1] = f
-        matrix[2, 2] = (far + near) / (near - far)
-        matrix[2, 3] = (2.0 * far * near) / (near - far)
-        matrix[3, 2] = -1.0
-        return matrix
+        return _terrain_scene_perspective_matrix(fov_y, aspect, near, far)
 
     def _look_at(self, eye, target, up):
-        forward = target - eye
-        forward /= max(np.linalg.norm(forward), 1e-6)
-        right = np.cross(forward, up)
-        right /= max(np.linalg.norm(right), 1e-6)
-        true_up = np.cross(right, forward)
-
-        matrix = np.identity(4, dtype='f4')
-        matrix[0, :3] = right
-        matrix[1, :3] = true_up
-        matrix[2, :3] = -forward
-        matrix[0, 3] = -np.dot(right, eye)
-        matrix[1, 3] = -np.dot(true_up, eye)
-        matrix[2, 3] = np.dot(forward, eye)
-        return matrix
+        return _terrain_scene_look_at(eye, target, up)

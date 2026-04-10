@@ -16,6 +16,9 @@ class PhysicsEngine:
         self.default_max_terrain_step_height_m = float(config.get('physics', {}).get('normal_max_terrain_step_height_m', 0.35))
         self.default_step_climb_duration_sec = float(config.get('physics', {}).get('default_step_climb_duration_sec', 1.0))
         self.infantry_step_climb_duration_sec = float(config.get('physics', {}).get('infantry_step_climb_duration_sec', 1.0))
+        self.fly_slope_dead_zone_clearance_m = float(config.get('physics', {}).get('fly_slope_dead_zone_clearance_m', 0.20))
+        self.fly_slope_launch_boost_mps = float(config.get('physics', {}).get('fly_slope_launch_boost_mps', 3.1))
+        self.fly_slope_lateral_preserve = float(config.get('physics', {}).get('fly_slope_lateral_preserve', 0.25))
         self.max_collision_separation_m = float(config.get('physics', {}).get('max_collision_separation_m', 0.10))
         self.collision_slop_m = float(config.get('physics', {}).get('collision_slop_m', 0.02))
 
@@ -36,6 +39,82 @@ class PhysicsEngine:
         pixels_per_meter_x = map_width / max(field_length_m, 1e-6)
         pixels_per_meter_y = map_height / max(field_width_m, 1e-6)
         return float(meters) * ((pixels_per_meter_x + pixels_per_meter_y) / 2.0)
+
+    def _world_units_to_meters(self, world_units):
+        field_length_m = float(self.config.get('map', {}).get('field_length_m', 28.0))
+        field_width_m = float(self.config.get('map', {}).get('field_width_m', 15.0))
+        map_width = float(self.config.get('map', {}).get('width', 1576))
+        map_height = float(self.config.get('map', {}).get('height', 873))
+        pixels_per_meter_x = map_width / max(field_length_m, 1e-6)
+        pixels_per_meter_y = map_height / max(field_width_m, 1e-6)
+        pixels_per_meter = max((pixels_per_meter_x + pixels_per_meter_y) * 0.5, 1e-6)
+        return float(world_units) / pixels_per_meter
+
+    def _fly_slope_ballistic_height_m(self, entity, traversal):
+        if not isinstance(traversal, dict) or traversal.get('facility_type') != 'fly_slope' or traversal.get('direction') != 'forward':
+            return 0.0
+        launch_point = traversal.get('entry_point') or traversal.get('approach_point')
+        landing_point = traversal.get('landing_point') or traversal.get('exit_point')
+        if launch_point is None or landing_point is None:
+            return 0.0
+        launch_x = float(launch_point[0])
+        launch_y = float(launch_point[1])
+        landing_x = float(landing_point[0])
+        landing_y = float(landing_point[1])
+        delta_x = landing_x - launch_x
+        delta_y = landing_y - launch_y
+        total_distance_world = math.hypot(delta_x, delta_y)
+        if total_distance_world <= 1e-6:
+            return 0.0
+        current_x = float(entity.position['x'])
+        current_y = float(entity.position['y'])
+        progress = ((current_x - launch_x) * delta_x + (current_y - launch_y) * delta_y) / max(total_distance_world * total_distance_world, 1e-6)
+        progress = max(0.0, min(1.0, progress))
+        total_distance_m = self._world_units_to_meters(total_distance_world)
+        speed_world = math.hypot(float(entity.velocity.get('vx', 0.0)), float(entity.velocity.get('vy', 0.0)))
+        speed_mps = self._world_units_to_meters(speed_world)
+        apex_ratio = 0.35 if total_distance_m >= 1.6 else 0.5
+        apex_height_m = max(
+            self.fly_slope_dead_zone_clearance_m,
+            min(1.5, 0.20 + total_distance_m * 0.08 + speed_mps * 0.10),
+        )
+        if progress <= apex_ratio:
+            local_progress = progress / max(apex_ratio, 1e-6)
+            return apex_height_m * (1.0 - (1.0 - local_progress) ** 2)
+        local_progress = (1.0 - progress) / max(1.0 - apex_ratio, 1e-6)
+        return apex_height_m * (1.0 - (1.0 - local_progress) ** 2)
+
+    def _apply_fly_slope_launch_boost(self, entity, traversal):
+        if not isinstance(traversal, dict) or traversal.get('facility_type') != 'fly_slope' or traversal.get('direction') != 'forward':
+            entity.fly_slope_immunity_armed = False
+            return False
+        launch_point = traversal.get('entry_point') or traversal.get('approach_point')
+        landing_point = traversal.get('landing_point') or traversal.get('exit_point')
+        if launch_point is None or landing_point is None:
+            entity.fly_slope_immunity_armed = False
+            return False
+        direction_x = float(landing_point[0]) - float(launch_point[0])
+        direction_y = float(landing_point[1]) - float(launch_point[1])
+        direction_length = math.hypot(direction_x, direction_y)
+        if direction_length <= 1e-6:
+            entity.fly_slope_immunity_armed = False
+            return False
+        direction_x /= direction_length
+        direction_y /= direction_length
+        current_vx = float(entity.velocity.get('vx', 0.0))
+        current_vy = float(entity.velocity.get('vy', 0.0))
+        parallel_speed = current_vx * direction_x + current_vy * direction_y
+        perpendicular_vx = current_vx - direction_x * parallel_speed
+        perpendicular_vy = current_vy - direction_y * parallel_speed
+        boost_world = self._meters_to_world_units(self.fly_slope_launch_boost_mps)
+        enforced_parallel_speed = max(parallel_speed, boost_world)
+        preserved_lateral = max(0.0, min(1.0, self.fly_slope_lateral_preserve))
+        entity.velocity['vx'] = direction_x * enforced_parallel_speed + perpendicular_vx * preserved_lateral
+        entity.velocity['vy'] = direction_y * enforced_parallel_speed + perpendicular_vy * preserved_lateral
+        if not bool(getattr(entity, 'fly_slope_immunity_armed', False)):
+            entity.fly_slope_airborne_timer = max(float(getattr(entity, 'fly_slope_airborne_timer', 0.0)), 2.0)
+            entity.fly_slope_immunity_armed = True
+        return True
     
     def update(self, entities, map_manager, rules_engine=None, dt=None):
         """更新物理状态"""
@@ -258,6 +337,9 @@ class PhysicsEngine:
             return
 
         if getattr(entity, 'step_climb_state', None):
+            entity.fly_slope_airborne_height_m = 0.0
+            if self._update_step_climb(entity, map_manager, dt):
+                return
             entity.step_climb_state = None
 
         previous = dict(getattr(entity, 'previous_position', entity.position))
@@ -274,6 +356,13 @@ class PhysicsEngine:
         )
 
         if path_result.get('ok'):
+            traversal = map_manager.describe_segment_traversal(
+                previous['x'],
+                previous['y'],
+                current['x'],
+                current['y'],
+                max_height_delta_m=step_limit,
+            )
             if path_result.get('requires_step_alignment', False):
                 desired_heading = float(path_result.get('step_heading_deg', getattr(entity, 'angle', 0.0)))
                 angle_diff = self._normalize_angle_diff(desired_heading - float(getattr(entity, 'angle', 0.0)))
@@ -290,14 +379,35 @@ class PhysicsEngine:
                     entity.velocity['vz'] = 0.0
                     entity.last_valid_position = dict(entity.position)
                     return
-            entity.position['z'] = float(path_result.get('end_height_m', current.get('z', 0.0)))
+            self._apply_fly_slope_launch_boost(entity, traversal)
+            airborne_height_m = 0.0
+            if getattr(entity, 'type', None) == 'sentry':
+                airborne_height_m = self._fly_slope_ballistic_height_m(entity, traversal)
+            entity.fly_slope_airborne_height_m = airborne_height_m
+            entity.position['z'] = float(path_result.get('end_height_m', current.get('z', 0.0))) + airborne_height_m
             entity.last_valid_position = dict(entity.position)
+            return
+
+        transition = None
+        if getattr(entity, 'can_climb_steps', False):
+            transition = map_manager.get_step_transition(
+                previous['x'],
+                previous['y'],
+                current['x'],
+                current['y'],
+                max_height_delta_m=step_limit,
+            )
+        if transition is not None:
+            entity.fly_slope_airborne_height_m = 0.0
+            self._begin_step_climb(entity, transition, map_manager, dt)
             return
 
         fallback = dict(getattr(entity, 'last_valid_position', previous))
         entity.position['x'] = fallback['x']
         entity.position['y'] = fallback['y']
         entity.position['z'] = map_manager.get_terrain_height_m(fallback['x'], fallback['y'])
+        entity.fly_slope_airborne_height_m = 0.0
+        entity.fly_slope_immunity_armed = False
         entity.velocity['vx'] = 0.0
         entity.velocity['vy'] = 0.0
         entity.velocity['vz'] = 0.0

@@ -7,8 +7,23 @@ import sys
 import os
 from datetime import datetime
 
-# 添加项目根目录到路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 添加项目根目录及核心目录到路径
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+CORE_DIR = os.path.join(PROJECT_ROOT, "core")
+
+def _add_to_sys_path(path):
+    if os.path.isdir(path) and path not in sys.path:
+        sys.path.insert(0, path)
+
+def _add_package_parent(package_name):
+    for dirpath, dirnames, _ in os.walk(PROJECT_ROOT):
+        if package_name in dirnames:
+            _add_to_sys_path(dirpath)
+            return
+
+_add_to_sys_path(PROJECT_ROOT)
+_add_to_sys_path(CORE_DIR)
+_add_package_parent("state_machine")
 
 from core.game_engine import GameEngine
 from core.config_manager import ConfigManager

@@ -5,13 +5,23 @@ pygame兼容性模块
 兼容pygame-ce和标准pygame
 """
 
+import sys
+
 try:
     import pygame_ce as _pygame
 except ImportError:
     try:
         import pygame as _pygame
-    except ImportError:
-        raise ImportError("请安装pygame或pygame-ce")
+    except ImportError as exc:
+        python_exe = sys.executable or 'python'
+        raise ImportError(
+            '当前解释器未安装 pygame 或 pygame-ce。\n'
+            f'当前 Python: {python_exe}\n'
+            '请使用同一个解释器安装依赖，不要使用裸 pip。\n'
+            '推荐命令:\n'
+            f'  "{python_exe}" -m pip install -U pip\n'
+            f'  "{python_exe}" -m pip install -r requirements.txt'
+        ) from exc
 
 # 重新导出所有pygame模块
 pygame = _pygame

@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 
 import math
+import threading
 
 import numpy as np
 
 from pygame_compat import pygame
-from rendering.terrain_scene_backends import _sample_terrain_scene_data, _terrain_scene_focus_grid, create_terrain_scene_backend
+from rendering.terrain_scene_backends import _sample_terrain_scene_data, _terrain_scene_focus_grid, _terrain_scene_look_at, _terrain_scene_perspective_matrix, build_terrain_scene_camera_state, create_terrain_scene_backend
 
 try:
     from pygame._sdl2.video import Window as SdlWindow, Renderer as SdlRenderer, Texture as SdlTexture
@@ -17,6 +18,66 @@ except Exception:
 
 
 class TerrainOverviewMixin:
+    def _terrain_scene_prewarm_key(self, game_engine):
+        map_manager = game_engine.map_manager
+        return (
+            int(getattr(map_manager, 'raster_version', 0)),
+            int(map_manager.map_width),
+            int(map_manager.map_height),
+            float(getattr(map_manager, 'terrain_grid_cell_size', 1.0)),
+        )
+
+    def _start_terrain_scene_prewarm(self, game_engine):
+        key = self._terrain_scene_prewarm_key(game_engine)
+        worker = getattr(self, 'terrain_scene_prewarm_thread', None)
+        if worker is not None and worker.is_alive() and getattr(self, 'terrain_scene_prewarm_key', None) == key:
+            return
+        if getattr(self, 'terrain_scene_prewarm_ready_key', None) == key:
+            return
+        self.terrain_scene_prewarm_key = key
+        self.terrain_scene_prewarm_error = None
+        self.terrain_scene_prewarm_ready_key = None
+
+        def _worker():
+            try:
+                game_engine.map_manager.get_raster_layers()
+                self.terrain_scene_prewarm_ready_key = key
+            except Exception as exc:
+                self.terrain_scene_prewarm_error = str(exc)
+
+        self.terrain_scene_prewarm_thread = threading.Thread(target=_worker, name='terrain-scene-prewarm', daemon=True)
+        self.terrain_scene_prewarm_thread.start()
+
+    def _terrain_scene_loading_active(self, game_engine):
+        if self.terrain_view_mode != '3d':
+            return False
+        key = self._terrain_scene_prewarm_key(game_engine)
+        if getattr(self, 'terrain_scene_prewarm_ready_key', None) == key:
+            return False
+        worker = getattr(self, 'terrain_scene_prewarm_thread', None)
+        return worker is not None and worker.is_alive()
+
+    def _build_terrain_scene_loading_surface(self, size, message='正在加载三维地形...'):
+        width, height = int(size[0]), int(size[1])
+        surface = pygame.Surface((max(1, width), max(1, height)))
+        surface.fill((236, 240, 245))
+        panel_rect = pygame.Rect(0, 0, min(360, width - 32), 118)
+        panel_rect.center = (width // 2, height // 2)
+        pygame.draw.rect(surface, self.colors['overlay_bg'], panel_rect, border_radius=10)
+        pygame.draw.rect(surface, self.colors['panel_border'], panel_rect, 1, border_radius=10)
+        title = self.small_font.render('3D 地形预热中', True, self.colors['white'])
+        detail = self.tiny_font.render(message, True, self.colors['white'])
+        hint = self.tiny_font.render('首帧完成后会自动切入 3D 视图', True, self.colors['white'])
+        bar_rect = pygame.Rect(panel_rect.x + 24, panel_rect.bottom - 28, panel_rect.width - 48, 8)
+        phase = (pygame.time.get_ticks() // 220) % 5
+        fill_width = max(36, int(bar_rect.width * (0.24 + phase * 0.15)))
+        pygame.draw.rect(surface, (70, 82, 100), bar_rect, border_radius=4)
+        pygame.draw.rect(surface, (122, 194, 255), pygame.Rect(bar_rect.x, bar_rect.y, min(bar_rect.width, fill_width), bar_rect.height), border_radius=4)
+        surface.blit(title, title.get_rect(center=(panel_rect.centerx, panel_rect.y + 30)))
+        surface.blit(detail, detail.get_rect(center=(panel_rect.centerx, panel_rect.y + 58)))
+        surface.blit(hint, hint.get_rect(center=(panel_rect.centerx, panel_rect.y + 78)))
+        return surface
+
     def _terrain_overview_embedded_mode(self):
         return bool(getattr(self, 'terrain_overview_embedded', False))
 
@@ -50,6 +111,8 @@ class TerrainOverviewMixin:
         return self.terrain_scene_backend
 
     def _render_terrain_scene_surface(self, game_engine, scene_rect, map_rgb):
+        if self._terrain_scene_loading_active(game_engine):
+            return self._build_terrain_scene_loading_surface(scene_rect.size)
         backend = self._get_terrain_scene_backend()
         try:
             return backend.render_scene(self, game_engine, scene_rect.size, map_rgb)
@@ -58,6 +121,89 @@ class TerrainOverviewMixin:
                 raise
             self.terrain_scene_backend = create_terrain_scene_backend('software')
             return self.terrain_scene_backend.render_scene(self, game_engine, scene_rect.size, map_rgb)
+
+    def _invalidate_terrain_scene_cache(self):
+        self.terrain_3d_texture = None
+        self.terrain_3d_render_key = None
+
+    def _draw_terrain_scene_hover_panel(self, surface, rect, map_manager, world_pos):
+        metrics = self._hover_grid_metrics(map_manager, world_pos)
+        if metrics is None:
+            return
+        lines = [
+            f'栅格高度 {metrics["height_m"]:.2f}m',
+            f'栅格宽度 {metrics["cell_width_m"]:.3f}m',
+        ]
+        rendered_lines = [self.tiny_font.render(line, True, self.colors['white']) for line in lines]
+        panel_width = max(text.get_width() for text in rendered_lines) + 18
+        panel_height = sum(text.get_height() for text in rendered_lines) + 14 + (len(rendered_lines) - 1) * 3
+        panel_rect = pygame.Rect(rect.right - panel_width - 12, rect.bottom - panel_height - 12, panel_width, panel_height)
+        pygame.draw.rect(surface, self.colors['overlay_bg'], panel_rect, border_radius=6)
+        pygame.draw.rect(surface, self.colors['panel_border'], panel_rect, 1, border_radius=6)
+        draw_y = panel_rect.y + 7
+        for text in rendered_lines:
+            surface.blit(text, (panel_rect.x + 9, draw_y))
+            draw_y += text.get_height() + 3
+
+    def _draw_terrain_scene_controls(self, surface, rect):
+        return
+
+    def _update_terrain_scene_navigation(self, game_engine):
+        now_ms = pygame.time.get_ticks()
+        last_ms = getattr(self, 'terrain_3d_navigation_last_ms', now_ms)
+        self.terrain_3d_navigation_last_ms = now_ms
+        if self.edit_mode != 'terrain' or self.terrain_view_mode != '3d':
+            return False
+        if self.active_numeric_input is not None or getattr(self, 'active_text_input', None) is not None:
+            return False
+
+        dt = max(0.0, min(0.05, (now_ms - last_ms) / 1000.0))
+        if dt <= 0.0:
+            return False
+
+        pressed = pygame.key.get_pressed()
+        move_x = 0.0
+        move_y = 0.0
+        if pressed[pygame.K_w]:
+            move_y += 1.0
+        if pressed[pygame.K_s]:
+            move_y -= 1.0
+        if pressed[pygame.K_d]:
+            move_x += 1.0
+        if pressed[pygame.K_a]:
+            move_x -= 1.0
+        height_delta = 0.0
+        if pressed[pygame.K_f]:
+            height_delta += 1.0
+        if pressed[pygame.K_c]:
+            height_delta -= 1.0
+        if abs(move_x) <= 1e-6 and abs(move_y) <= 1e-6 and abs(height_delta) <= 1e-6:
+            return False
+
+        map_manager = game_engine.map_manager
+        focus_world = getattr(self, 'terrain_scene_focus_world', None)
+        if focus_world is None:
+            focus_world = (map_manager.map_width * 0.5, map_manager.map_height * 0.5)
+        yaw = self.terrain_3d_camera_yaw
+        zoom = max(1.0, float(getattr(self, 'terrain_scene_zoom', 1.0)))
+        move_speed = max(90.0, 540.0 / zoom)
+        diagonal = math.hypot(move_x, move_y)
+        if diagonal > 1e-6:
+            move_x /= diagonal
+            move_y /= diagonal
+        forward_x = -math.sin(yaw)
+        forward_y = -math.cos(yaw)
+        right_x = math.cos(yaw)
+        right_y = -math.sin(yaw)
+        world_dx = (right_x * move_x + forward_x * move_y) * move_speed * dt
+        world_dy = (right_y * move_x + forward_y * move_y) * move_speed * dt
+        next_focus_x = max(0.0, min(float(map_manager.map_width - 1), float(focus_world[0]) + world_dx))
+        next_focus_y = max(0.0, min(float(map_manager.map_height - 1), float(focus_world[1]) + world_dy))
+        self.terrain_scene_focus_world = (next_focus_x, next_focus_y)
+        if abs(height_delta) > 1e-6:
+            self.terrain_3d_camera_focus_height = max(-20.0, min(80.0, float(getattr(self, 'terrain_3d_camera_focus_height', 0.0)) + height_delta * dt * 8.0))
+        self._invalidate_terrain_scene_cache()
+        return True
 
     def _terrain_backend_badge_text(self, backend):
         name = getattr(backend, 'name', 'software')
@@ -159,65 +305,17 @@ class TerrainOverviewMixin:
             view_width = map_manager.map_width
         if view_height is None:
             view_height = map_manager.map_height
-
-        scale_x = map_rect.width / max(view_width, 1e-6)
-        scale_y = map_rect.height / max(view_height, 1e-6)
-        cell_lookup = map_manager.terrain_grid_overrides
-        visible_cells = []
-        overlay = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
-
-        if self.height_layer_enabled:
-            grid_x1, grid_x2, grid_y1, grid_y2 = map_manager._grid_ranges_from_world_bounds(view_x, view_y, view_x + view_width, view_y + view_height)
-            for grid_y in range(grid_y1, grid_y2 + 1):
-                for grid_x in range(grid_x1, grid_x2 + 1):
-                    x1, y1, x2, y2 = map_manager._grid_cell_bounds(grid_x, grid_y)
-                    cell_rect = pygame.Rect(
-                        map_rect.x + int((x1 - view_x) * scale_x),
-                        map_rect.y + int((y1 - view_y) * scale_y),
-                        max(1, int((x2 - x1 + 1) * scale_x)),
-                        max(1, int((y2 - y1 + 1) * scale_y)),
-                    )
-                    height_m = map_manager._sample_grid_height(grid_x, grid_y)
-                    color = self._height_layer_color(height_m)
-                    outline = self._height_layer_outline_color(height_m)
-                    pygame.draw.rect(overlay, (*color, self.height_layer_alpha), cell_rect)
-                    pygame.draw.rect(overlay, (*outline, min(255, self.height_layer_alpha + 36)), cell_rect, 1)
-
-        for key, cell in cell_lookup.items():
-            x1, y1, x2, y2 = map_manager._grid_cell_bounds(cell['x'], cell['y'])
-            if x2 < view_x or x1 > view_x + view_width or y2 < view_y or y1 > view_y + view_height:
-                continue
-            cell_rect = pygame.Rect(
-                map_rect.x + int((x1 - view_x) * scale_x),
-                map_rect.y + int((y1 - view_y) * scale_y),
-                max(1, int((x2 - x1 + 1) * scale_x)),
-                max(1, int((y2 - y1 + 1) * scale_y)),
-            )
-            color = self._terrain_color_by_type(cell.get('type', 'flat'))
-            pygame.draw.rect(overlay, (*color, self.terrain_overlay_alpha), cell_rect)
-            visible_cells.append((key, cell, cell_rect))
-
-        for _, cell, cell_rect in visible_cells:
-            grid_x = cell['x']
-            grid_y = cell['y']
-            signature = self._terrain_cell_border_signature(cell)
-            outline_color = self._terrain_outline_color(cell.get('type', 'flat'))
-            neighbors = {
-                'top': cell_lookup.get(map_manager._terrain_cell_key(grid_x, grid_y - 1)),
-                'right': cell_lookup.get(map_manager._terrain_cell_key(grid_x + 1, grid_y)),
-                'bottom': cell_lookup.get(map_manager._terrain_cell_key(grid_x, grid_y + 1)),
-                'left': cell_lookup.get(map_manager._terrain_cell_key(grid_x - 1, grid_y)),
-            }
-            if self._terrain_cell_border_signature(neighbors['top']) != signature:
-                pygame.draw.line(overlay, outline_color, cell_rect.topleft, cell_rect.topright, 2)
-            if self._terrain_cell_border_signature(neighbors['right']) != signature:
-                pygame.draw.line(overlay, outline_color, cell_rect.topright, cell_rect.bottomright, 2)
-            if self._terrain_cell_border_signature(neighbors['bottom']) != signature:
-                pygame.draw.line(overlay, outline_color, cell_rect.bottomleft, cell_rect.bottomright, 2)
-            if self._terrain_cell_border_signature(neighbors['left']) != signature:
-                pygame.draw.line(overlay, outline_color, cell_rect.topleft, cell_rect.bottomleft, 2)
-
-        surface.blit(overlay, (0, 0))
+        source_overlay = self._get_world_terrain_grid_overlay_surface(map_manager)
+        source_rect = pygame.Rect(
+            max(0, int(view_x)),
+            max(0, int(view_y)),
+            max(1, min(int(view_width), source_overlay.get_width() - max(0, int(view_x)))),
+            max(1, min(int(view_height), source_overlay.get_height() - max(0, int(view_y)))),
+        )
+        if source_rect.width <= 0 or source_rect.height <= 0:
+            return
+        scaled_overlay = pygame.transform.smoothscale(source_overlay.subsurface(source_rect), map_rect.size)
+        surface.blit(scaled_overlay, map_rect.topleft)
 
     def _ensure_terrain_3d_window(self):
         if self._terrain_overview_embedded_mode():
@@ -250,6 +348,9 @@ class TerrainOverviewMixin:
                 return
 
             terrain_window.show()
+            if self.terrain_view_mode == '3d':
+                self._start_terrain_scene_prewarm(game_engine)
+            self._update_terrain_scene_navigation(game_engine)
             size = terrain_window.size
             render_key = (
                 tuple(size),
@@ -272,6 +373,7 @@ class TerrainOverviewMixin:
                 self.terrain_brush_radius,
                 round(self.terrain_3d_camera_yaw, 3),
                 round(self.terrain_3d_camera_pitch, 3),
+                round(float(getattr(self, 'terrain_3d_camera_focus_height', 0.0)), 3),
                 self.selected_terrain_cell_key,
                 tuple(sorted(self._terrain_selection_keys())),
                 self.selected_wall_id,
@@ -286,7 +388,11 @@ class TerrainOverviewMixin:
             allow_rebuild = True
             if needs_rebuild and (self.terrain_painting or self.terrain_pan_active):
                 allow_rebuild = now_ms - self.terrain_3d_last_build_ms >= 70
-            if needs_rebuild and allow_rebuild:
+            if self._terrain_scene_loading_active(game_engine):
+                surface = self._build_terrain_scene_loading_surface(size)
+                self.terrain_3d_texture = SdlTexture.from_surface(terrain_renderer, surface)
+                self.terrain_3d_render_key = None
+            elif needs_rebuild and allow_rebuild:
                 surface = self._build_full_terrain_3d_surface(game_engine, size)
                 self.terrain_3d_texture = SdlTexture.from_surface(terrain_renderer, surface)
                 self.terrain_3d_render_key = render_key
@@ -310,6 +416,8 @@ class TerrainOverviewMixin:
         surface.fill((228, 233, 239))
         self.terrain_overview_ui = {'window_id': self.terrain_overview_ui.get('window_id'), 'buttons': [], 'map_rect': None, 'scene_rect': None, 'scene_map_rect': None, 'scene_world_rect': None}
         header_offset = max(0, int(self._render_terrain_overview_host_header(surface, game_engine, width) or 0))
+        if self.terrain_view_mode == '3d':
+            self._start_terrain_scene_prewarm(game_engine)
 
         map_manager = game_engine.map_manager
         grid_width, grid_height = map_manager._grid_dimensions()
@@ -327,10 +435,12 @@ class TerrainOverviewMixin:
         scene_hint_text = '上半区左键按当前形状设置范围；3D 模式右键拖动旋转。'
         if self.terrain_view_mode == '2d':
             scene_hint_text = '上半区为 2D 顶视图，可直接框选或多边形圈定范围。'
+        elif self.terrain_view_mode == '3d':
+            scene_hint_text = '3D: WASD 平移中心，滚轮缩放，F/C 升降，按住右键旋转。'
         scene_hint = self.tiny_font.render(scene_hint_text, True, self.colors['panel_text'])
         surface.blit(scene_hint, (scene_rect.x + 10, scene_rect.y + 8))
-        map_rgb = self._get_terrain_3d_map_rgb(map_manager)
         if self.terrain_view_mode == '3d':
+            map_rgb = self._get_terrain_3d_map_rgb(map_manager)
             scene_surface = self._render_terrain_scene_surface(game_engine, scene_rect, map_rgb)
         else:
             scene_surface = self._render_terrain_scene_2d_surface(game_engine, scene_rect)
@@ -339,11 +449,18 @@ class TerrainOverviewMixin:
                 scene_surface = pygame.transform.smoothscale(scene_surface, scene_rect.size)
             surface.blit(scene_surface, scene_rect.topleft)
             pygame.draw.rect(surface, self.colors['panel_border'], scene_rect, 1, border_radius=12)
+        self._draw_terrain_scene_controls(surface, scene_rect)
 
-        zoom_label_rect = pygame.Rect(scene_rect.right - 84, scene_rect.bottom - 34, 70, 20)
+        zoom_label_rect = pygame.Rect(scene_rect.x + 12, scene_rect.bottom - 34, 70, 20)
         pygame.draw.rect(surface, self.colors['overlay_bg'], zoom_label_rect, border_radius=5)
         zoom_text = self.tiny_font.render(f'{self.terrain_scene_zoom:.1f}x', True, self.colors['white'])
         surface.blit(zoom_text, zoom_text.get_rect(center=zoom_label_rect.center))
+
+        hover_scene_world = None
+        if self.terrain_view_mode == '3d':
+            hover_scene_world = self._terrain_overview_hover_world(game_engine)
+            if hover_scene_world is not None:
+                self._draw_terrain_scene_hover_panel(surface, scene_rect, map_manager, hover_scene_world)
 
         title = self.font.render('地图编辑总览', True, self.colors['panel_text'])
         surface.blit(title, (18, 16 + header_offset))
@@ -367,18 +484,39 @@ class TerrainOverviewMixin:
         self._draw_surface_button(surface, facility_button, '设施', self.terrain_editor_tool == 'facility')
         self._draw_surface_button(surface, view_2d_button, '2D', self.terrain_view_mode == '2d')
         self._draw_surface_button(surface, view_3d_button, '3D', self.terrain_view_mode == '3d')
-        self._draw_surface_button(surface, prev_button, '<', False)
-        self._draw_surface_button(surface, next_button, '>', False)
         self.terrain_overview_ui['buttons'].extend([
             (terrain_button, 'terrain_tool:terrain'),
             (facility_button, 'terrain_tool:facility'),
             (view_2d_button, 'terrain_view_mode:2d'),
             (view_3d_button, 'terrain_view_mode:3d'),
-            (prev_button, 'terrain_brush_radius:-1' if self.terrain_editor_tool == 'terrain' else 'facility_select_delta:-1'),
-            (next_button, 'terrain_brush_radius:1' if self.terrain_editor_tool == 'terrain' else 'facility_select_delta:1'),
         ])
 
         if self.terrain_editor_tool == 'terrain':
+            radius_minus_rect = pygame.Rect(348, row1_y, 28, 28)
+            radius_value_rect = pygame.Rect(382, row1_y, 76, 28)
+            radius_plus_rect = pygame.Rect(464, row1_y, 28, 28)
+            self._draw_surface_button(surface, radius_minus_rect, '-', False)
+            self._draw_surface_button(surface, radius_value_rect, f'R {self.terrain_brush_radius}', False)
+            self._draw_surface_button(surface, radius_plus_rect, '+', False)
+            self.terrain_overview_ui['buttons'].extend([
+                (radius_minus_rect, 'terrain_brush_radius:-1'),
+                (radius_plus_rect, 'terrain_brush_radius:1'),
+            ])
+
+            height_minus_rect = pygame.Rect(504, row1_y, 28, 28)
+            height_value_rect = pygame.Rect(538, row1_y, 92, 28)
+            height_plus_rect = pygame.Rect(636, row1_y, 28, 28)
+            height_active = self._is_numeric_input_active('terrain_brush', 'brush')
+            height_text = self.active_numeric_input['text'] if height_active and self.active_numeric_input is not None else f'{self.terrain_brush.get("height_m", 0.0):.2f}m'
+            self._draw_surface_button(surface, height_minus_rect, '-', False)
+            self._draw_surface_button(surface, height_plus_rect, '+', False)
+            self._draw_surface_button(surface, height_value_rect, height_text, height_active)
+            self.terrain_overview_ui['buttons'].extend([
+                (height_minus_rect, 'terrain_brush_height:-0.1'),
+                (height_value_rect, 'height_input:terrain_brush:brush'),
+                (height_plus_rect, 'terrain_brush_height:0.1'),
+            ])
+
             workflow_label = {
                 'select': '框选',
                 'brush': '刷子',
@@ -390,6 +528,12 @@ class TerrainOverviewMixin:
             if self.terrain_workflow_mode == 'shape':
                 selected_label += f'  形状 {shape_label}'
         else:
+            self._draw_surface_button(surface, prev_button, '<', False)
+            self._draw_surface_button(surface, next_button, '>', False)
+            self.terrain_overview_ui['buttons'].extend([
+                (prev_button, 'facility_select_delta:-1'),
+                (next_button, 'facility_select_delta:1'),
+            ])
             shape_label = {'circle': '圆形', 'rect': '矩形', 'polygon': '多边形'}.get(self.facility_draw_shape, self.facility_draw_shape)
             selected_region = self._selected_region_option()
             if selected_region is not None and selected_region['type'] == 'wall':
@@ -434,6 +578,13 @@ class TerrainOverviewMixin:
                     (slope_button, 'terrain_shape:slope'),
                     (smooth_button, 'terrain_shape:smooth'),
                 ])
+                if self.terrain_shape_mode == 'smooth':
+                    strength_x = smooth_button.right + 8
+                    for value in range(4):
+                        strength_rect = pygame.Rect(strength_x, row3_y, 32, 28)
+                        self._draw_surface_button(surface, strength_rect, str(value), self.terrain_smooth_strength == value)
+                        self.terrain_overview_ui['buttons'].append((strength_rect, f'terrain_smooth_strength:set:{value}'))
+                        strength_x = strength_rect.right + 6
         elif (self._selected_region_option() or {}).get('type') != 'wall':
             circle_button = pygame.Rect(18, row2_y, 64, 28)
             rect_button = pygame.Rect(88, row2_y, 64, 28)
@@ -466,12 +617,12 @@ class TerrainOverviewMixin:
         editor_top = footer_y + 28
         editor_rect = pygame.Rect(18, editor_top, width - 36, max(220, height - editor_top - bottom_margin))
         self._render_terrain_overview_editor(surface, game_engine, editor_rect)
-        hover_world = self._terrain_overview_hover_world(game_engine)
+        hover_world = hover_scene_world if hover_scene_world is not None else self._terrain_overview_hover_world(game_engine)
         if hover_world is not None:
             hovered_region = self._hover_region_at_world(map_manager, hover_world)
             if hovered_region is not None:
                 self.mouse_world = hover_world
-                self._draw_region_hover_card(surface, hovered_region, self.terrain_overview_mouse_pos, clamp_rect=surface.get_rect())
+                self._draw_region_hover_card(surface, hovered_region, self.terrain_overview_mouse_pos, clamp_rect=surface.get_rect(), map_manager=map_manager, world_pos=hover_world)
         return surface
 
     def _draw_surface_button(self, surface, rect, label, active):
@@ -506,20 +657,27 @@ class TerrainOverviewMixin:
         padding = 10
         content_rect = pygame.Rect(padding, padding, max(1, scene_rect.width - padding * 2), max(1, scene_rect.height - padding * 2))
         aspect = source.get_width() / max(source.get_height(), 1)
-        draw_width = content_rect.width
-        draw_height = int(draw_width / max(aspect, 1e-6))
-        if draw_height > content_rect.height:
-            draw_height = content_rect.height
-            draw_width = int(draw_height * aspect)
-        map_rect = pygame.Rect(
-            content_rect.x + (content_rect.width - draw_width) // 2,
-            content_rect.y + (content_rect.height - draw_height) // 2,
-            draw_width,
-            draw_height,
-        )
         zoom = max(1.0, float(getattr(self, 'terrain_scene_zoom', 1.0)))
-        view_width = max(1.0, float(map_manager.map_width) / zoom)
-        view_height = max(1.0, float(map_manager.map_height) / zoom)
+        if zoom <= 1.001:
+            draw_width = content_rect.width
+            draw_height = int(draw_width / max(aspect, 1e-6))
+            if draw_height > content_rect.height:
+                draw_height = content_rect.height
+                draw_width = int(draw_height * aspect)
+            map_rect = pygame.Rect(
+                content_rect.x + (content_rect.width - draw_width) // 2,
+                content_rect.y + (content_rect.height - draw_height) // 2,
+                draw_width,
+                draw_height,
+            )
+            view_width = float(map_manager.map_width)
+            view_height = float(map_manager.map_height)
+        else:
+            map_rect = content_rect.copy()
+            cover_scale = max(content_rect.width / max(float(map_manager.map_width), 1.0), content_rect.height / max(float(map_manager.map_height), 1.0))
+            effective_scale = max(cover_scale * zoom, 1e-6)
+            view_width = max(1.0, min(float(map_manager.map_width), content_rect.width / effective_scale))
+            view_height = max(1.0, min(float(map_manager.map_height), content_rect.height / effective_scale))
         focus_world = getattr(self, 'terrain_scene_focus_world', None)
         if focus_world is None:
             center_x = map_manager.map_width / 2.0
@@ -534,9 +692,7 @@ class TerrainOverviewMixin:
         source_w = max(1, min(source.get_width() - source_x, int(round(view_width))))
         source_h = max(1, min(source.get_height() - source_y, int(round(view_height))))
         source_rect = pygame.Rect(source_x, source_y, source_w, source_h)
-        view_surface = pygame.Surface((source_w, source_h))
-        view_surface.blit(source, (0, 0), source_rect)
-        surface.blit(pygame.transform.smoothscale(view_surface, map_rect.size), map_rect.topleft)
+        surface.blit(pygame.transform.smoothscale(source.subsurface(source_rect), map_rect.size), map_rect.topleft)
         pygame.draw.rect(surface, self.colors['panel_border'], map_rect, 1)
         self.terrain_overview_ui['scene_map_rect'] = map_rect.move(scene_rect.x, scene_rect.y)
         self.terrain_overview_ui['scene_world_rect'] = (view_x, view_y, view_width, view_height)
@@ -545,30 +701,9 @@ class TerrainOverviewMixin:
         scale_y = map_rect.height / max(view_height, 1e-6)
         if show_terrain:
             self._render_terrain_grid_overlay(surface, map_manager, map_rect, view_x=view_x, view_y=view_y, view_width=view_width, view_height=view_height)
-
-        for region in map_manager.get_facility_regions():
-            if region.get('type') == 'boundary':
-                continue
-            color = self._wall_color(region) if region.get('type') == 'wall' else self._terrain_color_by_type(region.get('type', 'flat'))
-            if region.get('shape') == 'line':
-                start = (map_rect.x + int((region['x1'] - view_x) * scale_x), map_rect.y + int((region['y1'] - view_y) * scale_y))
-                end = (map_rect.x + int((region['x2'] - view_x) * scale_x), map_rect.y + int((region['y2'] - view_y) * scale_y))
-                pygame.draw.line(surface, color, start, end, max(2, int(region.get('thickness', 12) * min(scale_x, scale_y))))
-            elif region.get('shape') == 'polygon':
-                points = [
-                    (map_rect.x + int((point[0] - view_x) * scale_x), map_rect.y + int((point[1] - view_y) * scale_y))
-                    for point in region.get('points', [])
-                ]
-                if len(points) >= 3:
-                    pygame.draw.polygon(surface, color, points, 2)
-            else:
-                facility_rect = pygame.Rect(
-                    map_rect.x + int((region['x1'] - view_x) * scale_x),
-                    map_rect.y + int((region['y1'] - view_y) * scale_y),
-                    max(1, int((region['x2'] - region['x1']) * scale_x)),
-                    max(1, int((region['y2'] - region['y1']) * scale_y)),
-                )
-                pygame.draw.rect(surface, color, facility_rect, 2)
+        facility_overlay = self._get_world_facility_overlay_surface(map_manager)
+        facility_source_rect = pygame.Rect(source_x, source_y, source_w, source_h)
+        surface.blit(pygame.transform.smoothscale(facility_overlay.subsurface(facility_source_rect), map_rect.size), map_rect.topleft)
 
         terrain_selection = self._terrain_selection_keys()
         for key in terrain_selection:
@@ -643,7 +778,7 @@ class TerrainOverviewMixin:
                 '滚轮改半径，Shift+滚轮改高度',
                 '高级模式保留圆形、矩形、多边形、直线、斜坡',
                 '斜坡: 先闭合区域，再左键两次设置坡向箭头',
-                '平滑: 先框选区域，再点侧栏 1/2/3 直接平滑',
+                '平滑: 先框选区域，再在工具栏设置 0-3，其中 0 为关闭',
             ]
             for index, line in enumerate(lines):
                 font = self.small_font if index == 0 else self.tiny_font
@@ -651,48 +786,11 @@ class TerrainOverviewMixin:
                 surface.blit(text, (rect.x + 10, y))
                 y += 20 if index == 0 else 18
 
-            height_rect = pygame.Rect(rect.right - 108, y + 1, 96, 22)
-            height_minus_rect = pygame.Rect(rect.right - 166, y + 1, 24, 22)
-            height_plus_rect = pygame.Rect(rect.right - 136, y + 1, 24, 22)
-            height_active = self._is_numeric_input_active('terrain_brush', 'brush')
-            height_text = f'{self.terrain_brush.get("height_m", 0.0):.2f}'
-            if height_active and self.active_numeric_input is not None:
-                height_text = self.active_numeric_input['text']
-            surface.blit(self.tiny_font.render(f'高度: {self.terrain_brush.get("height_m", 0.0):.2f}m', True, self.colors['panel_text']), (rect.x + 10, y + 4))
-            self._draw_surface_button(surface, height_minus_rect, '-', False)
-            self._draw_surface_button(surface, height_plus_rect, '+', False)
-            self._draw_surface_input_box(surface, height_rect, height_text, height_active)
-            self.terrain_overview_ui['buttons'].append((height_minus_rect, 'terrain_brush_height:-0.1'))
-            self.terrain_overview_ui['buttons'].append((height_plus_rect, 'terrain_brush_height:0.1'))
-            self.terrain_overview_ui['buttons'].append((height_rect, 'height_input:terrain_brush:brush'))
-            y += 34
+            surface.blit(self.tiny_font.render(f'笔刷高度: {self.terrain_brush.get("height_m", 0.0):.2f}m（顶部工具栏设置）', True, self.colors['panel_text']), (rect.x + 10, y + 4))
+            y += 28
 
-            layer_toggle_rect = pygame.Rect(rect.x + 10, y, 92, 24)
-            layer_minus_rect = pygame.Rect(rect.x + 122, y, 22, 24)
-            layer_plus_rect = pygame.Rect(rect.x + 176, y, 22, 24)
-            alpha_percent = int(round(self.height_layer_alpha / 255.0 * 100))
-            self._draw_surface_button(surface, layer_toggle_rect, '高度图层', self.height_layer_enabled)
-            self._draw_surface_button(surface, layer_minus_rect, '-', False)
-            self._draw_surface_button(surface, layer_plus_rect, '+', False)
-            surface.blit(self.tiny_font.render(str(alpha_percent), True, self.colors['panel_text']), (rect.x + 152, y + 5))
-            self.terrain_overview_ui['buttons'].append((layer_toggle_rect, 'height_layer_toggle'))
-            self.terrain_overview_ui['buttons'].append((layer_minus_rect, 'height_layer_alpha:-16'))
-            self.terrain_overview_ui['buttons'].append((layer_plus_rect, 'height_layer_alpha:16'))
-            y += 30
-
-            surface.blit(self.tiny_font.render(f'分层步进: {self.height_layer_step_m:.2f}m', True, self.colors['panel_text']), (rect.x + 10, y + 2))
-            y += 24
-
-            surface.blit(self.tiny_font.render(f'半径: {self.terrain_brush_radius}', True, self.colors['panel_text']), (rect.x + 10, y + 4))
-            minus_rect = pygame.Rect(rect.x + 68, y + 1, 24, 22)
-            plus_rect = pygame.Rect(rect.x + 98, y + 1, 24, 22)
-            self._draw_surface_button(surface, minus_rect, '-', False)
-            self._draw_surface_button(surface, plus_rect, '+', False)
-            self.terrain_overview_ui['buttons'].extend([
-                (minus_rect, 'terrain_brush_radius:-1'),
-                (plus_rect, 'terrain_brush_radius:1'),
-            ])
-            y += 34
+            surface.blit(self.tiny_font.render(f'笔刷半径: {self.terrain_brush_radius}（顶部工具栏设置）', True, self.colors['panel_text']), (rect.x + 10, y + 4))
+            y += 28
 
             terrain_selection = self._terrain_selection_keys()
             if terrain_selection:
@@ -850,69 +948,16 @@ class TerrainOverviewMixin:
             '框选: 左键拖框选择已编辑格栅',
             '刷子/橡皮擦: 左键连续涂抹；高级保留形状工具',
             '斜坡: 先闭合区域，再左键两次设置箭头方向',
-            '平滑: 先框选区域，再点侧栏 1/2/3 直接平滑',
+            '平滑: 先框选区域，再在工具栏设置 0-3，其中 0 为关闭',
         ]):
             font = self.small_font if index == 0 else self.tiny_font
             surface.blit(font.render(line, True, self.colors['panel_text']), (rect.x + 10, y))
             y += 20 if index == 0 else 18
 
-        height_rect = pygame.Rect(rect.right - 88, y + 1, 78, 22)
-        minus_rect = pygame.Rect(rect.right - 146, y + 1, 24, 22)
-        plus_rect = pygame.Rect(rect.right - 116, y + 1, 24, 22)
-        active = self._is_numeric_input_active('terrain_brush', 'brush')
-        text = self.active_numeric_input['text'] if active and self.active_numeric_input is not None else f'{self.terrain_brush.get("height_m", 0.0):.2f}'
-        surface.blit(self.tiny_font.render(f'笔刷高度: {self.terrain_brush.get("height_m", 0.0):.2f}m', True, self.colors['panel_text']), (rect.x + 10, y + 4))
-        self._draw_surface_button(surface, minus_rect, '-', False)
-        self._draw_surface_button(surface, plus_rect, '+', False)
-        self._draw_surface_input_box(surface, height_rect, text, active)
-        self.terrain_overview_ui['buttons'].extend([
-            (minus_rect, 'terrain_brush_height:-0.1'),
-            (plus_rect, 'terrain_brush_height:0.1'),
-            (height_rect, 'height_input:terrain_brush:brush'),
-        ])
-        y += 34
-
-        surface.blit(self.tiny_font.render(f'笔刷半径: {self.terrain_brush_radius}', True, self.colors['panel_text']), (rect.x + 10, y + 4))
-        radius_minus_rect = pygame.Rect(rect.x + 92, y + 1, 24, 22)
-        radius_plus_rect = pygame.Rect(rect.x + 122, y + 1, 24, 22)
-        self._draw_surface_button(surface, radius_minus_rect, '-', False)
-        self._draw_surface_button(surface, radius_plus_rect, '+', False)
-        self.terrain_overview_ui['buttons'].extend([
-            (radius_minus_rect, 'terrain_brush_radius:-1'),
-            (radius_plus_rect, 'terrain_brush_radius:1'),
-        ])
-        y += 34
-
-        layer_toggle_rect = pygame.Rect(rect.x + 10, y, 88, 24)
-        layer_minus_rect = pygame.Rect(rect.x + 108, y, 22, 24)
-        layer_plus_rect = pygame.Rect(rect.x + 160, y, 22, 24)
-        alpha_percent = int(round(self.height_layer_alpha / 255.0 * 100))
-        self._draw_surface_button(surface, layer_toggle_rect, '高度图层', self.height_layer_enabled)
-        self._draw_surface_button(surface, layer_minus_rect, '-', False)
-        self._draw_surface_button(surface, layer_plus_rect, '+', False)
-        surface.blit(self.tiny_font.render(str(alpha_percent), True, self.colors['panel_text']), (rect.x + 138, y + 5))
-        self.terrain_overview_ui['buttons'].extend([
-            (layer_toggle_rect, 'height_layer_toggle'),
-            (layer_minus_rect, 'height_layer_alpha:-16'),
-            (layer_plus_rect, 'height_layer_alpha:16'),
-        ])
+        surface.blit(self.tiny_font.render('笔刷高度/半径请在上方工具栏直接调整。', True, self.colors['panel_text']), (rect.x + 10, y + 4))
         y += 28
 
-        surface.blit(self.tiny_font.render(f'分层步进: {self.height_layer_step_m:.2f}m', True, self.colors['panel_text']), (rect.x + 10, y + 2))
-        y += 24
-
-        surface.blit(self.tiny_font.render('区域平滑: 先框选，再点 1-3', True, self.colors['panel_text']), (rect.x + 10, y + 4))
-        smooth_1_rect = pygame.Rect(rect.x + 152, y, 24, 24)
-        smooth_2_rect = pygame.Rect(rect.x + 180, y, 24, 24)
-        smooth_3_rect = pygame.Rect(rect.x + 208, y, 24, 24)
-        self._draw_surface_button(surface, smooth_1_rect, '1', self.terrain_smooth_strength == 1)
-        self._draw_surface_button(surface, smooth_2_rect, '2', self.terrain_smooth_strength == 2)
-        self._draw_surface_button(surface, smooth_3_rect, '3', self.terrain_smooth_strength == 3)
-        self.terrain_overview_ui['buttons'].extend([
-            (smooth_1_rect, 'terrain_smooth_apply:1'),
-            (smooth_2_rect, 'terrain_smooth_apply:2'),
-            (smooth_3_rect, 'terrain_smooth_apply:3'),
-        ])
+        surface.blit(self.tiny_font.render(f'区域平滑强度: {self.terrain_smooth_strength}（工具栏设置，0=关闭）', True, self.colors['panel_text']), (rect.x + 10, y + 4))
         y += 30
 
         for line in (
@@ -1454,30 +1499,10 @@ class TerrainOverviewMixin:
         self._set_terrain_view_center(map_manager, world_pos)
 
     def _terrain_scene_perspective_matrix(self, fov_y, aspect, near, far):
-        factor = 1.0 / math.tan(fov_y / 2.0)
-        matrix = np.zeros((4, 4), dtype='f4')
-        matrix[0, 0] = factor / max(aspect, 1e-6)
-        matrix[1, 1] = factor
-        matrix[2, 2] = (far + near) / (near - far)
-        matrix[2, 3] = (2.0 * far * near) / (near - far)
-        matrix[3, 2] = -1.0
-        return matrix
+        return _terrain_scene_perspective_matrix(fov_y, aspect, near, far)
 
     def _terrain_scene_look_at(self, eye, target, up):
-        forward = target - eye
-        forward /= max(np.linalg.norm(forward), 1e-6)
-        right = np.cross(forward, up)
-        right /= max(np.linalg.norm(right), 1e-6)
-        true_up = np.cross(right, forward)
-
-        matrix = np.identity(4, dtype='f4')
-        matrix[0, :3] = right
-        matrix[1, :3] = true_up
-        matrix[2, :3] = -forward
-        matrix[0, 3] = -np.dot(right, eye)
-        matrix[1, 3] = -np.dot(true_up, eye)
-        matrix[2, 3] = np.dot(forward, eye)
-        return matrix
+        return _terrain_scene_look_at(eye, target, up)
 
     def _terrain_scene_pos_to_world(self, pos, game_engine):
         scene_rect = self.terrain_overview_ui.get('scene_rect')
@@ -1509,46 +1534,52 @@ class TerrainOverviewMixin:
 
         if backend_name == 'moderngl':
             width, height = scene_rect.size
-            aspect = width / max(height, 1)
             vertical_scale = 0.82
             max_height = max(1.0, float(np.max(sampled_heights) * vertical_scale))
-            zoom = max(1.0, float(getattr(self, 'terrain_scene_zoom', 1.0)))
-            distance = (max(float(grid_width), float(grid_height)) * 1.28 + max_height * 2.4 + 6.0) / zoom
-            pitch = max(0.20, min(1.15, self.terrain_3d_camera_pitch))
-            yaw = self.terrain_3d_camera_yaw
-            focus_grid_x, focus_grid_y = _terrain_scene_focus_grid(self, map_manager, grid_width, grid_height)
-            target = np.array([
-                focus_grid_x - grid_width / 2.0 + 0.5,
-                max_height * 0.18,
-                focus_grid_y - grid_height / 2.0 + 0.5,
-            ], dtype='f4')
-            camera = np.array([
-                math.sin(yaw) * math.cos(pitch) * distance,
-                math.sin(pitch) * distance + max_height * 0.55 + 2.0,
-                math.cos(yaw) * math.cos(pitch) * distance,
-            ], dtype='f4')
-            camera += target
-            projection = self._terrain_scene_perspective_matrix(math.radians(52.0), aspect, 0.1, max(distance * 4.0, 200.0))
-            view = self._terrain_scene_look_at(camera, target, np.array([0.0, 1.0, 0.0], dtype='f4'))
-            mvp = projection @ view
+            camera_state = build_terrain_scene_camera_state(
+                self,
+                map_manager,
+                scene_rect.size,
+                grid_width,
+                grid_height,
+                max_height,
+                scene_step=data.get('scene_step', 1),
+            )
+            inv_mvp = np.linalg.inv(camera_state['mvp']).astype('f4')
+            ndc_x = ((pos[0] - scene_rect.x) / max(width, 1)) * 2.0 - 1.0
+            ndc_y = 1.0 - ((pos[1] - scene_rect.y) / max(height, 1)) * 2.0
+            near_clip = np.array([ndc_x, ndc_y, -1.0, 1.0], dtype='f4')
+            far_clip = np.array([ndc_x, ndc_y, 1.0, 1.0], dtype='f4')
+            near_world = inv_mvp @ near_clip
+            far_world = inv_mvp @ far_clip
+            if abs(float(near_world[3])) <= 1e-6 or abs(float(far_world[3])) <= 1e-6:
+                return None
+            near_world = near_world[:3] / near_world[3]
+            far_world = far_world[:3] / far_world[3]
+            ray_dir = far_world - near_world
+            ray_length = np.linalg.norm(ray_dir)
+            if ray_length <= 1e-6 or abs(float(ray_dir[1])) <= 1e-6:
+                return None
+            ray_dir /= ray_length
             center_offset_x = grid_width / 2.0
             center_offset_y = grid_height / 2.0
-
-            for grid_y in range(grid_height):
-                for grid_x in range(grid_width):
-                    height_value = float(sampled_heights[grid_y, grid_x]) * vertical_scale
-                    vertex = np.array([grid_x - center_offset_x + 0.5, height_value, grid_y - center_offset_y + 0.5, 1.0], dtype='f4')
-                    clip = mvp @ vertex
-                    if abs(float(clip[3])) < 1e-6:
-                        continue
-                    ndc = clip[:3] / clip[3]
-                    if ndc[2] < -1.2 or ndc[2] > 1.2:
-                        continue
-                    screen_x = scene_rect.x + (float(ndc[0]) * 0.5 + 0.5) * width
-                    screen_y = scene_rect.y + (1.0 - (float(ndc[1]) * 0.5 + 0.5)) * height
-                    distance_sq = (screen_x - pos[0]) ** 2 + (screen_y - pos[1]) ** 2
-                    if best is None or distance_sq < best[0]:
-                        best = (distance_sq, grid_x, grid_y)
+            distance_to_plane = -float(near_world[1]) / float(ray_dir[1])
+            if distance_to_plane <= 0.0:
+                return None
+            hit = near_world + ray_dir * distance_to_plane
+            grid_x = int(round(float(hit[0]) + center_offset_x - 0.5))
+            grid_y = int(round(float(hit[2]) + center_offset_y - 0.5))
+            grid_x = max(0, min(grid_width - 1, grid_x))
+            grid_y = max(0, min(grid_height - 1, grid_y))
+            terrain_plane_y = float(sampled_heights[grid_y, grid_x]) * vertical_scale
+            distance_to_plane = (terrain_plane_y - float(near_world[1])) / float(ray_dir[1])
+            if distance_to_plane > 0.0:
+                hit = near_world + ray_dir * distance_to_plane
+                grid_x = int(round(float(hit[0]) + center_offset_x - 0.5))
+                grid_y = int(round(float(hit[2]) + center_offset_y - 0.5))
+                grid_x = max(0, min(grid_width - 1, grid_x))
+                grid_y = max(0, min(grid_height - 1, grid_y))
+            best = (0.0, grid_x, grid_y)
         else:
             width, height = scene_rect.size
             zoom = max(1.0, float(getattr(self, 'terrain_scene_zoom', 1.0)))
@@ -1577,9 +1608,9 @@ class TerrainOverviewMixin:
         if best is None:
             return None
         _, grid_x, grid_y = best
-        world_x = min(map_manager.map_width - 1, grid_x * cell_size + cell_size // 2)
-        world_y = min(map_manager.map_height - 1, grid_y * cell_size + cell_size // 2)
-        return int(world_x), int(world_y)
+        world_x = min(map_manager.map_width - 1, float(grid_x) * float(cell_size) + float(cell_size) * 0.5)
+        world_y = min(map_manager.map_height - 1, float(grid_y) * float(cell_size) + float(cell_size) * 0.5)
+        return float(world_x), float(world_y)
 
     def _terrain_brush_height_step(self, delta):
         self.terrain_brush['height_m'] = round(max(0.0, min(5.0, self.terrain_brush.get('height_m', 0.0) + delta)), 2)
@@ -1611,8 +1642,16 @@ class TerrainOverviewMixin:
             if self._handle_numeric_input_keydown(event, game_engine):
                 return True
             mods = pygame.key.get_mods()
-            if event.key == pygame.K_z and mods & pygame.KMOD_CTRL and hasattr(game_engine, 'undo_last_edit'):
+            if event.key == pygame.K_z and mods & pygame.KMOD_CTRL and not (mods & pygame.KMOD_SHIFT) and hasattr(game_engine, 'undo_last_edit'):
                 if game_engine.undo_last_edit():
+                    self.map_cache_surface = None
+                    self.map_cache_size = None
+                    self.terrain_3d_texture = None
+                    self.terrain_3d_render_key = None
+                    return True
+                return False
+            if (((event.key == pygame.K_y) and mods & pygame.KMOD_CTRL) or ((event.key == pygame.K_z) and mods & pygame.KMOD_CTRL and mods & pygame.KMOD_SHIFT)) and hasattr(game_engine, 'redo_last_edit'):
+                if game_engine.redo_last_edit():
                     self.map_cache_surface = None
                     self.map_cache_size = None
                     self.terrain_3d_texture = None
@@ -1671,8 +1710,7 @@ class TerrainOverviewMixin:
                     self._zoom_terrain_view(game_engine.map_manager, event.y, focus_world=zoom_world)
                     self.map_cache_surface = None
                     self.map_cache_size = None
-                    self.terrain_3d_texture = None
-                    self.terrain_3d_render_key = None
+                    self._invalidate_terrain_scene_cache()
                     return True
             if pointer_pos is not None:
                 if self.overview_side_panel_rect is not None and self.overview_side_panel_rect.collidepoint(pointer_pos) and self.overview_side_scroll_max > 0:
@@ -1711,7 +1749,7 @@ class TerrainOverviewMixin:
                 self.terrain_3d_camera_yaw += delta_x * 0.012
                 self.terrain_3d_camera_pitch = max(0.18, min(1.15, self.terrain_3d_camera_pitch - delta_y * 0.006))
                 self.terrain_3d_orbit_last_pos = event.pos
-                self.terrain_3d_render_key = None
+                self._invalidate_terrain_scene_cache()
                 return True
             if self.terrain_overview_viewport_drag_active:
                 self._drag_terrain_view_from_overview(event.pos, game_engine.map_manager)

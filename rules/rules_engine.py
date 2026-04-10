@@ -170,10 +170,10 @@ class RulesEngine:
                 'evasive_spin_duration': 1.8,
                 'evasive_spin_rate_deg': 420.0,
                 'hero_deployment_structure_fire': {
-                    'max_hit_probability': 0.8,
-                    'min_hit_probability': 0.3,
-                    'optimal_distance_m': 6.0,
-                    'falloff_end_distance_m': 24.0,
+                    'max_hit_probability': 0.7,
+                    'min_hit_probability': 0.2,
+                    'optimal_distance_m': 8.0,
+                    'falloff_end_distance_m': 20.0,
                     'target_types': ['outpost', 'base'],
                 },
                 'hero_mobile_accuracy_mult': 0.7,
@@ -804,10 +804,6 @@ class RulesEngine:
 
         shooter_height = self._shooter_view_height_m(shooter)
         target_height = self._target_armor_height_m(target)
-        step = max(map_manager.meters_to_world_units(self.rules['shooting'].get('los_sample_step_m', 0.25)), 1.0)
-        steps = max(2, int(distance / step) + 1)
-        clearance = float(self.rules['shooting'].get('los_clearance_m', 0.02))
-        endpoint_guard = min(0.12, 0.5 / max(steps, 1))
 
         meters_per_world_unit = max(float(map_manager.meters_to_world_units(1.0)), 1e-6)
         distance_m = distance / meters_per_world_unit
@@ -833,25 +829,9 @@ class RulesEngine:
             self._line_of_sight_cache[cache_key] = False
             return False
 
-        for index in range(1, steps):
-            progress = index / steps
-            if progress <= endpoint_guard or progress >= 1.0 - endpoint_guard:
-                continue
-            sample_x = start_x + (end_x - start_x) * progress
-            sample_y = start_y + (end_y - start_y) * progress
-            sample = map_manager.sample_raster_layers(sample_x, sample_y)
-            obstacle_height = max(float(sample.get('height_m', 0.0)), float(sample.get('vision_block_height_m', 0.0)))
-            sight_height = shooter_height + (target_height - shooter_height) * progress
-            sample_distance = max(distance_m * progress, 1e-6)
-            obstacle_pitch_rad = math.atan2((obstacle_height + clearance) - shooter_height, sample_distance)
-            if obstacle_pitch_rad >= target_pitch_rad - pitch_margin_rad:
-                self._line_of_sight_cache[cache_key] = False
-                return False
-            if obstacle_height >= sight_height - clearance:
-                self._line_of_sight_cache[cache_key] = False
-                return False
-        self._line_of_sight_cache[cache_key] = True
-        return True
+        line_clear = map_manager.is_vision_line_clear((start_x, start_y), (end_x, end_y), include_start=False, include_end=False)
+        self._line_of_sight_cache[cache_key] = bool(line_clear)
+        return bool(line_clear)
 
     def evaluate_auto_aim_target(self, shooter, target, distance=None, require_fov=True):
         if target is None or not target.is_alive() or target.team == shooter.team:
@@ -1097,20 +1077,46 @@ class RulesEngine:
             and self._available_ammo(shooter) > 0
         )
 
+    def _can_use_hero_structure_lob_fire(self, shooter, target=None):
+        if getattr(shooter, 'type', None) != 'robot' or getattr(shooter, 'robot_type', '') != '英雄':
+            return False
+        if self._available_ammo(shooter) <= 0:
+            return False
+        if self._can_use_hero_deployment_fire(shooter):
+            return target is None or getattr(target, 'type', None) in {'outpost', 'base'}
+        if not bool(getattr(shooter, 'hero_structure_lob_active', False)):
+            return False
+        desired_target_type = str(getattr(shooter, 'hero_structure_lob_target_type', '') or '').strip()
+        if desired_target_type not in {'outpost', 'base'}:
+            return False
+        if target is None:
+            return True
+        if not target.is_alive() or target.team == shooter.team or target.type != desired_target_type:
+            return False
+        if target.type == 'base' and self.is_base_shielded(target):
+            return False
+        return True
+
     def _resolve_hero_deployment_target(self, shooter, entities):
-        if not self._can_use_hero_deployment_fire(shooter):
+        if not self._can_use_hero_structure_lob_fire(shooter):
             return None
         deployment_rules = self.rules.get('shooting', {}).get('hero_deployment_structure_fire', {})
         allowed_types = tuple(deployment_rules.get('target_types', ['outpost', 'base']))
+        desired_target_type = str(getattr(shooter, 'hero_structure_lob_target_type', '') or '').strip()
         candidates = []
         for entity in entities:
             if entity.team == shooter.team or not entity.is_alive() or entity.type not in allowed_types:
+                continue
+            if desired_target_type in {'outpost', 'base'} and entity.type != desired_target_type:
                 continue
             if entity.type == 'base' and self.is_base_shielded(entity):
                 continue
             if not self.has_line_of_sight(shooter, entity):
                 continue
-            priority = 0 if entity.type == 'outpost' else 1
+            if desired_target_type in {'outpost', 'base'}:
+                priority = 0
+            else:
+                priority = 0 if entity.type == 'outpost' else 1
             distance = math.hypot(entity.position['x'] - shooter.position['x'], entity.position['y'] - shooter.position['y'])
             candidates.append((priority, distance, entity))
         if not candidates:
@@ -1847,6 +1853,11 @@ class RulesEngine:
 
         if region.get('type') == 'buff_hero_deployment':
             entity.hero_deployment_zone_active = True
+            if bool(getattr(entity, 'hero_deployment_forced_off', False)):
+                entity.hero_deployment_active = False
+                entity.hero_deployment_state = 'inactive'
+                entity.hero_deployment_charge = 0.0
+                return
             delay_sec = float(buff_rules.get('activation_delay_sec', 2.0))
             entity.hero_deployment_charge = min(delay_sec, float(getattr(entity, 'hero_deployment_charge', 0.0)) + dt)
             if entity.hero_deployment_charge + 1e-6 < delay_sec:
@@ -1988,6 +1999,7 @@ class RulesEngine:
             entity.hero_deployment_target_id = None
             entity.hero_deployment_hit_probability = 0.0
             entity.fly_slope_airborne_timer = max(0.0, float(getattr(entity, 'fly_slope_airborne_timer', 0.0)) - dt)
+            entity.fly_slope_airborne_height_m = max(0.0, float(getattr(entity, 'fly_slope_airborne_height_m', 0.0)))
             if getattr(entity, 'robot_type', '') != '英雄':
                 entity.hero_deployment_charge = 0.0
                 entity.hero_deployment_active = False
@@ -2005,7 +2017,7 @@ class RulesEngine:
             for region in regions:
                 region_type = region.get('type')
                 if region_type == 'dead_zone':
-                    if float(getattr(entity, 'fly_slope_airborne_timer', 0.0)) > 0.0:
+                    if float(getattr(entity, 'fly_slope_airborne_timer', 0.0)) > 0.0 or float(getattr(entity, 'fly_slope_airborne_height_m', 0.0)) >= 0.20:
                         continue
                     self._apply_dead_zone_penalty(entity)
                     break
@@ -2167,7 +2179,7 @@ class RulesEngine:
                     self._trigger_evasive_spin(target, shooter)
 
     def _resolve_autoaim_target(self, shooter, entities):
-        if self._can_use_hero_deployment_fire(shooter):
+        if self._can_use_hero_structure_lob_fire(shooter):
             return self._resolve_hero_deployment_target(shooter, entities)
         max_distance = self.get_range(shooter.type)
         locked_target = self._get_locked_autoaim_target(shooter, entities, max_distance)
@@ -2248,7 +2260,7 @@ class RulesEngine:
         if self.is_base_shielded(target):
             return 0.0
 
-        if self._can_use_hero_deployment_fire(shooter) and getattr(target, 'type', None) in {'outpost', 'base'}:
+        if self._can_use_hero_structure_lob_fire(shooter, target) and getattr(target, 'type', None) in {'outpost', 'base'}:
             raw_probability = self._calculate_hero_deployment_hit_probability(shooter, target, distance)
             return self._stabilize_hit_probability(
                 shooter,
@@ -2279,7 +2291,7 @@ class RulesEngine:
             )
 
         probability = self._get_auto_aim_accuracy(distance, target)
-        if getattr(shooter, 'robot_type', '') == '英雄' and not self._can_use_hero_deployment_fire(shooter):
+        if getattr(shooter, 'robot_type', '') == '英雄' and not self._can_use_hero_structure_lob_fire(shooter, target):
             translating_speed = self._meters_to_world_units(self.rules['shooting'].get('motion_thresholds', {}).get('translating_target_speed_mps', 0.45))
             shooter_speed = math.hypot(float(getattr(shooter, 'velocity', {}).get('vx', 0.0)), float(getattr(shooter, 'velocity', {}).get('vy', 0.0)))
             if shooter_speed >= translating_speed:
@@ -2307,7 +2319,7 @@ class RulesEngine:
         )
 
     def _calculate_hero_deployment_hit_probability(self, shooter, target, distance=None):
-        if not self._can_use_hero_deployment_fire(shooter):
+        if not self._can_use_hero_structure_lob_fire(shooter, target):
             return 0.0
         if target is None or not target.is_alive() or target.team == shooter.team or target.type not in {'outpost', 'base'}:
             return 0.0
@@ -2316,10 +2328,10 @@ class RulesEngine:
         if distance is None:
             distance = math.hypot(target.position['x'] - shooter.position['x'], target.position['y'] - shooter.position['y'])
         deployment_rules = self.rules.get('shooting', {}).get('hero_deployment_structure_fire', {})
-        max_probability = float(deployment_rules.get('max_hit_probability', 0.8))
-        min_probability = float(deployment_rules.get('min_hit_probability', 0.3))
-        optimal_distance = self._meters_to_world_units(float(deployment_rules.get('optimal_distance_m', 6.0)))
-        falloff_end_distance = self._meters_to_world_units(float(deployment_rules.get('falloff_end_distance_m', 24.0)))
+        max_probability = float(deployment_rules.get('max_hit_probability', 0.7))
+        min_probability = float(deployment_rules.get('min_hit_probability', 0.2))
+        optimal_distance = self._meters_to_world_units(float(deployment_rules.get('optimal_distance_m', 8.0)))
+        falloff_end_distance = self._meters_to_world_units(float(deployment_rules.get('falloff_end_distance_m', 20.0)))
         if distance <= optimal_distance:
             return max_probability
         if distance >= falloff_end_distance:

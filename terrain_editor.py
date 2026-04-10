@@ -4,6 +4,7 @@
 import os
 import re
 import sys
+import threading
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -35,9 +36,19 @@ class TerrainEditorEngine:
         self.entity_manager = SimpleNamespace(entities=[], get_entity=lambda _entity_id: None)
         self.rules_engine = SimpleNamespace(game_over=False, auto_aim_max_distance=0.0)
         self.preset_name = self._sanitize_preset_name(self.config.get('map', {}).get('preset', 'latest_map'))
+        self.available_map_names = []
         self.map_manager = MapManager(self.config)
         self.undo_stack = []
+        self.redo_stack = []
         self.max_undo_steps = 50
+        self._map_sync_lock = threading.Lock()
+        self._map_sync_event = threading.Event()
+        self._map_sync_stop_event = threading.Event()
+        self._map_sync_generation = 0
+        self._pending_map_sync_job = None
+        self._map_sync_worker = threading.Thread(target=self._map_sync_worker_loop, name='terrain-editor-map-sync', daemon=True)
+        self._map_sync_worker.start()
+        self.refresh_available_maps()
         self.reload_map_manager()
 
     def _sanitize_preset_name(self, name):
@@ -46,37 +57,202 @@ class TerrainEditorEngine:
         return sanitized or 'latest_map'
 
     def reload_map_manager(self):
+        with self._map_sync_lock:
+            self._map_sync_generation += 1
+            self._pending_map_sync_job = None
         self.map_manager = MapManager(self.config)
         self.map_manager.load_map()
 
+    def shutdown(self):
+        self._map_sync_stop_event.set()
+        self._map_sync_event.set()
+        worker = self._map_sync_worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=1.0)
+
+    def refresh_available_maps(self):
+        names = self.config_manager.list_map_presets(self.config_path)
+        self.available_map_names = names or [self.preset_name]
+        if self.preset_name not in self.available_map_names:
+            self.available_map_names.append(self.preset_name)
+            self.available_map_names.sort()
+
+    def _copy_facility_regions(self):
+        copied = []
+        for region in self.map_manager.facilities:
+            region_copy = dict(region)
+            points = region_copy.get('points')
+            if isinstance(points, list):
+                region_copy['points'] = [list(point) if isinstance(point, (list, tuple)) else point for point in points]
+            copied.append(region_copy)
+        return copied
+
+    def _build_map_metadata(self):
+        map_config = self.config.setdefault('map', {})
+        metadata = self._snapshot_metadata(map_config)
+        metadata['width'] = int(self.map_manager.map_width)
+        metadata['height'] = int(self.map_manager.map_height)
+        metadata['source_width'] = int(self.map_manager.source_map_width)
+        metadata['source_height'] = int(self.map_manager.source_map_height)
+        metadata['strict_scale'] = bool(self.map_manager.strict_scale_enabled)
+        metadata['coordinate_space'] = 'world'
+        return metadata
+
+    def _build_map_sync_payload_fast(self):
+        return {
+            'metadata': self._build_map_metadata(),
+            'facilities': self._copy_facility_regions(),
+            'terrain_grid': {
+                'cell_size': self.map_manager._serialized_grid_cell_size(self.map_manager.terrain_grid_cell_size),
+                'cells': [dict(cell) for cell in self.map_manager.terrain_grid_overrides.values()],
+            },
+            'function_grid': {
+                'cell_size': self.map_manager._serialized_grid_cell_size(self.map_manager.function_grid_cell_size or self.map_manager.terrain_grid_cell_size),
+                'cells': [dict(cell) for cell in self.map_manager.function_grid_overrides.values()],
+            },
+            'runtime_grid': deepcopy(self.map_manager.export_runtime_grid_config()),
+        }
+
+    def _build_map_sync_job(self, generation):
+        return {
+            'generation': int(generation),
+            'metadata': self._build_map_metadata(),
+            'facilities': self._copy_facility_regions(),
+            'terrain_cell_size': self.map_manager._serialized_grid_cell_size(self.map_manager.terrain_grid_cell_size),
+            'function_cell_size': self.map_manager._serialized_grid_cell_size(self.map_manager.function_grid_cell_size or self.map_manager.terrain_grid_cell_size),
+            'terrain_cells': tuple(self.map_manager.terrain_grid_overrides.values()),
+            'function_cells': tuple(self.map_manager.function_grid_overrides.values()),
+            'runtime_grid': deepcopy(self.map_manager.export_runtime_grid_config()),
+        }
+
+    def _apply_map_sync_payload(self, payload):
+        map_config = self.config.setdefault('map', {})
+        for key, value in payload.get('metadata', {}).items():
+            map_config[key] = deepcopy(value)
+        map_config['facilities'] = payload.get('facilities', [])
+        map_config['terrain_grid'] = payload.get('terrain_grid', {'cell_size': 1, 'cells': []})
+        map_config['function_grid'] = payload.get('function_grid', {'cell_size': 1, 'cells': []})
+        map_config['runtime_grid'] = payload.get('runtime_grid', {'resolution_m': 0.01, 'shape': [], 'channels': {}})
+        map_config['coordinate_space'] = 'world'
+
+    def _materialize_job_payload(self, job):
+        return {
+            'metadata': dict(job.get('metadata', {})),
+            'facilities': deepcopy(job.get('facilities', [])),
+            'terrain_grid': {
+                'cell_size': job.get('terrain_cell_size', 1),
+                'cells': [dict(cell) for cell in job.get('terrain_cells', ())],
+            },
+            'function_grid': {
+                'cell_size': job.get('function_cell_size', 1),
+                'cells': [dict(cell) for cell in job.get('function_cells', ())],
+            },
+            'runtime_grid': deepcopy(job.get('runtime_grid', {})),
+        }
+
+    def _map_sync_worker_loop(self):
+        while not self._map_sync_stop_event.is_set():
+            self._map_sync_event.wait(0.2)
+            if self._map_sync_stop_event.is_set():
+                return
+            self._map_sync_event.clear()
+            with self._map_sync_lock:
+                job = self._pending_map_sync_job
+                self._pending_map_sync_job = None
+                latest_generation = self._map_sync_generation
+            if job is None:
+                continue
+            payload = self._materialize_job_payload(job)
+            with self._map_sync_lock:
+                if int(job.get('generation', -1)) != self._map_sync_generation or latest_generation != self._map_sync_generation:
+                    continue
+                self._apply_map_sync_payload(payload)
+
+    def queue_map_sync(self):
+        with self._map_sync_lock:
+            self._map_sync_generation += 1
+            generation = self._map_sync_generation
+        job = self._build_map_sync_job(generation)
+        with self._map_sync_lock:
+            if generation != self._map_sync_generation:
+                return
+            self._pending_map_sync_job = job
+        self._map_sync_event.set()
+
     def sync_map_config(self):
-        self.config.setdefault('map', {})['facilities'] = self.map_manager.export_facilities_config()
-        self.config['map']['terrain_grid'] = self.map_manager.export_terrain_grid_config()
+        payload = self._build_map_sync_payload_fast()
+        with self._map_sync_lock:
+            self._map_sync_generation += 1
+            self._pending_map_sync_job = None
+            self._apply_map_sync_payload(payload)
+
+    def _snapshot_metadata(self, map_config):
+        metadata_keys = (
+            'image_path',
+            'origin_x',
+            'origin_y',
+            'unit',
+            'width',
+            'height',
+            'source_width',
+            'source_height',
+            'strict_scale',
+            'field_length_m',
+            'field_width_m',
+            'coordinate_space',
+        )
+        return {key: deepcopy(map_config.get(key)) for key in metadata_keys if key in map_config}
+
+    def _apply_snapshot(self, snapshot):
+        map_config = self.config.setdefault('map', {})
+        metadata = snapshot.get('metadata', {}) or {}
+        for key, value in metadata.items():
+            map_config[key] = deepcopy(value)
+        map_config['facilities'] = deepcopy(snapshot.get('facilities', []))
+        map_config['terrain_grid'] = deepcopy(snapshot.get('terrain_grid', {'cell_size': self.map_manager.terrain_grid_cell_size, 'cells': []}))
+        map_config['function_grid'] = deepcopy(snapshot.get('function_grid', {'cell_size': self.map_manager.terrain_grid_cell_size, 'cells': []}))
+        map_config['runtime_grid'] = deepcopy(snapshot.get('runtime_grid', {'resolution_m': 0.05, 'shape': [], 'channels': {}}))
+        map_config['coordinate_space'] = 'world'
+
+    def _trim_history(self):
+        if len(self.undo_stack) > self.max_undo_steps:
+            self.undo_stack = self.undo_stack[-self.max_undo_steps:]
+        if len(self.redo_stack) > self.max_undo_steps:
+            self.redo_stack = self.redo_stack[-self.max_undo_steps:]
 
     def capture_map_snapshot(self):
-        self.sync_map_config()
-        map_config = self.config.setdefault('map', {})
-        return {
-            'facilities': deepcopy(map_config.get('facilities', [])),
-            'terrain_grid': deepcopy(map_config.get('terrain_grid', {'cell_size': self.map_manager.terrain_grid_cell_size, 'cells': []})),
-        }
+        return self._build_map_sync_payload_fast()
 
     def push_undo_snapshot(self, label='编辑'):
         snapshot = self.capture_map_snapshot()
         self.undo_stack.append({'label': str(label), 'snapshot': snapshot})
-        if len(self.undo_stack) > self.max_undo_steps:
-            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+        self._trim_history()
 
     def undo_last_edit(self):
         if not self.undo_stack:
             self.add_log('没有可撤销的地图编辑', 'system')
             return False
+        current_snapshot = self.capture_map_snapshot()
         item = self.undo_stack.pop()
-        map_config = self.config.setdefault('map', {})
-        map_config['facilities'] = deepcopy(item['snapshot'].get('facilities', []))
-        map_config['terrain_grid'] = deepcopy(item['snapshot'].get('terrain_grid', {'cell_size': self.map_manager.terrain_grid_cell_size, 'cells': []}))
+        self.redo_stack.append({'label': str(item.get('label', '编辑')), 'snapshot': current_snapshot})
+        self._apply_snapshot(item['snapshot'])
         self.reload_map_manager()
+        self._trim_history()
         self.add_log(f'已撤销: {item["label"]}', 'system')
+        return True
+
+    def redo_last_edit(self):
+        if not self.redo_stack:
+            self.add_log('没有可重做的地图编辑', 'system')
+            return False
+        current_snapshot = self.capture_map_snapshot()
+        item = self.redo_stack.pop()
+        self.undo_stack.append({'label': str(item.get('label', '编辑')), 'snapshot': current_snapshot})
+        self._apply_snapshot(item['snapshot'])
+        self.reload_map_manager()
+        self._trim_history()
+        self.add_log(f'已重做: {item["label"]}', 'system')
         return True
 
     def add_log(self, message, team='system'):
@@ -87,8 +263,14 @@ class TerrainEditorEngine:
     def save_preset(self, preset_name=None):
         name = self._sanitize_preset_name(preset_name or self.preset_name)
         self.sync_map_config()
-        preset_path = self.config_manager.save_map_preset(name, config=self.config, config_path=self.config_path)
+        preset_path = self.config_manager.save_map_preset(
+            name,
+            config=self.config,
+            config_path=self.config_path,
+            map_manager=self.map_manager,
+        )
         self.preset_name = name
+        self.refresh_available_maps()
         self.config.setdefault('map', {})['preset'] = name
         saved_label = os.path.basename(preset_path) if preset_path else f'{name}.json'
         self.add_log(f'地图预设已保存: {saved_label}')
@@ -108,17 +290,49 @@ class TerrainEditorEngine:
             self.add_log(f'未找到地图预设: {name}', 'system')
             return False
         current_map = self.config.setdefault('map', {})
-        metadata_keys = ['image_path', 'origin_x', 'origin_y', 'unit', 'width', 'height', 'field_length_m', 'field_width_m']
+        metadata_keys = [
+            'image_path',
+            'origin_x',
+            'origin_y',
+            'unit',
+            'width',
+            'height',
+            'source_width',
+            'source_height',
+            'strict_scale',
+            'field_length_m',
+            'field_width_m',
+            'coordinate_space',
+        ]
         for key in metadata_keys:
             if key in preset_map:
                 current_map[key] = preset_map[key]
         current_map['facilities'] = preset_map.get('facilities', [])
         current_map['terrain_grid'] = preset_map.get('terrain_grid', {'cell_size': current_map.get('terrain_grid', {}).get('cell_size', 8), 'cells': []})
+        current_map['function_grid'] = preset_map.get('function_grid', {'cell_size': current_map.get('function_grid', {}).get('cell_size', current_map.get('terrain_grid', {}).get('cell_size', 8)), 'cells': []})
+        current_map['runtime_grid'] = preset_map.get('runtime_grid', {})
+        if preset_map.get('_preset_path'):
+            current_map['_preset_path'] = preset_map.get('_preset_path')
         current_map['preset'] = name
         self.preset_name = name
+        self.refresh_available_maps()
+        self.undo_stack.clear()
+        self.redo_stack.clear()
         self.reload_map_manager()
         self.add_log(f'已重载地图预设: {name}')
         return True
+
+    def cycle_available_map(self, delta):
+        self.refresh_available_maps()
+        if not self.available_map_names:
+            return None
+        if self.preset_name not in self.available_map_names:
+            self.preset_name = self.available_map_names[0]
+            return self.preset_name
+        current_index = self.available_map_names.index(self.preset_name)
+        next_index = (current_index + int(delta)) % len(self.available_map_names)
+        self.preset_name = self.available_map_names[next_index]
+        return self.preset_name
 
     def run(self, renderer):
         self.running = True
@@ -137,6 +351,7 @@ class TerrainEditorEngine:
             renderer.render(self)
             clock.tick(max(30, int(self.config.get('simulator', {}).get('fps', 50))))
 
+        self.shutdown()
         pygame.quit()
 
 
@@ -229,6 +444,7 @@ class TerrainEditorRenderer(Renderer):
 
     def render(self, game_engine):
         self._refresh_editor_state(game_engine)
+        self._update_terrain_scene_navigation(game_engine)
         self.screen.fill(self.colors['bg'])
         self.toolbar_actions = []
         self.hud_actions = []
@@ -261,6 +477,20 @@ class TerrainEditorRenderer(Renderer):
             self.terrain_overview_ui['buttons'].append((rect, action))
             x = rect.right + 8
 
+        prev_map_rect = pygame.Rect(x, 12, 32, 36)
+        next_map_rect = pygame.Rect(x + 244, 12, 32, 36)
+        name_box_rect = pygame.Rect(x + 40, 12, 196, 36)
+        self._draw_surface_button(surface, prev_map_rect, '<', False)
+        self._draw_surface_button(surface, next_map_rect, '>', False)
+        pygame.draw.rect(surface, self.colors['white'], name_box_rect, border_radius=6)
+        pygame.draw.rect(surface, self.colors['panel_border'], name_box_rect, 1, border_radius=6)
+        map_name = game_engine.preset_name or 'unnamed'
+        map_rendered = self.small_font.render(map_name, True, self.colors['panel_text'])
+        surface.blit(map_rendered, map_rendered.get_rect(center=name_box_rect.center))
+        self.terrain_overview_ui['buttons'].append((prev_map_rect, 'editor_prev_map'))
+        self.terrain_overview_ui['buttons'].append((next_map_rect, 'editor_next_map'))
+        x = next_map_rect.right + 12
+
         name_label = self.tiny_font.render('预设名', True, self.colors['toolbar_text'])
         surface.blit(name_label, (x + 4, 8))
         input_rect = pygame.Rect(x, 24, 200, 24)
@@ -272,7 +502,7 @@ class TerrainEditorRenderer(Renderer):
         surface.blit(rendered, (input_rect.x + 10, input_rect.y + 3))
         self.terrain_overview_ui['buttons'].append((input_rect, 'editor_focus_preset_name'))
 
-        hint = self.tiny_font.render('Ctrl+S 保存 | Ctrl+Shift+S 应用 | Ctrl+Z 撤销 | Tab 切换地形/设施', True, self.colors['toolbar_text'])
+        hint = self.tiny_font.render('Ctrl+S 保存 | Ctrl+Shift+S 应用 | Ctrl+Z 撤销 | Ctrl+Y 重做 | Tab 切换地形/设施', True, self.colors['toolbar_text'])
         surface.blit(hint, (width - hint.get_width() - 12, 22))
         return header_rect.height
 
@@ -282,6 +512,8 @@ class TerrainEditorRenderer(Renderer):
             ('保存预设', 'editor_save_preset', False),
             ('应用到主程序', 'editor_apply_preset', False),
             ('重载预设', 'editor_reload_preset', False),
+            ('上一张', 'editor_prev_map', False),
+            ('下一张', 'editor_next_map', False),
             ('总览窗口', 'editor_toggle_overview', self.terrain_overview_window_open),
             ('地形刷', 'terrain_tool:terrain', self.terrain_editor_tool == 'terrain'),
             ('设施放置', 'terrain_tool:facility', self.terrain_editor_tool == 'facility'),
@@ -310,7 +542,7 @@ class TerrainEditorRenderer(Renderer):
         self.screen.blit(rendered, (input_rect.x + 10, input_rect.y + 9))
         self.toolbar_actions.append((input_rect, 'editor_focus_preset_name'))
 
-        hint = self.tiny_font.render('Ctrl+S 保存预设 | Ctrl+Shift+S 应用到主程序 | Tab 切换工具', True, self.colors['toolbar_text'])
+        hint = self.tiny_font.render('Ctrl+S 保存预设 | Ctrl+Shift+S 应用 | Ctrl+Z 撤销 | Ctrl+Y 重做 | Tab 切换工具', True, self.colors['toolbar_text'])
         self.screen.blit(hint, (self.window_width - hint.get_width() - 12, 19))
 
     def render_match_hud(self, game_engine):
@@ -409,6 +641,22 @@ class TerrainEditorRenderer(Renderer):
             self.map_cache_size = None
             self.terrain_3d_render_key = None
             return
+        if action == 'editor_prev_map':
+            selected = game_engine.cycle_available_map(-1)
+            if selected:
+                game_engine.reload_preset(selected)
+                self.map_cache_surface = None
+                self.map_cache_size = None
+                self.terrain_3d_render_key = None
+            return
+        if action == 'editor_next_map':
+            selected = game_engine.cycle_available_map(1)
+            if selected:
+                game_engine.reload_preset(selected)
+                self.map_cache_surface = None
+                self.map_cache_size = None
+                self.terrain_3d_render_key = None
+            return
         if action == 'editor_toggle_overview':
             self.terrain_overview_window_open = True
             return
@@ -416,6 +664,15 @@ class TerrainEditorRenderer(Renderer):
             self.terrain_overview_window_open = True
             return
         return super()._execute_action(game_engine, action)
+
+    def _sync_terrain_grid_config(self, game_engine):
+        if not self.terrain_paint_dirty:
+            return
+        if hasattr(game_engine, 'queue_map_sync'):
+            game_engine.queue_map_sync()
+        else:
+            super()._sync_terrain_grid_config(game_engine)
+        self.terrain_paint_dirty = False
 
 
 def main():

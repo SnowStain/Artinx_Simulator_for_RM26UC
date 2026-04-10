@@ -41,10 +41,9 @@ class BehaviorEditorEngine:
         'defense': '防守类',
         'area_patrol': '区域巡航类',
     }
-    DESTINATION_MODE_ORDER = ('region', 'reference', 'none')
+    DESTINATION_MODE_ORDER = ('region', 'none')
     DESTINATION_MODE_LABELS = {
         'region': '到达选定区域',
-        'reference': '跟随引用目标',
         'none': '不设置目标地点',
     }
     DESTINATION_REFERENCE_ORDER = (
@@ -135,10 +134,20 @@ class BehaviorEditorEngine:
 
     def _load_behavior_payload(self, preset_name):
         payload = self.config_manager.load_behavior_preset(preset_name, self.config_path)
-        if isinstance(payload, dict):
+        if isinstance(payload, dict) and 'roles' in payload:
             payload.setdefault('version', 1)
             payload.setdefault('name', str(preset_name))
             payload.setdefault('roles', {})
+            roles = payload.get('roles', {})
+            if isinstance(roles, dict):
+                for role_entry in roles.values():
+                    if not isinstance(role_entry, dict):
+                        continue
+                    decisions = role_entry.get('decisions', {})
+                    if not isinstance(decisions, dict):
+                        continue
+                    for decision_id, override in list(decisions.items()):
+                        decisions[decision_id] = self._normalize_override(override)
             return payload
         return self._empty_payload(preset_name)
 
@@ -301,9 +310,6 @@ class BehaviorEditorEngine:
             destination_mode = 'region'
         if destination_mode != 'region':
             normalized['destination_mode'] = destination_mode
-        destination_ref = str(strategy.get('destination_ref', '') or '').strip()
-        if destination_ref:
-            normalized['destination_ref'] = destination_ref
         assault_ref = str(strategy.get('assault_ref', 'enemy_any_unit') or 'enemy_any_unit').strip()
         if assault_ref and assault_ref != 'enemy_any_unit':
             normalized['assault_ref'] = assault_ref
@@ -332,7 +338,7 @@ class BehaviorEditorEngine:
         stages = []
         raw_stages = strategy.get('stages', None)
         if isinstance(raw_stages, list):
-            for stage in raw_stages[:self.MAX_STRATEGY_STAGES]:
+            for stage in raw_stages:
                 normalized_stage = self._normalize_strategy_stage(stage)
                 if normalized_stage:
                     stages.append(normalized_stage)
@@ -354,8 +360,6 @@ class BehaviorEditorEngine:
             and not normalized.get('time_window')
             and not normalized.get('behavior_regions')
             and not normalized.get('behavior_regions_by_team')
-            and not normalized.get('point_targets')
-            and not normalized.get('point_targets_by_team')
             and not normalized.get('strategy')
             and normalized.get('region_mode', 'enter_then_execute') == 'enter_then_execute'
         )
@@ -367,7 +371,8 @@ class BehaviorEditorEngine:
             if text:
                 override[field_name] = text
             else:
-                override.pop(field_name, None)
+                if field_name in override:
+                    override.pop(field_name)
         if 'time_window' in override and not isinstance(override['time_window'], dict):
             override.pop('time_window', None)
         behavior_regions = self._normalize_region_list(override.get('behavior_regions', []))
@@ -400,16 +405,8 @@ class BehaviorEditorEngine:
         override.pop('destination_regions', None)
         override.pop('task_regions_by_team', None)
         override.pop('destination_regions_by_team', None)
-        point_targets = self._normalize_point_target_specs(override.get('point_targets', {}))
-        if point_targets:
-            override['point_targets'] = point_targets
-        else:
-            override.pop('point_targets', None)
-        point_targets_by_team = self._normalize_team_point_target_specs(override.get('point_targets_by_team', {}))
-        if point_targets_by_team:
-            override['point_targets_by_team'] = point_targets_by_team
-        else:
-            override.pop('point_targets_by_team', None)
+        override.pop('point_targets', None)
+        override.pop('point_targets_by_team', None)
         strategy = self._normalize_strategy(override.get('strategy', {}))
         if strategy:
             override['strategy'] = strategy
@@ -797,30 +794,13 @@ class BehaviorEditorEngine:
         return self.current_behavior_regions(team=team)
 
     def current_point_targets(self, team=None):
-        spec = self.selected_spec()
-        if spec is None:
-            return {}
-        return dict(self.ai_controller.get_decision_point_targets(self.selected_role_key(), spec['id'], self.map_manager, team=team))
+        return {}
 
     def current_point_target_specs(self, team=None):
-        spec = self.selected_spec()
-        if spec is None:
-            return {}
-        return {
-            str(target_id): dict(target_spec)
-            for target_id, target_spec in self.ai_controller.get_decision_point_target_specs(self.selected_role_key(), spec['id'], self.map_manager, team=team).items()
-        }
+        return {}
 
     def editable_point_targets(self):
-        spec = self.selected_spec() or {}
-        editable = spec.get('editable_targets', ())
-        items = [dict(item) for item in editable if isinstance(item, dict) and str(item.get('id', '')).strip()]
-        if any(str(stage.get('task_type', 'default')) == 'terrain_traversal' for stage in self.strategy_stages()):
-            existing = {str(item.get('id')) for item in items}
-            for item in self.STRATEGY_TERRAIN_TARGET_DEFS:
-                if item['id'] not in existing:
-                    items.append(dict(item))
-        return items
+        return []
 
     def strategy_stages(self):
         override = self.current_override(create=False) or {}
@@ -847,7 +827,7 @@ class BehaviorEditorEngine:
         while len(stages) <= stage_index:
             stages.append({})
         stage = dict(stages[stage_index])
-        if field_name in {'task_type', 'destination_mode', 'destination_ref', 'assault_ref', 'assault_follow_priority', 'interaction_ref', 'defense_ref'}:
+        if field_name in {'task_type', 'destination_mode', 'assault_ref', 'assault_follow_priority', 'interaction_ref', 'defense_ref'}:
             text = str(value or '').strip()
             if field_name == 'task_type' and (not text or text == 'default'):
                 stage.pop('task_type', None)
@@ -903,9 +883,6 @@ class BehaviorEditorEngine:
         elif field_name == 'destination_mode':
             order = self.DESTINATION_MODE_ORDER
             current = str(strategy.get('destination_mode', 'region'))
-        elif field_name == 'destination_ref':
-            order = self.DESTINATION_REFERENCE_ORDER
-            current = str(strategy.get('destination_ref', order[0]))
         elif field_name == 'assault_ref':
             order = self.ASSAULT_REFERENCE_ORDER
             current = str(strategy.get('assault_ref', order[0]))
@@ -934,8 +911,7 @@ class BehaviorEditorEngine:
         return self.DESTINATION_MODE_LABELS.get(mode, mode)
 
     def current_destination_ref_label(self, stage_index=0):
-        reference = str(self.current_strategy_stage(stage_index).get('destination_ref', self.DESTINATION_REFERENCE_ORDER[0]))
-        return self.STRATEGY_REFERENCE_LABELS.get(reference, reference)
+        return '已停用'
 
     def current_assault_ref_label(self, stage_index=0):
         reference = str(self.current_strategy_stage(stage_index).get('assault_ref', self.ASSAULT_REFERENCE_ORDER[0]))
@@ -1015,10 +991,6 @@ class BehaviorEditorEngine:
             logic_lines.append(f'默认设施目标类型: {", ".join(str(item) for item in binding.get("default_destination_types", ()))}')
         if binding.get('terrain_mode'):
             logic_lines.append(f'地形模式: {binding.get("terrain_mode")}')
-        editable_targets = [str(item.get('id', '')) for item in binding.get('editable_targets', ()) if isinstance(item, dict)]
-        if editable_targets:
-            logic_lines.append(f'可编辑目标点接口: {", ".join(editable_targets)}')
-
         function_lines = [
             f'condition: {self._callable_source_label(condition_callable or spec.get("condition"))}',
             f'action: {self._callable_source_label(action_callable or spec.get("action"))}',
@@ -1034,10 +1006,8 @@ class BehaviorEditorEngine:
             'condition_expr: 额外触发条件表达式',
             'region_mode: 先进入行为区域 or 严格在区域内',
             'behavior_regions: 统一行为区域',
-            'point_targets: 跨越节点或自定义目标点（支持半径）',
             'strategy.stages[n].task_type: 阶段行为类型',
             'strategy.stages[n].destination_mode: 阶段目标模式',
-            'strategy.stages[n].destination_ref: 阶段引用目标',
             'strategy.stages[n].assault_ref: 阶段进攻对象',
             'strategy.stages[n].assault_follow_priority: 引用地点/目标优先级',
             'strategy.stages[n].interaction_ref: 场地交互目标',
@@ -1099,23 +1069,7 @@ class BehaviorEditorEngine:
         return True
 
     def _replace_team_point_targets(self, team, targets):
-        override = self.current_override(create=True)
-        if override is None:
-            return False
-        point_targets_by_team = self._normalize_team_point_target_specs(override.get('point_targets_by_team', {}))
-        point_targets_by_team[team] = {
-            str(target_id): ({
-                'x': round(float(point.get('x', point.get('cx', 0.0))), 1),
-                'y': round(float(point.get('y', point.get('cy', 0.0))), 1),
-                **({'radius': round(max(6.0, float(point.get('radius', 0.0))), 1)} if point.get('radius', None) not in {None, ''} else {}),
-            } if isinstance(point, dict) else {
-                'x': round(float(point[0]), 1),
-                'y': round(float(point[1]), 1),
-            })
-            for target_id, point in targets.items()
-        }
-        override['point_targets_by_team'] = point_targets_by_team
-        return True
+        return False
 
     def mirror_current_team_to_opponent(self, source_team):
         source_team = str(source_team or 'red')
@@ -1124,23 +1078,8 @@ class BehaviorEditorEngine:
             self._mirror_region_across_map_center(region, target_team)
             for region in self.current_behavior_regions(team=source_team)
         ]
-        point_targets = {}
-        for target_id, point_spec in self.current_point_target_specs(team=source_team).items():
-            mirrored_point = self._mirror_point_across_map_center((point_spec.get('x', 0.0), point_spec.get('y', 0.0)))
-            if mirrored_point is None:
-                continue
-            radius_value = point_spec.get('radius')
-            mirrored_spec = {
-                'x': mirrored_point[0],
-                'y': mirrored_point[1],
-            }
-            if radius_value not in {None, ''}:
-                mirrored_spec['radius'] = float(str(radius_value))
-            point_targets[str(target_id)] = mirrored_spec
         updated = False
         updated = self._replace_team_regions('behavior', target_team, behavior_regions) or updated
-        if point_targets:
-            updated = self._replace_team_point_targets(target_team, point_targets) or updated
         if not updated:
             return False
         self.prune_current_override_if_default()
@@ -1249,69 +1188,13 @@ class BehaviorEditorEngine:
         return True
 
     def set_point_target(self, target_id, point, team=None):
-        override = self.current_override(create=True)
-        if override is None:
-            return
-
-        point_targets_by_team = self._normalize_team_point_target_specs(override.get('point_targets_by_team', {}))
-        team_targets = point_targets_by_team.setdefault(team, {})
-        current_spec = dict(team_targets.get(str(target_id), {}))
-        radius_value = current_spec.get('radius')
-        target_spec = {
-            'x': round(float(point[0]), 1),
-            'y': round(float(point[1]), 1),
-        }
-        if radius_value not in {None, ''}:
-            target_spec['radius'] = float(str(radius_value))
-        team_targets[str(target_id)] = target_spec
-
-        override['point_targets_by_team'] = point_targets_by_team
-
-        self.prune_current_override_if_default()
-        self._persist_live_changes('已更新目标点')
+        return
 
     def set_point_target_radius(self, target_id, radius, team=None):
-        override = self.current_override(create=True)
-        if override is None:
-            return False
-        point_targets_by_team = self._normalize_team_point_target_specs(override.get('point_targets_by_team', {}))
-        team_targets = point_targets_by_team.setdefault(team, {})
-        current_spec = dict(team_targets.get(str(target_id), {}))
-        if not current_spec:
-            return False
-        current_spec['radius'] = round(max(6.0, float(radius)), 1)
-        team_targets[str(target_id)] = current_spec
-        override['point_targets_by_team'] = point_targets_by_team
-        self.prune_current_override_if_default()
-        self._persist_live_changes('已更新节点生效范围')
-        return True
+        return False
 
     def clear_point_target(self, target_id, team=None):
-        override = self.current_override(create=False)
-        if override is None:
-            return
-        removed = False
-        if team in {'red', 'blue'}:
-            by_team = override.get('point_targets_by_team', {})
-            targets = by_team.get(team) if isinstance(by_team, dict) else None
-            if isinstance(targets, dict) and str(target_id) in targets:
-                targets.pop(str(target_id), None)
-                removed = True
-                if not targets:
-                    by_team.pop(team, None)
-                if not by_team:
-                    override.pop('point_targets_by_team', None)
-        else:
-            targets = override.get('point_targets')
-            if isinstance(targets, dict) and str(target_id) in targets:
-                targets.pop(str(target_id), None)
-                removed = True
-                if not targets:
-                    override.pop('point_targets', None)
-        if removed:
-            self.prune_current_override_if_default()
-            self._persist_live_changes('已清除目标点')
-        return removed
+        return False
 
     def clear_current_override(self):
         spec = self.selected_spec()
@@ -2188,7 +2071,7 @@ class BehaviorEditorApp:
         self.screen.blit(rendered, (preset_rect.x + 10, preset_rect.y + 8))
         self.click_actions.append((preset_rect, 'edit:preset_name'))
 
-        hint_text = '绿色=行为区域 | 策略页可编辑 4 个顺序阶段 | 目标点点设后左键落点'
+        hint_text = '绿色=行为区域 | 策略页可编辑 4 个顺序阶段'
         hint = self.tiny_font.render(hint_text, True, self.colors['toolbar_text'])
         hint_x = preset_rect.right + 14
         if hint_x + hint.get_width() <= self.window_width - 12:
@@ -2206,15 +2089,11 @@ class BehaviorEditorApp:
         self._render_facility_overlay()
         self._render_behavior_regions()
         self._render_selected_region_overlay()
-        self._render_point_targets_overlay()
         self._render_preview_target_regions()
         self._render_preview_units()
         self._render_drawing_preview()
         if self.mouse_world is not None:
-            point_hint = ''
-            if self.point_edit_target is not None:
-                point_hint = f' | 正在设置目标点: {self.point_edit_target}'
-            coord_text = self.tiny_font.render(f'世界坐标: ({int(self.mouse_world[0])}, {int(self.mouse_world[1])}) | 缩放 {self.map_zoom:.2f}x{point_hint}', True, self.colors['panel_text'])
+            coord_text = self.tiny_font.render(f'世界坐标: ({int(self.mouse_world[0])}, {int(self.mouse_world[1])}) | 缩放 {self.map_zoom:.2f}x', True, self.colors['panel_text'])
             self.screen.blit(coord_text, (map_area_rect.x + 10, map_area_rect.bottom - coord_text.get_height() - 8))
 
     def _render_facility_overlay(self):
@@ -2270,40 +2149,7 @@ class BehaviorEditorApp:
         self._render_region_collection(self.engine.current_behavior_regions(team=self.region_edit_team), self.colors['green'], width=3)
 
     def _render_point_targets_overlay(self):
-        target_defs = self.engine.editable_point_targets()
-        if not target_defs:
-            return
-        targets = self.engine.current_point_target_specs(team=self.region_edit_team)
-        if not targets:
-            return
-        color = self.colors['red'] if self.region_edit_team == 'red' else self.colors['blue']
-        ordered_points = []
-        for index, item in enumerate(target_defs, start=1):
-            point_spec = targets.get(str(item.get('id', '')))
-            if point_spec is None:
-                continue
-            point = (float(point_spec.get('x', 0.0)), float(point_spec.get('y', 0.0)))
-            ordered_points.append(point)
-            screen_point = self.world_to_screen(point)
-            if screen_point is None:
-                continue
-            active = self.point_edit_target == str(item.get('id', ''))
-            radius = float(point_spec.get('radius', 0.0) or 0.0)
-            if radius > 0.0:
-                edge_point = self.world_to_screen((point[0] + radius, point[1]))
-                if edge_point is not None:
-                    draw_radius = max(2, int(math.hypot(edge_point[0] - screen_point[0], edge_point[1] - screen_point[1])))
-                    pygame.draw.circle(self.screen, self.colors['orange'] if active else color, screen_point, draw_radius, 2)
-            pygame.draw.circle(self.screen, self.colors['white'], screen_point, 10)
-            pygame.draw.circle(self.screen, self.colors['orange'] if active else color, screen_point, 10, 3)
-            label_surface = self.tiny_font.render(str(index), True, self.colors['panel_text'])
-            self.screen.blit(label_surface, (screen_point[0] - label_surface.get_width() // 2, screen_point[1] - label_surface.get_height() // 2))
-        if len(ordered_points) >= 2:
-            for start, end in zip(ordered_points[:-1], ordered_points[1:]):
-                start_point = self.world_to_screen(start)
-                end_point = self.world_to_screen(end)
-                if start_point is not None and end_point is not None:
-                    pygame.draw.line(self.screen, color, start_point, end_point, 2)
+        return
 
     def _render_selected_region_overlay(self):
         region = deepcopy(self.region_drag_state['preview']) if self.region_drag_state is not None else self._selected_region()
@@ -2397,13 +2243,11 @@ class BehaviorEditorApp:
         task_type = self.engine.current_strategy_task_type_label(stage_index)
         parts = [task_type]
         destination_mode = str(stage.get('destination_mode', 'region') or 'region')
-        if destination_mode == 'reference':
-            parts.append(self.engine.current_destination_ref_label(stage_index))
+        if destination_mode == 'none':
+            parts.append('无目标地点')
         task_key = str(stage.get('task_type', 'default') or 'default')
         if task_key == 'assault':
             parts.append(self.engine.current_assault_ref_label(stage_index))
-            if destination_mode == 'reference':
-                parts.append(self.engine.current_assault_follow_priority_label(stage_index))
         if task_key == 'field_interaction':
             parts.append(self.engine.current_interaction_ref_label(stage_index))
         if task_key == 'defense':
@@ -2598,15 +2442,9 @@ class BehaviorEditorApp:
             card_y += card_h_small + 8
             self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_small), '目标地点类型', [self.engine.current_destination_mode_label(selected_stage_index)], action=f'cycle:destination_mode:{selected_stage_index}', active=True)
             card_y += card_h_small + 8
-            if destination_mode == 'reference':
-                self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_medium), '目标地点引用', [self.engine.current_destination_ref_label(selected_stage_index)], action=f'cycle:destination_ref:{selected_stage_index}', active=True)
-                card_y += card_h_medium + 8
             if task_type == 'assault':
                 self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_medium), '进攻对象', [self.engine.current_assault_ref_label(selected_stage_index)], action=f'cycle:assault_ref:{selected_stage_index}', active=True)
                 card_y += card_h_medium + 8
-                if destination_mode == 'reference':
-                    self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_small), '引用优先级', [self.engine.current_assault_follow_priority_label(selected_stage_index)], action=f'cycle:assault_follow_priority:{selected_stage_index}', active=True)
-                    card_y += card_h_small + 8
             if task_type == 'field_interaction':
                 self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_medium), '交互目标', [self.engine.current_interaction_ref_label(selected_stage_index)], action=f'cycle:interaction_ref:{selected_stage_index}', active=True)
                 card_y += card_h_medium + 8
@@ -2619,25 +2457,19 @@ class BehaviorEditorApp:
             self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, 144), '策略说明', [
                 '一个决策最多可配置 4 个顺序阶段，会按阶段 1 到 4 依次执行。',
                 '地形跨越类：使用跨越节点 1 到 4，节点自带生效范围，不再额外叠目标区域。',
-                '进攻类：可设置进攻对象，并在“跟随引用目标”时切换目标优先或地点优先。',
+                '进攻类：可设置进攻对象。',
                 '场地交互类：支持补给、取矿、激活能量机关。',
                 '防守类：需要先配置行为区域，再选择高威胁敌人或回防基地。',
                 '区域巡航类：在行为区域内随机巡航，触敌距离可单独配置。',
-                '目标地点可设置为行为区域、引用目标，也可以明确关闭。',
+                '目标地点可设置为行为区域，也可以明确关闭。',
             ])
             card_y += 152
         elif self.detail_page == 'region':
             behavior_regions = self.engine.current_behavior_regions(team=self.region_edit_team)
-            editable_targets = self.engine.editable_point_targets()
-            point_targets = self.engine.current_point_target_specs(team=self.region_edit_team)
             edit_team_label = '红方' if self.region_edit_team == 'red' else '蓝方'
             terrain_stage_active = str(self.engine.current_strategy_stage(selected_stage_index).get('task_type', 'default') or 'default') == 'terrain_traversal'
             self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_small), '当前编辑队伍', [edit_team_label], action=f'edit_team:{self.region_edit_team}', active=True)
             card_y += card_h_small + 8
-            if editable_targets:
-                point_rect = pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, self._point_target_section_height(len(editable_targets)))
-                self._render_point_target_section(point_rect, f'目标点 / 节点列表（{edit_team_label}）', editable_targets, point_targets)
-                card_y += point_rect.height + 8
             if not terrain_stage_active:
                 self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, card_h_small), '行为区域数量', [f'{len(behavior_regions)} 个区域'])
                 card_y += card_h_small + 8
@@ -2648,8 +2480,7 @@ class BehaviorEditorApp:
                 card_y += card_h_small + 8
             self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, 122), '绘制说明', [
                 '绿色区域表示统一的行为区域。',
-                '切到策略页的地形跨越类后，可在这里布置跨越节点 1 到 4，并用滚轮调节点范围。',
-                '地形跨越类不再额外使用行为区域，直接按节点区判定到达。',
+                '地形跨越类当前不再使用旧目标点/节点预设。',
                 '工具栏可切换当前红蓝双方。',
                 '矩形/圆形：左键拖拽完成；多边形：左键逐点添加，点回起点或 Enter 收尾。',
                 '点击已有区域可选中并拖拽编辑，右侧列表也可直接选中或删除。',
@@ -2848,15 +2679,6 @@ class BehaviorEditorApp:
                 if self.selected_region_kind == region_kind and self.selected_region_team == self.region_edit_team and self.selected_region_index == int(raw_index):
                     self._clear_region_selection()
             return
-        if action.startswith('edit_point_target:'):
-            self.point_edit_target = action.split(':', 1)[1]
-            self._clear_region_selection()
-            return
-        if action.startswith('clear_point_target:'):
-            self.engine.clear_point_target(action.split(':', 1)[1], team=self.region_edit_team)
-            if self.point_edit_target == action.split(':', 1)[1]:
-                self.point_edit_target = None
-            return
         if action.startswith('edit:'):
             parts = action.split(':')
             field = ':'.join(parts[1:])
@@ -2886,9 +2708,6 @@ class BehaviorEditorApp:
             return
         if action.startswith('cycle:destination_mode:'):
             self.engine.cycle_strategy_field('destination_mode', stage_index=int(action.rsplit(':', 1)[1]))
-            return
-        if action.startswith('cycle:destination_ref:'):
-            self.engine.cycle_strategy_field('destination_ref', stage_index=int(action.rsplit(':', 1)[1]))
             return
         if action.startswith('cycle:assault_ref:'):
             self.engine.cycle_strategy_field('assault_ref', stage_index=int(action.rsplit(':', 1)[1]))
@@ -2982,13 +2801,6 @@ class BehaviorEditorApp:
                         self.drag_current = self._current_draw_target(self.mouse_world)
                 if event.type == pygame.MOUSEWHEEL:
                     mouse_pos = pygame.mouse.get_pos()
-                    if self.point_edit_target is not None and self.map_draw_rect().collidepoint(mouse_pos):
-                        point_spec = self.engine.current_point_target_specs(team=self.region_edit_team).get(self.point_edit_target)
-                        if point_spec is not None:
-                            base_radius = float(point_spec.get('radius', 0.0) or self.engine.ai_controller._strategy_node_default_radius(self.engine.map_manager))
-                            if self.engine.set_point_target_radius(self.point_edit_target, base_radius + float(event.y) * 10.0, team=self.region_edit_team):
-                                self.engine.add_log(f'已调整 {self.point_edit_target} 节点范围')
-                                continue
                     if self.map_draw_rect().collidepoint(mouse_pos):
                         self._zoom_map_around(mouse_pos, event.y)
                         self.mouse_world = self.screen_to_world(mouse_pos)
@@ -3019,10 +2831,6 @@ class BehaviorEditorApp:
                     if world_point is None:
                         if self.active_text.input is not None:
                             self.commit_text_input()
-                        continue
-                    if self.point_edit_target is not None:
-                        self.engine.set_point_target(self.point_edit_target, world_point, team=self.region_edit_team)
-                        self.engine.add_log(f'已设置 {self.point_edit_target} 目标点，可继续滚轮调整范围，右键结束')
                         continue
                     if self.shape_mode == 'polygon' and self.polygon_points:
                         world_point = self._current_draw_target(world_point)

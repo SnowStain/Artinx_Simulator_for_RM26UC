@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-from pygame_compat import pygame
 import math
 import numpy as np
 import os
+import sys
 import threading
 import time
 from heapq import heappop, heappush
+
+try:
+    from pygame_compat import pygame
+except ModuleNotFoundError:
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from pygame_compat import pygame
 
 class MapManager:
     def __init__(self, config):
@@ -18,13 +26,36 @@ class MapManager:
         self.scale = config.get('simulator', {}).get('scale', 1.0)
         self.origin_x = config.get('map', {}).get('origin_x', 0)
         self.origin_y = config.get('map', {}).get('origin_y', 0)
-        self.map_width = config.get('map', {}).get('width', 1576)
-        self.map_height = config.get('map', {}).get('height', 873)
+        self.source_map_width = int(config.get('map', {}).get('source_width', config.get('map', {}).get('width', 1576)))
+        self.source_map_height = int(config.get('map', {}).get('source_height', config.get('map', {}).get('height', 873)))
+        self.strict_scale_enabled = bool(config.get('map', {}).get('strict_scale', True))
+        self.map_width = int(config.get('map', {}).get('width', self.source_map_width))
+        self.map_height = int(config.get('map', {}).get('height', self.source_map_height))
         self.field_length_m = config.get('map', {}).get('field_length_m', 28.0)
         self.field_width_m = config.get('map', {}).get('field_width_m', 15.0)
-        self.terrain_grid_cell_size = int(config.get('map', {}).get('terrain_grid', {}).get('cell_size', 8))
+        self.terrain_grid_cell_size = max(0.2, float(config.get('map', {}).get('terrain_grid', {}).get('cell_size', 8)))
+        self.function_grid_cell_size = max(0.2, float(config.get('map', {}).get('function_grid', {}).get('cell_size', self.terrain_grid_cell_size)))
+        self.runtime_grid_resolution_m = 0.01
+        self.runtime_grid_width = 0
+        self.runtime_grid_height = 0
+        self.runtime_cell_width_world = 0.0
+        self.runtime_cell_height_world = 0.0
+        self.runtime_grid_bundle = {}
+        self.runtime_grid_loaded = False
+        self._config_coordinate_space_hint = None
         self.facilities = []
         self.terrain_grid_overrides = {}
+        self.function_grid_overrides = {}
+        self.function_pass_mode_by_code = {
+            'passable': 0,
+            'conditional': 1,
+            'blocked': 2,
+        }
+        self.function_pass_mode_label_by_code = {
+            0: '可通过',
+            1: '条件通过',
+            2: '不可通过',
+        }
         self.terrain_code_by_type = {
             'flat': 0,
             'boundary': 1,
@@ -63,7 +94,11 @@ class MapManager:
         self.height_map = None
         self.terrain_type_map = None
         self.move_block_map = None
+        self.movement_block_map = None
+        self.vision_block_map = None
         self.vision_block_height_map = None
+        self.function_pass_map = None
+        self.function_heading_map = None
         self.priority_map = None
         self.raster_dirty = True
         self.raster_version = 0
@@ -86,19 +121,55 @@ class MapManager:
         self._region_query_default_rank = len(self.terrain_priority) + 32
         self._regions_query_cache = {}
         self._regions_query_cache_version = -1
+        self._fov_cache = {}
+        self._macro_path_cache = {}
+        self._macro_path_cache_lock = threading.Lock()
         self._lpa_planner_cache = {}
         self._path_result_cache = {}
         self._path_result_cache_lock = threading.Lock()
         self._path_result_cache_max_entries = max(32, int(config.get('ai', {}).get('path_cache_max_entries', 192)))
         self._path_failure_cache_ttl_sec = max(0.1, float(config.get('ai', {}).get('path_failure_cache_ttl_sec', 0.35)))
+        self._raster_batch_depth = 0
+        self._raster_batch_pending = False
+        preserved_runtime_grid_bundle = dict(config.get('map', {}).get('runtime_grid', {}) or {})
+        self._refresh_runtime_grid_metrics()
         self._load_facilities_from_config()
         self._load_terrain_grid_from_config()
+        self._load_function_grid_from_config()
+        if preserved_runtime_grid_bundle:
+            self.runtime_grid_bundle = preserved_runtime_grid_bundle
+            self.config.setdefault('map', {})['runtime_grid'] = dict(preserved_runtime_grid_bundle)
+            self._refresh_runtime_grid_metrics()
 
-    def _mark_raster_dirty(self):
+    def begin_raster_batch(self):
+        self._raster_batch_depth += 1
+
+    def end_raster_batch(self):
+        if self._raster_batch_depth <= 0:
+            return
+        self._raster_batch_depth -= 1
+        if self._raster_batch_depth == 0 and self._raster_batch_pending:
+            self._raster_batch_pending = False
+            self._mark_raster_dirty(force=True)
+
+    def _mark_raster_dirty(self, force=False):
+        if not force and self._raster_batch_depth > 0:
+            self._raster_batch_pending = True
+            return
         self.raster_dirty = True
+        self.runtime_grid_loaded = False
+        self.runtime_grid_bundle = {
+            'resolution_m': float(self.runtime_grid_resolution_m),
+            'shape': list(self._runtime_grid_shape()),
+            'channels': {},
+        }
+        self.config.setdefault('map', {})['runtime_grid'] = dict(self.runtime_grid_bundle)
         self.raster_version += 1
         self._regions_query_cache.clear()
         self._regions_query_cache_version = self.raster_version
+        self._fov_cache.clear()
+        with self._macro_path_cache_lock:
+            self._macro_path_cache.clear()
         self._lpa_planner_cache.clear()
         with self._path_result_cache_lock:
             self._path_result_cache.clear()
@@ -110,6 +181,67 @@ class MapManager:
         grid_x, grid_y = key.split(',', 1)
         return int(grid_x), int(grid_y)
 
+    def _function_cell_key(self, grid_x, grid_y):
+        return f'{int(grid_x)},{int(grid_y)}'
+
+    def _decode_function_cell_key(self, key):
+        grid_x, grid_y = key.split(',', 1)
+        return int(grid_x), int(grid_y)
+
+    def _normalize_heading_deg(self, heading_deg):
+        value = float(heading_deg or 0.0) % 360.0
+        if value < 0.0:
+            value += 360.0
+        return round(value, 1)
+
+    def _heading_between_points_deg(self, start, end):
+        if start is None or end is None:
+            return 0.0
+        dx = float(end[0]) - float(start[0])
+        dy = float(end[1]) - float(start[1])
+        if abs(dx) <= 1e-6 and abs(dy) <= 1e-6:
+            return 0.0
+        return self._normalize_heading_deg(math.degrees(math.atan2(dy, dx)))
+
+    def _heading_delta_deg(self, heading_a, heading_b):
+        delta = abs(self._normalize_heading_deg(heading_a) - self._normalize_heading_deg(heading_b))
+        return min(delta, 360.0 - delta)
+
+    def _function_override_payload(self, grid_x, grid_y, pass_mode='passable', heading_deg=None):
+        normalized_mode = str(pass_mode or 'passable')
+        if normalized_mode not in self.function_pass_mode_by_code:
+            normalized_mode = 'passable'
+        payload = {
+            'x': int(grid_x),
+            'y': int(grid_y),
+            'pass_mode': normalized_mode,
+        }
+        if normalized_mode == 'conditional':
+            payload['heading_deg'] = self._normalize_heading_deg(heading_deg)
+        return payload
+
+    def _set_function_override_cell(self, grid_x, grid_y, pass_mode='passable', heading_deg=None):
+        key = self._function_cell_key(grid_x, grid_y)
+        normalized_mode = str(pass_mode or 'passable')
+        if normalized_mode == 'passable':
+            return self.function_grid_overrides.pop(key, None) is not None
+        payload = self._function_override_payload(grid_x, grid_y, pass_mode=normalized_mode, heading_deg=heading_deg)
+        previous = self.function_grid_overrides.get(key)
+        if previous == payload:
+            return False
+        self.function_grid_overrides[key] = payload
+        return True
+
+    def _serialized_grid_cell_size(self, cell_size):
+        value = round(float(cell_size), 4)
+        if abs(value - round(value)) <= 1e-6:
+            return int(round(value))
+        return value
+
+    def _grid_cell_center(self, grid_x, grid_y):
+        x1, y1, x2, y2 = self._grid_cell_bounds(grid_x, grid_y)
+        return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
     def _grid_dimensions(self):
         return (
             math.ceil(self.map_width / max(self.terrain_grid_cell_size, 1)),
@@ -118,15 +250,317 @@ class MapManager:
 
     def _world_to_grid(self, world_x, world_y):
         cell_size = max(self.terrain_grid_cell_size, 1)
-        return int(world_x) // cell_size, int(world_y) // cell_size
+        return int(math.floor(float(world_x) / cell_size)), int(math.floor(float(world_y) / cell_size))
 
     def _grid_cell_bounds(self, grid_x, grid_y):
         cell_size = max(self.terrain_grid_cell_size, 1)
-        x1 = grid_x * cell_size
-        y1 = grid_y * cell_size
-        x2 = min(self.map_width - 1, x1 + cell_size - 1)
-        y2 = min(self.map_height - 1, y1 + cell_size - 1)
+        x1 = int(math.floor(grid_x * cell_size))
+        y1 = int(math.floor(grid_y * cell_size))
+        x2 = min(self.map_width - 1, int(math.ceil((grid_x + 1) * cell_size) - 1))
+        y2 = min(self.map_height - 1, int(math.ceil((grid_y + 1) * cell_size) - 1))
         return x1, y1, x2, y2
+
+    def _refresh_runtime_grid_metrics(self):
+        runtime_grid = self.config.get('map', {}).get('runtime_grid', {})
+        terrain_grid = self.config.get('map', {}).get('terrain_grid', {})
+        resolution_m = runtime_grid.get('resolution_m', terrain_grid.get('resolution_m', 0.01))
+        self.runtime_grid_resolution_m = max(0.01, float(resolution_m or 0.01))
+        self.runtime_grid_width = max(1, int(math.ceil(float(self.field_length_m) / self.runtime_grid_resolution_m)))
+        self.runtime_grid_height = max(1, int(math.ceil(float(self.field_width_m) / self.runtime_grid_resolution_m)))
+        if self.strict_scale_enabled:
+            self.map_width = int(self.runtime_grid_width)
+            self.map_height = int(self.runtime_grid_height)
+        self.runtime_cell_width_world = float(self.map_width) / max(self.runtime_grid_width, 1)
+        self.runtime_cell_height_world = float(self.map_height) / max(self.runtime_grid_height, 1)
+        self.runtime_grid_bundle = dict(runtime_grid or {})
+
+    def _world_scale_x(self):
+        return float(self.map_width) / max(float(self.source_map_width), 1e-6)
+
+    def _world_scale_y(self):
+        return float(self.map_height) / max(float(self.source_map_height), 1e-6)
+
+    def _scale_world_x_from_source(self, value):
+        return int(round(float(value) * self._world_scale_x()))
+
+    def _scale_world_y_from_source(self, value):
+        return int(round(float(value) * self._world_scale_y()))
+
+    def _scale_region_to_current_map(self, region):
+        if self.source_map_width == self.map_width and self.source_map_height == self.map_height:
+            return dict(region)
+        scaled = dict(region)
+        for field_name in ('x1', 'x2', 'cx'):
+            if field_name in scaled:
+                scaled[field_name] = self._scale_world_x_from_source(scaled[field_name])
+        for field_name in ('y1', 'y2', 'cy'):
+            if field_name in scaled:
+                scaled[field_name] = self._scale_world_y_from_source(scaled[field_name])
+        if 'radius' in scaled:
+            average_scale = (self._world_scale_x() + self._world_scale_y()) * 0.5
+            scaled['radius'] = round(float(scaled['radius']) * average_scale, 1)
+        if 'thickness' in scaled:
+            average_scale = (self._world_scale_x() + self._world_scale_y()) * 0.5
+            scaled['thickness'] = max(1, int(round(float(scaled['thickness']) * average_scale)))
+        if isinstance(scaled.get('points'), list):
+            scaled['points'] = [
+                [self._scale_world_x_from_source(point[0]), self._scale_world_y_from_source(point[1])]
+                for point in scaled['points']
+                if isinstance(point, (list, tuple)) and len(point) >= 2
+            ]
+        return scaled
+
+    def _scale_grid_coordinate_from_source(self, grid_x, grid_y, source_cell_size, target_cell_size):
+        world_x = float(grid_x) * float(source_cell_size) * self._world_scale_x()
+        world_y = float(grid_y) * float(source_cell_size) * self._world_scale_y()
+        return int(round(world_x / max(float(target_cell_size), 1e-6))), int(round(world_y / max(float(target_cell_size), 1e-6)))
+
+    def _read_explicit_coordinate_space(self):
+        coordinate_space = str(self.config.get('map', {}).get('coordinate_space', '') or '').strip().lower()
+        if coordinate_space in {'world', 'current', 'map'}:
+            return 'world'
+        if coordinate_space in {'source', 'preset'}:
+            return 'source'
+        return None
+
+    def _infer_coordinate_space_from_facilities(self, facilities):
+        if not facilities:
+            return None
+        source_x = max(1.0, float(self.source_map_width - 1))
+        source_y = max(1.0, float(self.source_map_height - 1))
+        target_x = max(1.0, float(self.map_width - 1))
+        target_y = max(1.0, float(self.map_height - 1))
+
+        for region in facilities:
+            if not isinstance(region, dict):
+                continue
+            if region.get('type') != 'boundary':
+                continue
+            if 'x2' not in region or 'y2' not in region:
+                continue
+            boundary_x = float(region.get('x2', 0.0))
+            boundary_y = float(region.get('y2', 0.0))
+            source_delta = abs(boundary_x - source_x) + abs(boundary_y - source_y)
+            target_delta = abs(boundary_x - target_x) + abs(boundary_y - target_y)
+            return 'source' if source_delta <= target_delta else 'world'
+
+        max_x = 0.0
+        max_y = 0.0
+        for region in facilities:
+            if not isinstance(region, dict):
+                continue
+            for key in ('x1', 'x2', 'cx'):
+                if key in region:
+                    max_x = max(max_x, float(region.get(key, 0.0)))
+            for key in ('y1', 'y2', 'cy'):
+                if key in region:
+                    max_y = max(max_y, float(region.get(key, 0.0)))
+            points = region.get('points', [])
+            if isinstance(points, list):
+                for point in points:
+                    if not isinstance(point, (list, tuple)) or len(point) < 2:
+                        continue
+                    max_x = max(max_x, float(point[0]))
+                    max_y = max(max_y, float(point[1]))
+
+        if max_x > source_x * 1.05 or max_y > source_y * 1.05:
+            return 'world'
+        if max_x <= source_x + 1.0 and max_y <= source_y + 1.0:
+            return 'source'
+        if max_x <= target_x + 1.0 and max_y <= target_y + 1.0:
+            return 'world'
+        return 'source'
+
+    def _infer_coordinate_space_from_grid_cells(self, cells, source_cell_size, target_cell_size):
+        if not cells:
+            return None
+        source_cols = max(1, int(math.ceil(float(self.source_map_width) / max(float(source_cell_size), 1e-6))))
+        source_rows = max(1, int(math.ceil(float(self.source_map_height) / max(float(source_cell_size), 1e-6))))
+        target_cols = max(1, int(math.ceil(float(self.map_width) / max(float(target_cell_size), 1e-6))))
+        target_rows = max(1, int(math.ceil(float(self.map_height) / max(float(target_cell_size), 1e-6))))
+
+        max_x = 0
+        max_y = 0
+        for cell in cells:
+            if not isinstance(cell, dict):
+                continue
+            max_x = max(max_x, int(cell.get('x', 0)))
+            max_y = max(max_y, int(cell.get('y', 0)))
+
+        if max_x >= source_cols or max_y >= source_rows:
+            return 'world'
+        if max_x >= target_cols or max_y >= target_rows:
+            return 'source'
+        return None
+
+    def _configured_coordinate_space(self):
+        if self._config_coordinate_space_hint is not None:
+            return self._config_coordinate_space_hint
+
+        explicit = self._read_explicit_coordinate_space()
+        if explicit is not None:
+            self._config_coordinate_space_hint = explicit
+            return explicit
+
+        map_config = self.config.get('map', {})
+        facilities = map_config.get('facilities', []) or []
+        inferred = self._infer_coordinate_space_from_facilities(facilities)
+        if inferred is not None:
+            self._config_coordinate_space_hint = inferred
+            return inferred
+
+        terrain_grid = map_config.get('terrain_grid', {}) or {}
+        terrain_cells = terrain_grid.get('cells', []) or []
+        terrain_source_cell_size = max(0.2, float(terrain_grid.get('cell_size', self.terrain_grid_cell_size)))
+        terrain_target_cell_size = 1.0 if self.strict_scale_enabled else terrain_source_cell_size
+        inferred = self._infer_coordinate_space_from_grid_cells(terrain_cells, terrain_source_cell_size, terrain_target_cell_size)
+        if inferred is not None:
+            self._config_coordinate_space_hint = inferred
+            return inferred
+
+        self._config_coordinate_space_hint = 'source'
+        return self._config_coordinate_space_hint
+
+    def _scaled_grid_cell_ranges_from_source(self, grid_x, grid_y, source_cell_size, target_cell_size):
+        target_cell_size = max(float(target_cell_size), 1e-6)
+        world_x1 = float(grid_x) * float(source_cell_size) * self._world_scale_x()
+        world_y1 = float(grid_y) * float(source_cell_size) * self._world_scale_y()
+        world_x2 = float(grid_x + 1) * float(source_cell_size) * self._world_scale_x()
+        world_y2 = float(grid_y + 1) * float(source_cell_size) * self._world_scale_y()
+
+        grid_width = max(1, int(math.ceil(float(self.map_width) / target_cell_size)))
+        grid_height = max(1, int(math.ceil(float(self.map_height) / target_cell_size)))
+
+        start_x = max(0, min(grid_width - 1, int(math.floor(world_x1 / target_cell_size))))
+        start_y = max(0, min(grid_height - 1, int(math.floor(world_y1 / target_cell_size))))
+        end_x = max(start_x, min(grid_width - 1, int(math.ceil(world_x2 / target_cell_size) - 1)))
+        end_y = max(start_y, min(grid_height - 1, int(math.ceil(world_y2 / target_cell_size) - 1)))
+        return start_x, end_x, start_y, end_y
+
+    def _grid_cell_ranges_from_world_space(self, grid_x, grid_y, source_cell_size, target_cell_size):
+        target_cell_size = max(float(target_cell_size), 1e-6)
+        world_x1 = float(grid_x) * float(source_cell_size)
+        world_y1 = float(grid_y) * float(source_cell_size)
+        world_x2 = float(grid_x + 1) * float(source_cell_size)
+        world_y2 = float(grid_y + 1) * float(source_cell_size)
+
+        grid_width = max(1, int(math.ceil(float(self.map_width) / target_cell_size)))
+        grid_height = max(1, int(math.ceil(float(self.map_height) / target_cell_size)))
+
+        start_x = max(0, min(grid_width - 1, int(math.floor(world_x1 / target_cell_size))))
+        start_y = max(0, min(grid_height - 1, int(math.floor(world_y1 / target_cell_size))))
+        end_x = max(start_x, min(grid_width - 1, int(math.ceil(world_x2 / target_cell_size) - 1)))
+        end_y = max(start_y, min(grid_height - 1, int(math.ceil(world_y2 / target_cell_size) - 1)))
+        return start_x, end_x, start_y, end_y
+
+    def _create_blank_map_surface(self, width=None, height=None):
+        width = max(1, int(width or self.map_width or 1576))
+        height = max(1, int(height or self.map_height or 873))
+        surface = pygame.Surface((width, height))
+        surface.fill((241, 244, 248))
+        pygame.draw.rect(surface, (210, 216, 224), pygame.Rect(0, 0, width, height), 2)
+        step = max(24, min(72, int(round(min(width, height) / 18))))
+        line_color = (228, 233, 239)
+        for x in range(step, width, step):
+            pygame.draw.line(surface, line_color, (x, 0), (x, height), 1)
+        for y in range(step, height, step):
+            pygame.draw.line(surface, line_color, (0, y), (width, y), 1)
+        return surface
+
+    def _runtime_grid_shape(self):
+        return self.runtime_grid_height, self.runtime_grid_width
+
+    def _world_to_runtime_cell(self, world_x, world_y):
+        cell_x = int(float(world_x) / max(self.runtime_cell_width_world, 1e-6))
+        cell_y = int(float(world_y) / max(self.runtime_cell_height_world, 1e-6))
+        cell_x = max(0, min(self.runtime_grid_width - 1, cell_x))
+        cell_y = max(0, min(self.runtime_grid_height - 1, cell_y))
+        return cell_x, cell_y
+
+    def _runtime_cell_center_world(self, cell_x, cell_y):
+        center_x = (float(cell_x) + 0.5) * self.runtime_cell_width_world
+        center_y = (float(cell_y) + 0.5) * self.runtime_cell_height_world
+        return (
+            max(0.0, min(float(self.map_width - 1), center_x)),
+            max(0.0, min(float(self.map_height - 1), center_y)),
+        )
+
+    def _runtime_bounds_to_cell_ranges(self, x1, y1, x2, y2):
+        min_x = max(0.0, min(float(x1), float(x2)))
+        max_x = min(float(self.map_width - 1), max(float(x1), float(x2)))
+        min_y = max(0.0, min(float(y1), float(y2)))
+        max_y = min(float(self.map_height - 1), max(float(y1), float(y2)))
+        grid_x1 = max(0, min(self.runtime_grid_width - 1, int(min_x / max(self.runtime_cell_width_world, 1e-6))))
+        grid_x2 = max(0, min(self.runtime_grid_width - 1, int(max_x / max(self.runtime_cell_width_world, 1e-6))))
+        grid_y1 = max(0, min(self.runtime_grid_height - 1, int(min_y / max(self.runtime_cell_height_world, 1e-6))))
+        grid_y2 = max(0, min(self.runtime_grid_height - 1, int(max_y / max(self.runtime_cell_height_world, 1e-6))))
+        return grid_x1, grid_x2, grid_y1, grid_y2
+
+    def _runtime_world_coordinate_axes(self, grid_x1, grid_x2, grid_y1, grid_y2):
+        cell_xs = (np.arange(grid_x1, grid_x2 + 1, dtype=np.float32) + 0.5) * float(self.runtime_cell_width_world)
+        cell_ys = (np.arange(grid_y1, grid_y2 + 1, dtype=np.float32) + 0.5) * float(self.runtime_cell_height_world)
+        return cell_xs, cell_ys
+
+    def _map_preset_directory(self):
+        preset_path = self.config.get('map', {}).get('_preset_path')
+        if preset_path:
+            return os.path.dirname(os.path.abspath(preset_path))
+        config_path = self.config.get('_config_path')
+        if config_path:
+            return os.path.join(os.path.dirname(os.path.abspath(config_path)), 'maps')
+        return os.getcwd()
+
+    def _resolve_runtime_bundle_path(self, relative_path):
+        if not relative_path:
+            return None
+        if os.path.isabs(relative_path):
+            return relative_path
+        return os.path.join(self._map_preset_directory(), relative_path)
+
+    def _runtime_channel_names(self):
+        return {
+            'height_map': ('height_map', np.float32),
+            'terrain_type_map': ('terrain_type_map', np.uint8),
+            'movement_block_map': ('movement_block_map', np.bool_),
+            'vision_block_map': ('vision_block_map', np.bool_),
+            'vision_block_height_map': ('vision_block_height_map', np.float32),
+            'priority_map': ('priority_map', np.uint8),
+            'function_pass_map': ('function_pass_map', np.uint8),
+            'function_heading_map': ('function_heading_map', np.float32),
+        }
+
+    def _try_load_runtime_grid_bundle(self):
+        runtime_grid = dict(self.config.get('map', {}).get('runtime_grid', {}) or {})
+        channels = runtime_grid.get('channels', {}) if isinstance(runtime_grid, dict) else {}
+        if not channels:
+            return False
+        expected_shape = tuple(int(value) for value in runtime_grid.get('shape', self._runtime_grid_shape()))
+        if expected_shape != self._runtime_grid_shape():
+            return False
+
+        loaded_arrays = {}
+        for channel_name, (_, dtype) in self._runtime_channel_names().items():
+            channel_path = self._resolve_runtime_bundle_path(channels.get(channel_name))
+            if channel_path is None or not os.path.exists(channel_path):
+                return False
+            loaded = np.load(channel_path, allow_pickle=False)
+            if tuple(loaded.shape) != expected_shape:
+                return False
+            loaded_arrays[channel_name] = loaded.astype(dtype, copy=False)
+
+        self.height_map = loaded_arrays['height_map']
+        self.terrain_type_map = loaded_arrays['terrain_type_map']
+        self.movement_block_map = loaded_arrays['movement_block_map']
+        self.move_block_map = self.movement_block_map
+        self.vision_block_map = loaded_arrays['vision_block_map']
+        self.vision_block_height_map = loaded_arrays['vision_block_height_map']
+        self.priority_map = loaded_arrays['priority_map']
+        self.function_pass_map = loaded_arrays['function_pass_map']
+        self.function_heading_map = loaded_arrays['function_heading_map']
+        self.runtime_grid_bundle = runtime_grid
+        self.runtime_grid_loaded = True
+        self.raster_dirty = False
+        return True
 
     def _terrain_override_payload(self, grid_x, grid_y, terrain_type, height_m, team='neutral', blocks_movement=None, blocks_vision=None):
         return {
@@ -156,10 +590,10 @@ class MapManager:
         max_x = min(self.map_width - 1, max(int(x1), int(x2)))
         min_y = max(0, min(int(y1), int(y2)))
         max_y = min(self.map_height - 1, max(int(y1), int(y2)))
-        grid_x1 = max(0, min_x // cell_size)
-        grid_x2 = min(self._grid_dimensions()[0] - 1, max_x // cell_size)
-        grid_y1 = max(0, min_y // cell_size)
-        grid_y2 = min(self._grid_dimensions()[1] - 1, max_y // cell_size)
+        grid_x1 = max(0, int(math.floor(min_x / cell_size)))
+        grid_x2 = min(self._grid_dimensions()[0] - 1, int(math.floor(max_x / cell_size)))
+        grid_y1 = max(0, int(math.floor(min_y / cell_size)))
+        grid_y2 = min(self._grid_dimensions()[1] - 1, int(math.floor(max_y / cell_size)))
         return grid_x1, grid_x2, grid_y1, grid_y2
 
     def _point_in_polygon_simple(self, x, y, points):
@@ -270,11 +704,9 @@ class MapManager:
         x1, y1, x2, y2 = self._polygon_bounds(normalized_points)
         grid_x1, grid_x2, grid_y1, grid_y2 = self._grid_ranges_from_world_bounds(x1, y1, x2, y2)
         selected_cells = []
-        cell_size = max(self.terrain_grid_cell_size, 1)
         for grid_y in range(grid_y1, grid_y2 + 1):
             for grid_x in range(grid_x1, grid_x2 + 1):
-                sample_x = min(self.map_width - 1, grid_x * cell_size + cell_size / 2.0)
-                sample_y = min(self.map_height - 1, grid_y * cell_size + cell_size / 2.0)
+                sample_x, sample_y = self._grid_cell_center(grid_x, grid_y)
                 if self._point_in_polygon(sample_x, sample_y, normalized_points):
                     selected_cells.append((grid_x, grid_y))
         return selected_cells
@@ -310,21 +742,72 @@ class MapManager:
 
     def _load_terrain_grid_from_config(self):
         terrain_grid = self.config.get('map', {}).get('terrain_grid', {})
-        self.terrain_grid_cell_size = int(terrain_grid.get('cell_size', self.terrain_grid_cell_size))
+        self._refresh_runtime_grid_metrics()
+        source_cell_size = max(0.2, float(terrain_grid.get('cell_size', self.terrain_grid_cell_size)))
+        self.terrain_grid_cell_size = 1.0 if self.strict_scale_enabled else source_cell_size
+        coordinate_space = self._configured_coordinate_space()
         self.terrain_grid_overrides = {}
         for cell in terrain_grid.get('cells', []):
-            grid_x = int(cell.get('x', 0))
-            grid_y = int(cell.get('y', 0))
-            normalized = {
-                'x': grid_x,
-                'y': grid_y,
-                'type': cell.get('type', 'flat'),
-                'team': cell.get('team', 'neutral'),
-                'height_m': round(float(cell.get('height_m', 0.0)), 2),
-                'blocks_movement': bool(cell.get('blocks_movement', False)),
-                'blocks_vision': bool(cell.get('blocks_vision', False)),
-            }
-            self.terrain_grid_overrides[self._terrain_cell_key(grid_x, grid_y)] = normalized
+            if coordinate_space == 'source':
+                start_x, end_x, start_y, end_y = self._scaled_grid_cell_ranges_from_source(
+                    cell.get('x', 0),
+                    cell.get('y', 0),
+                    source_cell_size,
+                    self.terrain_grid_cell_size,
+                )
+            else:
+                start_x, end_x, start_y, end_y = self._grid_cell_ranges_from_world_space(
+                    cell.get('x', 0),
+                    cell.get('y', 0),
+                    source_cell_size,
+                    self.terrain_grid_cell_size,
+                )
+            for grid_y in range(start_y, end_y + 1):
+                for grid_x in range(start_x, end_x + 1):
+                    normalized = {
+                        'x': grid_x,
+                        'y': grid_y,
+                        'type': cell.get('type', 'flat'),
+                        'team': cell.get('team', 'neutral'),
+                        'height_m': round(float(cell.get('height_m', 0.0)), 2),
+                        'blocks_movement': bool(cell.get('blocks_movement', False)),
+                        'blocks_vision': bool(cell.get('blocks_vision', False)),
+                    }
+                    self.terrain_grid_overrides[self._terrain_cell_key(grid_x, grid_y)] = normalized
+        self._mark_raster_dirty()
+
+    def _load_function_grid_from_config(self):
+        function_grid = self.config.get('map', {}).get('function_grid', {})
+        source_cell_size = max(0.2, float(function_grid.get('cell_size', self.terrain_grid_cell_size)))
+        self.function_grid_cell_size = 1.0 if self.strict_scale_enabled else source_cell_size
+        coordinate_space = self._configured_coordinate_space()
+        self.function_grid_overrides = {}
+        for cell in function_grid.get('cells', []):
+            pass_mode = str(cell.get('pass_mode', 'passable') or 'passable')
+            if pass_mode not in self.function_pass_mode_by_code or pass_mode == 'passable':
+                continue
+            if coordinate_space == 'source':
+                start_x, end_x, start_y, end_y = self._scaled_grid_cell_ranges_from_source(
+                    cell.get('x', 0),
+                    cell.get('y', 0),
+                    source_cell_size,
+                    self.function_grid_cell_size,
+                )
+            else:
+                start_x, end_x, start_y, end_y = self._grid_cell_ranges_from_world_space(
+                    cell.get('x', 0),
+                    cell.get('y', 0),
+                    source_cell_size,
+                    self.function_grid_cell_size,
+                )
+            for grid_y in range(start_y, end_y + 1):
+                for grid_x in range(start_x, end_x + 1):
+                    self.function_grid_overrides[self._function_cell_key(grid_x, grid_y)] = self._function_override_payload(
+                        grid_x,
+                        grid_y,
+                        pass_mode=pass_mode,
+                        heading_deg=cell.get('heading_deg'),
+                    )
         self._mark_raster_dirty()
 
     def export_terrain_grid_config(self):
@@ -333,9 +816,44 @@ class MapManager:
             cell = dict(self.terrain_grid_overrides[key])
             cells.append(cell)
         return {
-            'cell_size': int(self.terrain_grid_cell_size),
+            'cell_size': self._serialized_grid_cell_size(self.terrain_grid_cell_size),
             'cells': cells,
         }
+
+    def export_function_grid_config(self):
+        cells = []
+        for key in sorted(self.function_grid_overrides.keys(), key=lambda item: tuple(map(int, item.split(',')))):
+            cells.append(dict(self.function_grid_overrides[key]))
+        return {
+            'cell_size': self._serialized_grid_cell_size(self.function_grid_cell_size or self.terrain_grid_cell_size),
+            'cells': cells,
+        }
+
+    def export_runtime_grid_config(self):
+        runtime_grid = dict(self.runtime_grid_bundle or {})
+        runtime_grid['resolution_m'] = float(self.runtime_grid_resolution_m)
+        runtime_grid['shape'] = list(self._runtime_grid_shape())
+        runtime_grid.setdefault('channels', {})
+        return runtime_grid
+
+    def persist_runtime_grid_bundle(self, preset_name, preset_path=None):
+        self._ensure_raster_layers()
+        directory = os.path.dirname(os.path.abspath(preset_path)) if preset_path else self._map_preset_directory()
+        os.makedirs(directory, exist_ok=True)
+        safe_name = str(preset_name or 'map').strip() or 'map'
+        channel_files = {}
+        for channel_name, (attribute_name, _) in self._runtime_channel_names().items():
+            file_name = f'{safe_name}.{channel_name}.npy'
+            file_path = os.path.join(directory, file_name)
+            np.save(file_path, getattr(self, attribute_name), allow_pickle=False)
+            channel_files[channel_name] = file_name
+        self.runtime_grid_bundle = {
+            'resolution_m': float(self.runtime_grid_resolution_m),
+            'shape': list(self._runtime_grid_shape()),
+            'channels': channel_files,
+        }
+        self.config.setdefault('map', {})['runtime_grid'] = dict(self.runtime_grid_bundle)
+        return dict(self.runtime_grid_bundle)
 
     def paint_terrain_grid(self, world_x, world_y, terrain_type, height_m=0.0, brush_radius=0, team='neutral', blocks_movement=None, blocks_vision=None):
         center_grid_x, center_grid_y = self._world_to_grid(world_x, world_y)
@@ -347,6 +865,19 @@ class MapManager:
                 self._set_terrain_override_cell(grid_x, grid_y, terrain_type, height_m, team=team, blocks_movement=blocks_movement, blocks_vision=blocks_vision)
         self._mark_raster_dirty()
 
+    def paint_function_grid(self, world_x, world_y, pass_mode='passable', brush_radius=0, heading_deg=None):
+        center_grid_x, center_grid_y = self._world_to_grid(world_x, world_y)
+        max_x, max_y = self._grid_dimensions()
+        changed = False
+        for grid_y in range(max(0, center_grid_y - brush_radius), min(max_y, center_grid_y + brush_radius + 1)):
+            for grid_x in range(max(0, center_grid_x - brush_radius), min(max_x, center_grid_x + brush_radius + 1)):
+                if math.hypot(grid_x - center_grid_x, grid_y - center_grid_y) > brush_radius + 0.25:
+                    continue
+                changed = self._set_function_override_cell(grid_x, grid_y, pass_mode=pass_mode, heading_deg=heading_deg) or changed
+        if changed:
+            self._mark_raster_dirty()
+        return changed
+
     def paint_terrain_rect(self, x1, y1, x2, y2, terrain_type, height_m=0.0, team='neutral', blocks_movement=None, blocks_vision=None):
         grid_x1, grid_x2, grid_y1, grid_y2 = self._grid_ranges_from_world_bounds(x1, y1, x2, y2)
         for grid_y in range(grid_y1, grid_y2 + 1):
@@ -354,17 +885,40 @@ class MapManager:
                 self._set_terrain_override_cell(grid_x, grid_y, terrain_type, height_m, team=team, blocks_movement=blocks_movement, blocks_vision=blocks_vision)
         self._mark_raster_dirty()
 
+    def paint_function_rect(self, x1, y1, x2, y2, pass_mode='passable', heading_deg=None):
+        grid_x1, grid_x2, grid_y1, grid_y2 = self._grid_ranges_from_world_bounds(x1, y1, x2, y2)
+        changed = False
+        for grid_y in range(grid_y1, grid_y2 + 1):
+            for grid_x in range(grid_x1, grid_x2 + 1):
+                changed = self._set_function_override_cell(grid_x, grid_y, pass_mode=pass_mode, heading_deg=heading_deg) or changed
+        if changed:
+            self._mark_raster_dirty()
+        return changed
+
     def paint_terrain_circle(self, center_x, center_y, radius_world, terrain_type, height_m=0.0, team='neutral', blocks_movement=None, blocks_vision=None):
         radius_world = max(0.0, float(radius_world))
         grid_x1, grid_x2, grid_y1, grid_y2 = self._grid_ranges_from_world_bounds(center_x - radius_world, center_y - radius_world, center_x + radius_world, center_y + radius_world)
         cell_size = max(self.terrain_grid_cell_size, 1)
         for grid_y in range(grid_y1, grid_y2 + 1):
             for grid_x in range(grid_x1, grid_x2 + 1):
-                sample_x = min(self.map_width - 1, grid_x * cell_size + cell_size / 2.0)
-                sample_y = min(self.map_height - 1, grid_y * cell_size + cell_size / 2.0)
+                sample_x, sample_y = self._grid_cell_center(grid_x, grid_y)
                 if math.hypot(sample_x - center_x, sample_y - center_y) <= radius_world + cell_size * 0.35:
                     self._set_terrain_override_cell(grid_x, grid_y, terrain_type, height_m, team=team, blocks_movement=blocks_movement, blocks_vision=blocks_vision)
         self._mark_raster_dirty()
+
+    def paint_function_circle(self, center_x, center_y, radius_world, pass_mode='passable', heading_deg=None):
+        radius_world = max(0.0, float(radius_world))
+        grid_x1, grid_x2, grid_y1, grid_y2 = self._grid_ranges_from_world_bounds(center_x - radius_world, center_y - radius_world, center_x + radius_world, center_y + radius_world)
+        cell_size = max(self.terrain_grid_cell_size, 1)
+        changed = False
+        for grid_y in range(grid_y1, grid_y2 + 1):
+            for grid_x in range(grid_x1, grid_x2 + 1):
+                sample_x, sample_y = self._grid_cell_center(grid_x, grid_y)
+                if math.hypot(sample_x - center_x, sample_y - center_y) <= radius_world + cell_size * 0.35:
+                    changed = self._set_function_override_cell(grid_x, grid_y, pass_mode=pass_mode, heading_deg=heading_deg) or changed
+        if changed:
+            self._mark_raster_dirty()
+        return changed
 
     def paint_terrain_polygon(self, points, terrain_type, height_m=0.0, team='neutral', blocks_movement=None, blocks_vision=None):
         normalized_points = self._normalize_points(points)
@@ -374,6 +928,17 @@ class MapManager:
         for grid_x, grid_y in self._polygon_selected_cells(normalized_points):
             self._set_terrain_override_cell(grid_x, grid_y, terrain_type, height_m, team=team, blocks_movement=blocks_movement, blocks_vision=blocks_vision)
             changed = True
+        if changed:
+            self._mark_raster_dirty()
+        return changed
+
+    def paint_function_polygon(self, points, pass_mode='passable', heading_deg=None):
+        normalized_points = self._normalize_points(points)
+        if len(normalized_points) < 3:
+            return False
+        changed = False
+        for grid_x, grid_y in self._polygon_selected_cells(normalized_points):
+            changed = self._set_function_override_cell(grid_x, grid_y, pass_mode=pass_mode, heading_deg=heading_deg) or changed
         if changed:
             self._mark_raster_dirty()
         return changed
@@ -402,6 +967,47 @@ class MapManager:
             self._mark_raster_dirty()
         return changed
 
+    def paint_function_line(self, start_x, start_y, end_x, end_y, pass_mode='passable', brush_radius=0, heading_deg=None):
+        line_start = (int(start_x), int(start_y))
+        line_end = (int(end_x), int(end_y))
+        cell_size = max(self.terrain_grid_cell_size, 1)
+        line_width = max(cell_size * 0.45, (float(brush_radius) + 0.5) * cell_size)
+        grid_x1, grid_x2, grid_y1, grid_y2 = self._grid_ranges_from_world_bounds(
+            min(line_start[0], line_end[0]) - line_width,
+            min(line_start[1], line_end[1]) - line_width,
+            max(line_start[0], line_end[0]) + line_width,
+            max(line_start[1], line_end[1]) + line_width,
+        )
+        changed = False
+        for grid_y in range(grid_y1, grid_y2 + 1):
+            for grid_x in range(grid_x1, grid_x2 + 1):
+                x1, y1, x2, y2 = self._grid_cell_bounds(grid_x, grid_y)
+                sample_x = (x1 + x2) / 2.0
+                sample_y = (y1 + y2) / 2.0
+                if self._distance_to_segment_points(sample_x, sample_y, line_start, line_end) <= line_width:
+                    changed = self._set_function_override_cell(grid_x, grid_y, pass_mode=pass_mode, heading_deg=heading_deg) or changed
+        if changed:
+            self._mark_raster_dirty()
+        return changed
+
+    def paint_function_slope_polygon(self, points, pass_mode='conditional', direction_start=None, direction_end=None):
+        normalized_points = self._normalize_points(points)
+        if len(normalized_points) < 3:
+            return {'changed': False, 'cell_count': 0, 'heading_deg': 0.0}
+        heading_deg = self._heading_between_points_deg(direction_start, direction_end)
+        changed = False
+        cell_count = 0
+        for grid_x, grid_y in self._polygon_selected_cells(normalized_points):
+            changed = self._set_function_override_cell(grid_x, grid_y, pass_mode=pass_mode, heading_deg=heading_deg) or changed
+            cell_count += 1
+        if changed:
+            self._mark_raster_dirty()
+        return {
+            'changed': changed,
+            'cell_count': cell_count,
+            'heading_deg': heading_deg,
+        }
+
     def paint_terrain_slope(self, line1_start, line1_end, line2_start, line2_end, terrain_type, team='neutral', blocks_movement=None, blocks_vision=None):
         first_start = (int(line1_start[0]), int(line1_start[1]))
         first_end = (int(line1_end[0]), int(line1_end[1]))
@@ -427,8 +1033,7 @@ class MapManager:
 
         for grid_y in range(grid_y1, grid_y2 + 1):
             for grid_x in range(grid_x1, grid_x2 + 1):
-                sample_x = min(self.map_width - 1, grid_x * cell_size + cell_size / 2.0)
-                sample_y = min(self.map_height - 1, grid_y * cell_size + cell_size / 2.0)
+                sample_x, sample_y = self._grid_cell_center(grid_x, grid_y)
                 if not self._point_in_polygon_simple(sample_x, sample_y, polygon):
                     continue
                 distance_to_first = max(0.0, self._distance_to_segment_points(sample_x, sample_y, first_start, first_end) - edge_bias)
@@ -543,8 +1148,28 @@ class MapManager:
             self._mark_raster_dirty()
         return removed
 
+    def erase_function_grid(self, world_x, world_y, brush_radius=0):
+        center_grid_x, center_grid_y = self._world_to_grid(world_x, world_y)
+        max_x, max_y = self._grid_dimensions()
+        removed = False
+        for grid_y in range(max(0, center_grid_y - brush_radius), min(max_y, center_grid_y + brush_radius + 1)):
+            for grid_x in range(max(0, center_grid_x - brush_radius), min(max_x, center_grid_x + brush_radius + 1)):
+                if math.hypot(grid_x - center_grid_x, grid_y - center_grid_y) > brush_radius + 0.25:
+                    continue
+                removed = self.function_grid_overrides.pop(self._function_cell_key(grid_x, grid_y), None) is not None or removed
+        if removed:
+            self._mark_raster_dirty()
+        return removed
+
     def remove_terrain_grid_cell(self, grid_x, grid_y):
         removed = self.terrain_grid_overrides.pop(self._terrain_cell_key(grid_x, grid_y), None)
+        if removed is not None:
+            self._mark_raster_dirty()
+            return True
+        return False
+
+    def remove_function_grid_cell(self, grid_x, grid_y):
+        removed = self.function_grid_overrides.pop(self._function_cell_key(grid_x, grid_y), None)
         if removed is not None:
             self._mark_raster_dirty()
             return True
@@ -617,18 +1242,185 @@ class MapManager:
         grid_x, grid_y = self._world_to_grid(world_x, world_y)
         return self.terrain_grid_overrides.get(self._terrain_cell_key(grid_x, grid_y))
 
+    def get_function_grid_cell(self, world_x, world_y):
+        grid_x, grid_y = self._world_to_grid(world_x, world_y)
+        return self.function_grid_overrides.get(self._function_cell_key(grid_x, grid_y))
+
+    def _runtime_function_cell(self, world_x, world_y):
+        self._ensure_raster_layers()
+        cell_x, cell_y = self._world_to_runtime_cell(world_x, world_y)
+        pass_code = int(self.function_pass_map[cell_y, cell_x])
+        pass_mode = next(
+            (label for label, code in self.function_pass_mode_by_code.items() if code == pass_code),
+            'passable',
+        )
+        heading_deg = float(self.function_heading_map[cell_y, cell_x])
+        if np.isnan(heading_deg):
+            heading_deg = None
+        return {
+            'x': cell_x,
+            'y': cell_y,
+            'pass_mode': pass_mode,
+            'heading_deg': heading_deg,
+        }
+
+    def function_cell_blocks_movement(self, cell):
+        return isinstance(cell, dict) and str(cell.get('pass_mode', 'passable')) == 'blocked'
+
+    def _is_function_heading_passable(self, cell, heading_deg, tolerance_deg=35.0):
+        if not isinstance(cell, dict):
+            return True
+        if str(cell.get('pass_mode', 'passable')) != 'conditional':
+            return True
+        return self._heading_delta_deg(float(cell.get('heading_deg', 0.0)), heading_deg) <= float(tolerance_deg)
+
+    def is_directionally_passable_segment(self, from_x, from_y, to_x, to_y, collision_radius=0.0, sample_stride=None, tolerance_deg=35.0):
+        distance = math.hypot(float(to_x) - float(from_x), float(to_y) - float(from_y))
+        if distance <= 1e-6:
+            return True
+        heading_deg = self._heading_between_points_deg((from_x, from_y), (to_x, to_y))
+        stride = max(1.0, float(sample_stride or self.terrain_grid_cell_size * 0.35))
+        sample_count = max(1, int(math.ceil(distance / stride)))
+        radius = max(0.0, float(collision_radius))
+        normal_x = -(float(to_y) - float(from_y)) / distance
+        normal_y = (float(to_x) - float(from_x)) / distance
+        for sample_index in range(sample_count + 1):
+            ratio = sample_index / sample_count
+            sample_x = float(from_x) + (float(to_x) - float(from_x)) * ratio
+            sample_y = float(from_y) + (float(to_y) - float(from_y)) * ratio
+            sample_cell = self._runtime_function_cell(sample_x, sample_y)
+            if self.function_cell_blocks_movement(sample_cell):
+                return False
+            if not self._is_function_heading_passable(sample_cell, heading_deg, tolerance_deg=tolerance_deg):
+                return False
+            if radius > 1.0:
+                for edge_x, edge_y in (
+                    (sample_x + normal_x * radius, sample_y + normal_y * radius),
+                    (sample_x - normal_x * radius, sample_y - normal_y * radius),
+                ):
+                    edge_cell = self._runtime_function_cell(edge_x, edge_y)
+                    if self.function_cell_blocks_movement(edge_cell):
+                        return False
+                    if not self._is_function_heading_passable(edge_cell, heading_deg, tolerance_deg=tolerance_deg):
+                        return False
+        return True
+
+    def _bresenham_line_cells(self, start_cell, end_cell):
+        x0, y0 = int(start_cell[0]), int(start_cell[1])
+        x1, y1 = int(end_cell[0]), int(end_cell[1])
+        dx = abs(x1 - x0)
+        sx = 1 if x0 < x1 else -1
+        dy = -abs(y1 - y0)
+        sy = 1 if y0 < y1 else -1
+        error = dx + dy
+        cells = []
+        while True:
+            if 0 <= x0 < self.runtime_grid_width and 0 <= y0 < self.runtime_grid_height:
+                cells.append((x0, y0))
+            if x0 == x1 and y0 == y1:
+                break
+            error2 = error * 2
+            if error2 >= dy:
+                error += dy
+                x0 += sx
+            if error2 <= dx:
+                error += dx
+                y0 += sy
+        return cells
+
+    def is_vision_line_clear(self, start_point, end_point, include_start=False, include_end=False):
+        self._ensure_raster_layers()
+        if start_point is None or end_point is None:
+            return False
+        start_cell = self._world_to_runtime_cell(start_point[0], start_point[1])
+        end_cell = self._world_to_runtime_cell(end_point[0], end_point[1])
+        cells = self._bresenham_line_cells(start_cell, end_cell)
+        last_index = len(cells) - 1
+        for index, (cell_x, cell_y) in enumerate(cells):
+            if index == 0 and not include_start:
+                continue
+            if index == last_index and not include_end:
+                continue
+            if bool(self.vision_block_map[cell_y, cell_x]):
+                return False
+        return True
+
+    def compute_fov_visibility(self, origin_point, heading_deg, fov_deg, max_distance_world, angle_step_deg=1.0, include_mask=False):
+        self._ensure_raster_layers()
+        if origin_point is None:
+            return {'polygon_world': tuple(), 'visible_mask': None}
+
+        cache_key = None
+        if not include_mask:
+            cache_key = (
+                self._world_to_runtime_cell(origin_point[0], origin_point[1]),
+                round(float(heading_deg), 2),
+                round(float(fov_deg), 2),
+                round(float(max_distance_world), 2),
+                round(float(angle_step_deg), 2),
+                int(self.raster_version),
+            )
+            cached = self._fov_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        origin_cell = self._world_to_runtime_cell(origin_point[0], origin_point[1])
+        safe_step = max(0.25, float(angle_step_deg))
+        sample_count = max(1, int(math.ceil(max(0.0, float(fov_deg)) / safe_step)))
+        start_angle = float(heading_deg) - float(fov_deg) * 0.5
+        visible_mask = np.zeros(self._runtime_grid_shape(), dtype=np.bool_) if include_mask else None
+        if visible_mask is not None:
+            visible_mask[origin_cell[1], origin_cell[0]] = True
+
+        polygon_points = [
+            (float(origin_point[0]), float(origin_point[1])),
+        ]
+        for sample_index in range(sample_count + 1):
+            angle_deg = start_angle + safe_step * sample_index
+            angle_rad = math.radians(angle_deg)
+            end_x = float(origin_point[0]) + math.cos(angle_rad) * float(max_distance_world)
+            end_y = float(origin_point[1]) + math.sin(angle_rad) * float(max_distance_world)
+            end_cell = self._world_to_runtime_cell(end_x, end_y)
+            last_visible = origin_cell
+            ray_cells = self._bresenham_line_cells(origin_cell, end_cell)
+            for cell_index, (cell_x, cell_y) in enumerate(ray_cells):
+                if cell_index == 0:
+                    if visible_mask is not None:
+                        visible_mask[cell_y, cell_x] = True
+                    continue
+                if bool(self.vision_block_map[cell_y, cell_x]):
+                    break
+                last_visible = (cell_x, cell_y)
+                if visible_mask is not None:
+                    visible_mask[cell_y, cell_x] = True
+            polygon_points.append(self._runtime_cell_center_world(last_visible[0], last_visible[1]))
+
+        polygon_points.append((float(origin_point[0]), float(origin_point[1])))
+        result = {
+            'polygon_world': tuple(polygon_points),
+            'visible_mask': visible_mask,
+        }
+        if cache_key is not None:
+            self._fov_cache[cache_key] = result
+        return result
+
     def _create_raster_layers(self):
-        shape = (self.map_height, self.map_width)
+        shape = self._runtime_grid_shape()
         self.height_map = np.zeros(shape, dtype=np.float32)
         self.terrain_type_map = np.zeros(shape, dtype=np.uint8)
-        self.move_block_map = np.zeros(shape, dtype=np.bool_)
+        self.movement_block_map = np.zeros(shape, dtype=np.bool_)
+        self.move_block_map = self.movement_block_map
+        self.vision_block_map = np.zeros(shape, dtype=np.bool_)
         self.vision_block_height_map = np.zeros(shape, dtype=np.float32)
+        self.function_pass_map = np.zeros(shape, dtype=np.uint8)
+        self.function_heading_map = np.full(shape, np.nan, dtype=np.float32)
         self.priority_map = np.full(shape, fill_value=255, dtype=np.uint8)
 
     def _ensure_raster_layers(self):
-        if self.height_map is None or self.height_map.shape != (self.map_height, self.map_width):
-            self._create_raster_layers()
-            self.raster_dirty = True
+        if self.height_map is None or self.height_map.shape != self._runtime_grid_shape():
+            if not self._try_load_runtime_grid_bundle():
+                self._create_raster_layers()
+                self.raster_dirty = True
         if self.raster_dirty:
             self._rebuild_raster_layers()
 
@@ -658,8 +1450,7 @@ class MapManager:
             return None
 
         shape = region.get('shape')
-        xs = np.arange(x1, x2 + 1)
-        ys = np.arange(y1, y2 + 1)
+        xs, ys = self._runtime_world_coordinate_axes(x1, x2, y1, y2)
 
         if shape == 'rect':
             if region.get('type') == 'boundary':
@@ -712,16 +1503,17 @@ class MapManager:
         return None
 
     def _apply_region_to_raster(self, region):
-        x1, y1, x2, y2 = self._region_bounds(region)
-        if x2 < x1 or y2 < y1:
+        world_x1, world_y1, world_x2, world_y2 = self._region_bounds(region)
+        grid_x1, grid_x2, grid_y1, grid_y2 = self._runtime_bounds_to_cell_ranges(world_x1, world_y1, world_x2, world_y2)
+        if grid_x2 < grid_x1 or grid_y2 < grid_y1:
             return
 
-        mask = self._region_mask(region, x1, y1, x2, y2)
+        mask = self._region_mask(region, grid_x1, grid_y1, grid_x2, grid_y2)
         if mask is None or not mask.any():
             return
 
-        rows = slice(y1, y2 + 1)
-        cols = slice(x1, x2 + 1)
+        rows = slice(grid_y1, grid_y2 + 1)
+        cols = slice(grid_x1, grid_x2 + 1)
         priority = self.priority_rank.get(region.get('type', 'flat'), 254)
         priority_view = self.priority_map[rows, cols]
         replace_mask = mask & (priority <= priority_view)
@@ -735,11 +1527,13 @@ class MapManager:
                 move_block = bool(region.get('blocks_movement', True))
             elif region.get('type') in {'boundary', 'dog_hole', 'rugged_road'}:
                 move_block = True
-            self.move_block_map[rows, cols][replace_mask] = move_block
+            self.movement_block_map[rows, cols][replace_mask] = move_block
 
         vision_height = 0.0
-        if region.get('type') == 'wall' and bool(region.get('blocks_vision', True)):
+        vision_block = region.get('type') == 'wall' and bool(region.get('blocks_vision', True))
+        if vision_block:
             vision_height = float(region.get('height_m', 0.0))
+            self.vision_block_map[rows, cols][mask] = True
         if vision_height > 0.0:
             self.vision_block_height_map[rows, cols] = np.maximum(
                 self.vision_block_height_map[rows, cols],
@@ -750,12 +1544,13 @@ class MapManager:
         grid_x = int(cell.get('x', 0))
         grid_y = int(cell.get('y', 0))
         x1, y1, x2, y2 = self._grid_cell_bounds(grid_x, grid_y)
-        rows = slice(y1, y2 + 1)
-        cols = slice(x1, x2 + 1)
+        runtime_x1, runtime_x2, runtime_y1, runtime_y2 = self._runtime_bounds_to_cell_ranges(x1, y1, x2, y2)
+        rows = slice(runtime_y1, runtime_y2 + 1)
+        cols = slice(runtime_x1, runtime_x2 + 1)
         terrain_type = cell.get('type', 'flat')
         override_height = round(float(cell.get('height_m', 0.0)), 2)
         override_move_block = bool(cell.get('blocks_movement', False))
-        existing_move_block = self.move_block_map[rows, cols].copy()
+        existing_move_block = self.movement_block_map[rows, cols].copy()
         preserve_block_mask = existing_move_block & (not override_move_block)
 
         self.priority_map[rows, cols][~preserve_block_mask] = 0
@@ -765,12 +1560,28 @@ class MapManager:
             np.maximum(self.height_map[rows, cols], override_height),
             override_height,
         )
-        self.move_block_map[rows, cols] = existing_move_block | override_move_block
+        self.movement_block_map[rows, cols] = existing_move_block | override_move_block
         if bool(cell.get('blocks_vision', False)):
+            self.vision_block_map[rows, cols] = True
             self.vision_block_height_map[rows, cols] = np.maximum(
                 self.vision_block_height_map[rows, cols],
                 override_height,
             )
+
+    def _apply_function_override_to_raster(self, cell):
+        grid_x = int(cell.get('x', 0))
+        grid_y = int(cell.get('y', 0))
+        x1, y1, x2, y2 = self._grid_cell_bounds(grid_x, grid_y)
+        runtime_x1, runtime_x2, runtime_y1, runtime_y2 = self._runtime_bounds_to_cell_ranges(x1, y1, x2, y2)
+        rows = slice(runtime_y1, runtime_y2 + 1)
+        cols = slice(runtime_x1, runtime_x2 + 1)
+        pass_mode = str(cell.get('pass_mode', 'passable') or 'passable')
+        pass_code = self.function_pass_mode_by_code.get(pass_mode, 0)
+        self.function_pass_map[rows, cols] = pass_code
+        if pass_mode == 'conditional' and cell.get('heading_deg') is not None:
+            self.function_heading_map[rows, cols] = float(cell.get('heading_deg', 0.0))
+        else:
+            self.function_heading_map[rows, cols] = np.nan
 
     def _rebuild_raster_layers(self):
         self._create_raster_layers()
@@ -780,16 +1591,25 @@ class MapManager:
                     self._apply_region_to_raster(region)
         for cell in self.terrain_grid_overrides.values():
             self._apply_terrain_override_to_raster(cell)
+        for cell in self.function_grid_overrides.values():
+            self._apply_function_override_to_raster(cell)
+        self.move_block_map = self.movement_block_map
+        self.runtime_grid_loaded = False
         self.raster_dirty = False
 
     def get_raster_layers(self):
         self._ensure_raster_layers()
         return {
-            'shape': (self.map_height, self.map_width),
+            'shape': self._runtime_grid_shape(),
+            'resolution_m': float(self.runtime_grid_resolution_m),
             'height_map': self.height_map,
             'terrain_type_map': self.terrain_type_map,
-            'move_block_map': self.move_block_map,
+            'move_block_map': self.movement_block_map,
+            'movement_block_map': self.movement_block_map,
+            'vision_block_map': self.vision_block_map,
             'vision_block_height_map': self.vision_block_height_map,
+            'function_pass_map': self.function_pass_map,
+            'function_heading_map': self.function_heading_map,
             'terrain_code_by_type': dict(self.terrain_code_by_type),
             'terrain_label_by_code': dict(self.terrain_label_by_code),
         }
@@ -805,17 +1625,33 @@ class MapManager:
                 'height_m': 0.0,
                 'move_blocked': True,
                 'vision_block_height_m': 0.0,
+                'function_pass_mode': 'blocked',
+                'function_pass_mode_label': self.function_pass_mode_label_by_code[self.function_pass_mode_by_code['blocked']],
+                'function_heading_deg': None,
             }
 
         self._ensure_raster_layers()
-        terrain_code = int(self.terrain_type_map[map_y, map_x])
+        runtime_x, runtime_y = self._world_to_runtime_cell(map_x, map_y)
+        terrain_code = int(self.terrain_type_map[runtime_y, runtime_x])
+        function_pass_code = int(self.function_pass_map[runtime_y, runtime_x])
+        function_pass_mode = next(
+            (label for label, code in self.function_pass_mode_by_code.items() if code == function_pass_code),
+            'passable',
+        )
+        function_heading = float(self.function_heading_map[runtime_y, runtime_x])
+        if np.isnan(function_heading):
+            function_heading = None
         return {
             'terrain_type': self.terrain_type_by_code.get(terrain_code, 'flat'),
             'terrain_code': terrain_code,
             'terrain_label': self.terrain_label_by_code.get(terrain_code, '平地'),
-            'height_m': round(float(self.height_map[map_y, map_x]), 2),
-            'move_blocked': bool(self.move_block_map[map_y, map_x]),
-            'vision_block_height_m': round(float(self.vision_block_height_map[map_y, map_x]), 2),
+            'height_m': round(float(self.height_map[runtime_y, runtime_x]), 2),
+            'move_blocked': bool(self.movement_block_map[runtime_y, runtime_x]) or function_pass_code == self.function_pass_mode_by_code['blocked'],
+            'vision_blocked': bool(self.vision_block_map[runtime_y, runtime_x]),
+            'vision_block_height_m': round(float(self.vision_block_height_map[runtime_y, runtime_x]), 2),
+            'function_pass_mode': function_pass_mode,
+            'function_pass_mode_label': self.function_pass_mode_label_by_code[self.function_pass_mode_by_code.get(function_pass_mode, 0)],
+            'function_heading_deg': function_heading,
         }
 
     def _normalize_points(self, points):
@@ -866,36 +1702,119 @@ class MapManager:
     
     def load_map(self):
         """加载地图图像"""
-        map_path = self.config.get('map', {}).get('image_path', '场地-俯视图.png')
+        map_path = self.config.get('map', {}).get('image_path', '') or ''
+        self._config_coordinate_space_hint = None
+        preserved_runtime_grid_bundle = dict(self.config.get('map', {}).get('runtime_grid', {}) or {})
+        self._refresh_runtime_grid_metrics()
+        target_width = int(self.map_width)
+        target_height = int(self.map_height)
         resolved_path = map_path
-        if not os.path.isabs(resolved_path):
+        if resolved_path and not os.path.isabs(resolved_path):
+            base_dirs = []
+            preset_path = self.config.get('map', {}).get('_preset_path')
+            if preset_path:
+                base_dirs.append(os.path.dirname(os.path.abspath(preset_path)))
             config_path = self.config.get('_config_path')
-            base_dir = os.path.dirname(os.path.abspath(config_path)) if config_path else os.getcwd()
-            candidate = os.path.join(base_dir, resolved_path)
-            if os.path.exists(candidate):
-                resolved_path = candidate
-        
-        if os.path.exists(resolved_path):
+            if config_path:
+                base_dirs.append(os.path.dirname(os.path.abspath(config_path)))
+            base_dirs.append(os.getcwd())
+            for base_dir in base_dirs:
+                candidate = os.path.join(base_dir, resolved_path)
+                if os.path.exists(candidate):
+                    resolved_path = candidate
+                    break
+            if not os.path.exists(resolved_path):
+                fallback_candidates = []
+                for base_dir in base_dirs:
+                    fallback_candidates.append(os.path.join(base_dir, '场地-俯视图.png'))
+                    fallback_candidates.append(os.path.join(base_dir, '俯视图.png'))
+                    fallback_candidates.append(os.path.join(base_dir, 'maps', 'basicMap', '场地-俯视图.png'))
+                for candidate in fallback_candidates:
+                    if os.path.exists(candidate):
+                        resolved_path = candidate
+                        break
+
+        if resolved_path and os.path.exists(resolved_path):
             try:
-                self.map_image = pygame.image.load(resolved_path)
-                # 调整地图大小
-                width = int(self.map_image.get_width() * self.scale)
-                height = int(self.map_image.get_height() * self.scale)
-                self.map_surface = pygame.transform.scale(self.map_image, (width, height))
-                self.map_width = self.map_image.get_width()
-                self.map_height = self.map_image.get_height()
-                self._mark_raster_dirty()
+                loaded_image = pygame.image.load(resolved_path)
+                if (loaded_image.get_width(), loaded_image.get_height()) != (target_width, target_height):
+                    self.map_image = pygame.transform.smoothscale(loaded_image, (target_width, target_height))
+                else:
+                    self.map_image = loaded_image
+                self.map_width = target_width
+                self.map_height = target_height
+                self.map_surface = pygame.transform.scale(self.map_image, (int(target_width * self.scale), int(target_height * self.scale)))
+                self._refresh_runtime_grid_metrics()
+                map_config = self.config.setdefault('map', {})
+                map_config['width'] = int(self.map_width)
+                map_config['height'] = int(self.map_height)
+                map_config['source_width'] = int(self.source_map_width)
+                map_config['source_height'] = int(self.source_map_height)
+                map_config['strict_scale'] = bool(self.strict_scale_enabled)
+                if preserved_runtime_grid_bundle.get('channels'):
+                    self.runtime_grid_bundle = preserved_runtime_grid_bundle
+                    self.config.setdefault('map', {})['runtime_grid'] = dict(preserved_runtime_grid_bundle)
+                    self.height_map = None
+                    self.terrain_type_map = None
+                    self.movement_block_map = None
+                    self.move_block_map = None
+                    self.vision_block_map = None
+                    self.vision_block_height_map = None
+                    self.function_pass_map = None
+                    self.function_heading_map = None
+                    self.priority_map = None
+                    self.raster_dirty = False
+                    self.runtime_grid_loaded = False
+                else:
+                    self._mark_raster_dirty()
                 print(f"地图加载成功: {resolved_path}")
             except pygame.error as e:
                 print(f"地图加载失败: {e}")
         else:
-            print(f"地图文件不存在: {resolved_path}")
+            width = target_width
+            height = target_height
+            self.map_width = width
+            self.map_height = height
+            self.map_image = self._create_blank_map_surface(width, height)
+            self.map_surface = pygame.transform.scale(self.map_image, (int(width * self.scale), int(height * self.scale)))
+            self._refresh_runtime_grid_metrics()
+            map_config = self.config.setdefault('map', {})
+            map_config['width'] = int(self.map_width)
+            map_config['height'] = int(self.map_height)
+            map_config['source_width'] = int(self.source_map_width)
+            map_config['source_height'] = int(self.source_map_height)
+            map_config['strict_scale'] = bool(self.strict_scale_enabled)
+            if preserved_runtime_grid_bundle.get('channels'):
+                self.runtime_grid_bundle = preserved_runtime_grid_bundle
+                self.config.setdefault('map', {})['runtime_grid'] = dict(preserved_runtime_grid_bundle)
+                self.height_map = None
+                self.terrain_type_map = None
+                self.movement_block_map = None
+                self.move_block_map = None
+                self.vision_block_map = None
+                self.vision_block_height_map = None
+                self.function_pass_map = None
+                self.function_heading_map = None
+                self.priority_map = None
+                self.raster_dirty = False
+                self.runtime_grid_loaded = False
+            else:
+                self._mark_raster_dirty()
+            if map_path:
+                print(f"地图文件不存在，已回退为空白地图: {resolved_path}")
+            else:
+                print("未配置地图底图，已创建空白地图")
 
     def _load_facilities_from_config(self):
         """加载设施区域定义（优先使用配置，缺省使用内置俯视图标定）。"""
-        configured = self.config.get('map', {}).get('facilities', [])
-        if configured:
-            self.facilities = [self._normalize_region(region) for region in configured]
+        map_config = self.config.get('map', {})
+        if 'facilities' in map_config:
+            configured = map_config.get('facilities', []) or []
+            coordinate_space = self._configured_coordinate_space()
+            if coordinate_space == 'source':
+                self.facilities = [self._normalize_region(self._scale_region_to_current_map(self._normalize_region(region))) for region in configured]
+            else:
+                self.facilities = [self._normalize_region(region) for region in configured]
             self._mark_raster_dirty()
             return
 
@@ -926,6 +1845,7 @@ class MapManager:
             {'id': 'blue_fort', 'type': 'fort', 'team': 'blue', 'shape': 'rect', 'x1': 1215, 'y1': 320, 'x2': 1330, 'y2': 520},
             {'id': 'boundary_outer', 'type': 'boundary', 'team': 'neutral', 'shape': 'rect', 'x1': 0, 'y1': 0, 'x2': 1575, 'y2': 872, 'thickness': 14},
         ]
+        self.facilities = [self._normalize_region(self._scale_region_to_current_map(region)) for region in self.facilities]
         self._mark_raster_dirty()
 
     def _in_rect(self, x, y, region):
@@ -1177,44 +2097,254 @@ class MapManager:
     def get_terrain_height_m(self, x, y):
         return self.sample_raster_layers(x, y)['height_m']
 
+    def _is_runtime_cell_blocked(self, cell, traversal_profile=None):
+        self._ensure_raster_layers()
+        cell_x, cell_y = int(cell[0]), int(cell[1])
+        if not (0 <= cell_x < self.runtime_grid_width and 0 <= cell_y < self.runtime_grid_height):
+            return True
+        if bool(self.movement_block_map[cell_y, cell_x]):
+            return True
+        if int(self.function_pass_map[cell_y, cell_x]) == self.function_pass_mode_by_code['blocked']:
+            return True
+        collision_radius = float((traversal_profile or {}).get('collision_radius', 0.0))
+        if collision_radius <= max(self.runtime_cell_width_world, self.runtime_cell_height_world) * 0.45:
+            return False
+        center_x, center_y = self._runtime_cell_center_world(cell_x, cell_y)
+        return not self.is_position_valid_for_radius(center_x, center_y, collision_radius=collision_radius)
+
+    def _find_nearest_passable_runtime_cell(self, cell, traversal_profile=None, search_radius=8):
+        if not self._is_runtime_cell_blocked(cell, traversal_profile=traversal_profile):
+            return int(cell[0]), int(cell[1])
+        limit = max(1, int(search_radius))
+        for radius in range(1, limit + 1):
+            for offset_y in range(-radius, radius + 1):
+                for offset_x in range(-radius, radius + 1):
+                    if abs(offset_x) != radius and abs(offset_y) != radius:
+                        continue
+                    candidate = (int(cell[0]) + offset_x, int(cell[1]) + offset_y)
+                    if self._is_runtime_cell_blocked(candidate, traversal_profile=traversal_profile):
+                        continue
+                    return candidate
+        return None
+
+    def _iter_runtime_neighbors(self, cell):
+        for offset_y in (-1, 0, 1):
+            for offset_x in (-1, 0, 1):
+                if offset_x == 0 and offset_y == 0:
+                    continue
+                yield int(cell[0]) + offset_x, int(cell[1]) + offset_y
+
+    def _runtime_transition_cost(self, current_cell, neighbor_cell):
+        delta_x = abs(int(neighbor_cell[0]) - int(current_cell[0]))
+        delta_y = abs(int(neighbor_cell[1]) - int(current_cell[1]))
+        if delta_x == 0 and delta_y == 0:
+            return 0.0
+        width = float(self.runtime_cell_width_world)
+        height = float(self.runtime_cell_height_world)
+        if delta_x == 1 and delta_y == 1:
+            return math.hypot(width, height)
+        if delta_x == 1:
+            return width
+        if delta_y == 1:
+            return height
+        return math.hypot(delta_x * width, delta_y * height)
+
+    def _runtime_transition_passable(self, current_cell, neighbor_cell, max_height_delta_m=0.05, traversal_profile=None):
+        traversal_profile = traversal_profile or {}
+        if self._is_runtime_cell_blocked(neighbor_cell, traversal_profile=traversal_profile):
+            return False
+        delta_x = int(neighbor_cell[0]) - int(current_cell[0])
+        delta_y = int(neighbor_cell[1]) - int(current_cell[1])
+        if abs(delta_x) > 1 or abs(delta_y) > 1:
+            return False
+        if delta_x != 0 and delta_y != 0:
+            side_a = (int(current_cell[0]) + delta_x, int(current_cell[1]))
+            side_b = (int(current_cell[0]), int(current_cell[1]) + delta_y)
+            if self._is_runtime_cell_blocked(side_a, traversal_profile=traversal_profile):
+                return False
+            if self._is_runtime_cell_blocked(side_b, traversal_profile=traversal_profile):
+                return False
+        current_world = self._runtime_cell_center_world(current_cell[0], current_cell[1])
+        neighbor_world = self._runtime_cell_center_world(neighbor_cell[0], neighbor_cell[1])
+        if not self.is_directionally_passable_segment(
+            current_world[0],
+            current_world[1],
+            neighbor_world[0],
+            neighbor_world[1],
+            collision_radius=float(traversal_profile.get('collision_radius', 0.0)),
+            sample_stride=max(self.runtime_cell_width_world, self.runtime_cell_height_world),
+        ):
+            return False
+        current_height = float(self.height_map[int(current_cell[1]), int(current_cell[0])])
+        neighbor_height = float(self.height_map[int(neighbor_cell[1]), int(neighbor_cell[0])])
+        if abs(neighbor_height - current_height) <= float(max_height_delta_m) + 1e-6:
+            return True
+        return self._segment_touches_step_surface(
+            current_world[0],
+            current_world[1],
+            neighbor_world[0],
+            neighbor_world[1],
+        )
+
+    def _runtime_path_heuristic(self, cell, goal_cell):
+        current_world = self._runtime_cell_center_world(cell[0], cell[1])
+        goal_world = self._runtime_cell_center_world(goal_cell[0], goal_cell[1])
+        return math.hypot(goal_world[0] - current_world[0], goal_world[1] - current_world[1])
+
+    def _sparsify_runtime_path(self, points, max_height_delta_m=0.05, collision_radius=0.0):
+        if len(points) <= 2:
+            return points
+        simplified = [points[0]]
+        anchor_index = 0
+        sample_stride = max(1.0, min(self.runtime_cell_width_world, self.runtime_cell_height_world))
+        while anchor_index < len(points) - 1:
+            best_index = anchor_index + 1
+            for candidate_index in range(anchor_index + 1, len(points)):
+                anchor_point = points[anchor_index]
+                candidate_point = points[candidate_index]
+                result = self.evaluate_movement_path(
+                    anchor_point[0],
+                    anchor_point[1],
+                    candidate_point[0],
+                    candidate_point[1],
+                    max_height_delta_m=max_height_delta_m,
+                    collision_radius=collision_radius,
+                )
+                if not result.get('ok'):
+                    break
+                if not self.is_segment_valid_for_radius(
+                    anchor_point[0],
+                    anchor_point[1],
+                    candidate_point[0],
+                    candidate_point[1],
+                    collision_radius=collision_radius,
+                    sample_stride=sample_stride,
+                ):
+                    break
+                best_index = candidate_index
+            simplified.append(points[best_index])
+            anchor_index = best_index
+        return simplified
+
+    def _reconstruct_runtime_path(self, came_from, current_cell, start_point, end_point, max_height_delta_m=0.05, collision_radius=0.0):
+        cells = [current_cell]
+        while current_cell in came_from:
+            current_cell = came_from[current_cell]
+            cells.append(current_cell)
+        cells.reverse()
+        points = [start_point]
+        points.extend(self._runtime_cell_center_world(cell[0], cell[1]) for cell in cells[1:-1])
+        points.append(end_point)
+        return self._sparsify_runtime_path(
+            points,
+            max_height_delta_m=max_height_delta_m,
+            collision_radius=collision_radius,
+        )
+
+    def _runtime_astar_find_path(self, start_point, end_point, max_height_delta_m=0.05, traversal_profile=None, max_iterations=None, max_runtime_sec=None):
+        traversal_profile = traversal_profile or {}
+        start_cell = self._world_to_runtime_cell(start_point[0], start_point[1])
+        goal_cell = self._world_to_runtime_cell(end_point[0], end_point[1])
+        start_cell = self._find_nearest_passable_runtime_cell(start_cell, traversal_profile=traversal_profile)
+        goal_cell = self._find_nearest_passable_runtime_cell(goal_cell, traversal_profile=traversal_profile)
+        if start_cell is None or goal_cell is None:
+            return []
+        if start_cell == goal_cell:
+            return [start_point, end_point]
+
+        iteration_limit = max(1, int(max_iterations) if max_iterations is not None else 12000)
+        deadline = None
+        if max_runtime_sec is not None and float(max_runtime_sec) > 0.0:
+            deadline = time.perf_counter() + float(max_runtime_sec)
+
+        frontier_heap = []
+        start_h = self._runtime_path_heuristic(start_cell, goal_cell)
+        heappush(frontier_heap, (start_h, 0.0, start_cell))
+        came_from = {}
+        g_score = {start_cell: 0.0}
+        closed = set()
+        iterations = 0
+
+        while frontier_heap:
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
+            iterations += 1
+            if iterations > iteration_limit:
+                break
+
+            _, current_g, current_cell = heappop(frontier_heap)
+            best_g = float(g_score.get(current_cell, float('inf')))
+            if current_g > best_g + 1e-6:
+                continue
+            if current_cell in closed:
+                continue
+            if current_cell == goal_cell:
+                return self._reconstruct_runtime_path(
+                    came_from,
+                    current_cell,
+                    start_point,
+                    end_point,
+                    max_height_delta_m=max_height_delta_m,
+                    collision_radius=float(traversal_profile.get('collision_radius', 0.0)),
+                )
+            closed.add(current_cell)
+
+            for neighbor_cell in self._iter_runtime_neighbors(current_cell):
+                if neighbor_cell in closed:
+                    continue
+                if self._is_runtime_cell_blocked(neighbor_cell, traversal_profile=traversal_profile):
+                    continue
+                if not self._runtime_transition_passable(
+                    current_cell,
+                    neighbor_cell,
+                    max_height_delta_m=max_height_delta_m,
+                    traversal_profile=traversal_profile,
+                ):
+                    continue
+                tentative_g = best_g + self._runtime_transition_cost(current_cell, neighbor_cell)
+                if tentative_g >= float(g_score.get(neighbor_cell, float('inf'))) - 1e-6:
+                    continue
+                came_from[neighbor_cell] = current_cell
+                g_score[neighbor_cell] = tentative_g
+                heuristic = self._runtime_path_heuristic(neighbor_cell, goal_cell)
+                heappush(frontier_heap, (tentative_g + heuristic, tentative_g, neighbor_cell))
+        return []
+
     def find_path(self, start_point, end_point, max_height_delta_m=0.05, grid_step=None, traversal_profile=None, max_iterations=None, max_runtime_sec=None):
         self._ensure_raster_layers()
         if start_point is None or end_point is None:
             return []
 
         traversal_profile = traversal_profile or {}
+        collision_radius = float(traversal_profile.get('collision_radius', 0.0))
 
-        step = max(4, int(grid_step or max(self.terrain_grid_cell_size * 2, 12)))
-        start = self._point_to_nav_cell(start_point, step)
-        goal = self._point_to_nav_cell(end_point, step)
-        start_world = self._nav_cell_center(start, step)
-        goal_world = self._nav_cell_center(goal, step)
-
-        if not self._is_nav_cell_passable(start, step, traversal_profile=traversal_profile):
-            start = self._find_nearest_passable_nav_cell(start, step, search_radius=6, traversal_profile=traversal_profile)
-            if start is None:
-                return []
-            start_world = self._nav_cell_center(start, step)
-        if not self._is_nav_cell_passable(goal, step, traversal_profile=traversal_profile):
-            goal = self._find_nearest_passable_nav_cell(goal, step, search_radius=6, traversal_profile=traversal_profile)
-            if goal is None:
-                return []
-            goal_world = self._nav_cell_center(goal, step)
-
-        if start == goal:
+        direct_segment = self.evaluate_movement_path(
+            start_point[0],
+            start_point[1],
+            end_point[0],
+            end_point[1],
+            max_height_delta_m=max_height_delta_m,
+            collision_radius=collision_radius,
+        )
+        if direct_segment.get('ok'):
             return [start_point, end_point]
 
-        cache_key = self._path_result_cache_key(start, goal, step, traversal_profile, max_height_delta_m)
+        start_cell = self._world_to_runtime_cell(start_point[0], start_point[1])
+        goal_cell = self._world_to_runtime_cell(end_point[0], end_point[1])
+        cache_key = (
+            start_cell,
+            goal_cell,
+            round(float(self.runtime_grid_resolution_m), 3),
+            int(self.raster_version),
+            self._nav_profile_signature(traversal_profile, max_height_delta_m),
+        )
         cached_path = self._get_cached_path_result(cache_key)
         if cached_path is not None:
             return cached_path
 
-        path = self._astar_find_path(
-            start=start,
-            goal=goal,
-            start_point=start_world,
-            end_point=goal_world,
-            step=step,
+        path = self._runtime_astar_find_path(
+            start_point=start_point,
+            end_point=end_point,
             max_height_delta_m=max_height_delta_m,
             traversal_profile=traversal_profile,
             max_iterations=max_iterations,
@@ -1222,6 +2352,261 @@ class MapManager:
         )
         self._store_path_result(cache_key, path)
         return path
+
+    def _macro_nav_span(self, step):
+        target_world_size = max(float(step) * 3.0, 48.0)
+        return max(2, int(round(target_world_size / max(float(step), 1.0))))
+
+    def _nav_cell_to_macro_cell(self, cell, span):
+        return int(cell[0]) // int(span), int(cell[1]) // int(span)
+
+    def _macro_cell_bounds(self, macro_cell, span):
+        min_x = int(macro_cell[0]) * int(span)
+        min_y = int(macro_cell[1]) * int(span)
+        max_x = min_x + int(span) - 1
+        max_y = min_y + int(span) - 1
+        return min_x, max_x, min_y, max_y
+
+    def _macro_grid_dimensions(self, step, span):
+        fine_x = math.ceil(self.map_width / max(int(step), 1))
+        fine_y = math.ceil(self.map_height / max(int(step), 1))
+        return math.ceil(fine_x / max(int(span), 1)), math.ceil(fine_y / max(int(span), 1))
+
+    def _iter_macro_neighbors(self, macro_cell):
+        yield macro_cell[0] - 1, macro_cell[1]
+        yield macro_cell[0] + 1, macro_cell[1]
+        yield macro_cell[0], macro_cell[1] - 1
+        yield macro_cell[0], macro_cell[1] + 1
+
+    def _macro_path_cache_key(self, start_macro, goal_macro, step, span, traversal_profile, max_height_delta_m):
+        return (
+            start_macro,
+            goal_macro,
+            int(step),
+            int(span),
+            int(self.raster_version),
+            self._nav_profile_signature(traversal_profile, max_height_delta_m),
+        )
+
+    def _get_cached_macro_path(self, cache_key):
+        now = time.perf_counter()
+        with self._macro_path_cache_lock:
+            entry = self._macro_path_cache.get(cache_key)
+            if entry is None:
+                return None
+            entry['last_used'] = now
+            return tuple(entry.get('route', ()))
+
+    def _store_macro_path(self, cache_key, route):
+        now = time.perf_counter()
+        with self._macro_path_cache_lock:
+            self._macro_path_cache[cache_key] = {
+                'route': tuple(route or ()),
+                'last_used': now,
+            }
+            overflow = len(self._macro_path_cache) - 96
+            if overflow > 0:
+                ordered_keys = sorted(
+                    self._macro_path_cache,
+                    key=lambda key: self._macro_path_cache[key].get('last_used', 0.0),
+                )
+                for old_key in ordered_keys[:overflow]:
+                    self._macro_path_cache.pop(old_key, None)
+
+    def _is_macro_cell_passable(self, macro_cell, step, span, traversal_profile=None):
+        macro_width, macro_height = self._macro_grid_dimensions(step, span)
+        if not (0 <= macro_cell[0] < macro_width and 0 <= macro_cell[1] < macro_height):
+            return False
+        min_x, max_x, min_y, max_y = self._macro_cell_bounds(macro_cell, span)
+        fine_width = math.ceil(self.map_width / max(int(step), 1))
+        fine_height = math.ceil(self.map_height / max(int(step), 1))
+        max_x = min(max_x, fine_width - 1)
+        max_y = min(max_y, fine_height - 1)
+        for cell_y in range(min_y, max_y + 1):
+            for cell_x in range(min_x, max_x + 1):
+                if self._is_nav_cell_passable((cell_x, cell_y), step, traversal_profile=traversal_profile):
+                    return True
+        return False
+
+    def _find_nearest_passable_macro_cell(self, macro_cell, step, span, traversal_profile=None, search_radius=2):
+        if self._is_macro_cell_passable(macro_cell, step, span, traversal_profile=traversal_profile):
+            return macro_cell
+        macro_width, macro_height = self._macro_grid_dimensions(step, span)
+        for radius in range(1, max(1, int(search_radius)) + 1):
+            for offset_y in range(-radius, radius + 1):
+                for offset_x in range(-radius, radius + 1):
+                    candidate = (macro_cell[0] + offset_x, macro_cell[1] + offset_y)
+                    if not (0 <= candidate[0] < macro_width and 0 <= candidate[1] < macro_height):
+                        continue
+                    if self._is_macro_cell_passable(candidate, step, span, traversal_profile=traversal_profile):
+                        return candidate
+        return None
+
+    def _macro_boundary_nav_pairs(self, current_macro, neighbor_macro, span):
+        current_min_x, current_max_x, current_min_y, current_max_y = self._macro_cell_bounds(current_macro, span)
+        neighbor_min_x, neighbor_max_x, neighbor_min_y, neighbor_max_y = self._macro_cell_bounds(neighbor_macro, span)
+        delta_x = int(neighbor_macro[0]) - int(current_macro[0])
+        delta_y = int(neighbor_macro[1]) - int(current_macro[1])
+        pairs = []
+        if abs(delta_x) + abs(delta_y) != 1:
+            return pairs
+        if delta_x != 0:
+            current_x = current_max_x if delta_x > 0 else current_min_x
+            neighbor_x = neighbor_min_x if delta_x > 0 else neighbor_max_x
+            overlap_y1 = max(current_min_y, neighbor_min_y)
+            overlap_y2 = min(current_max_y, neighbor_max_y)
+            for cell_y in range(overlap_y1, overlap_y2 + 1):
+                pairs.append(((current_x, cell_y), (neighbor_x, cell_y)))
+        else:
+            current_y = current_max_y if delta_y > 0 else current_min_y
+            neighbor_y = neighbor_min_y if delta_y > 0 else neighbor_max_y
+            overlap_x1 = max(current_min_x, neighbor_min_x)
+            overlap_x2 = min(current_max_x, neighbor_max_x)
+            for cell_x in range(overlap_x1, overlap_x2 + 1):
+                pairs.append(((cell_x, current_y), (cell_x, neighbor_y)))
+        return pairs
+
+    def _is_macro_transition_passable(self, current_macro, neighbor_macro, step, span, traversal_profile=None, max_height_delta_m=0.05):
+        if not self._is_macro_cell_passable(current_macro, step, span, traversal_profile=traversal_profile):
+            return False
+        if not self._is_macro_cell_passable(neighbor_macro, step, span, traversal_profile=traversal_profile):
+            return False
+        for current_cell, neighbor_cell in self._macro_boundary_nav_pairs(current_macro, neighbor_macro, span):
+            if not self._is_nav_cell_passable(current_cell, step, traversal_profile=traversal_profile):
+                continue
+            if not self._is_nav_cell_passable(neighbor_cell, step, traversal_profile=traversal_profile):
+                continue
+            if not self._is_nav_transition_passable(current_cell, neighbor_cell, step, traversal_profile=traversal_profile):
+                continue
+            current_world = self._nav_cell_center(current_cell, step)
+            neighbor_world = self._nav_cell_center(neighbor_cell, step)
+            current_height = float(self.get_terrain_height_m(current_world[0], current_world[1]))
+            neighbor_height = float(self.get_terrain_height_m(neighbor_world[0], neighbor_world[1]))
+            if abs(neighbor_height - current_height) <= float(max_height_delta_m) + 1e-6:
+                return True
+            if self._segment_touches_step_surface(current_world[0], current_world[1], neighbor_world[0], neighbor_world[1]):
+                return True
+        return False
+
+    def _reconstruct_macro_route(self, parents, current):
+        route = [current]
+        while current in parents:
+            current = parents[current]
+            route.append(current)
+        route.reverse()
+        return tuple(route)
+
+    def _find_macro_corridor(self, start, goal, step, max_height_delta_m=0.05, traversal_profile=None):
+        span = self._macro_nav_span(step)
+        macro_passable_cache = {}
+        macro_transition_cache = {}
+
+        def is_macro_passable(cell):
+            if cell not in macro_passable_cache:
+                macro_passable_cache[cell] = self._is_macro_cell_passable(cell, step, span, traversal_profile=traversal_profile)
+            return macro_passable_cache[cell]
+
+        def is_macro_transition_passable(current_macro, neighbor_macro):
+            cache_key = (current_macro, neighbor_macro)
+            if cache_key not in macro_transition_cache:
+                macro_transition_cache[cache_key] = self._is_macro_transition_passable(
+                    current_macro,
+                    neighbor_macro,
+                    step,
+                    span,
+                    traversal_profile=traversal_profile,
+                    max_height_delta_m=max_height_delta_m,
+                )
+            return macro_transition_cache[cache_key]
+
+        start_macro = self._nav_cell_to_macro_cell(start, span)
+        goal_macro = self._nav_cell_to_macro_cell(goal, span)
+        start_macro = self._find_nearest_passable_macro_cell(start_macro, step, span, traversal_profile=traversal_profile)
+        goal_macro = self._find_nearest_passable_macro_cell(goal_macro, step, span, traversal_profile=traversal_profile)
+        if start_macro is None or goal_macro is None:
+            return (), span
+        if start_macro == goal_macro:
+            return (start_macro,), span
+        cache_key = self._macro_path_cache_key(start_macro, goal_macro, step, span, traversal_profile, max_height_delta_m)
+        cached = self._get_cached_macro_path(cache_key)
+        if cached is not None:
+            return cached, span
+
+        frontier_heap = []
+        start_h = math.hypot(goal_macro[0] - start_macro[0], goal_macro[1] - start_macro[1])
+        heappush(frontier_heap, (start_h, 0.0, start_macro))
+        parents = {}
+        g_score = {start_macro: 0.0}
+        closed = set()
+
+        while frontier_heap:
+            _, current_g, current = heappop(frontier_heap)
+            if current in closed:
+                continue
+            if current == goal_macro:
+                route = self._reconstruct_macro_route(parents, current)
+                self._store_macro_path(cache_key, route)
+                return route, span
+            closed.add(current)
+            for neighbor in self._iter_macro_neighbors(current):
+                if neighbor in closed:
+                    continue
+                if not is_macro_passable(neighbor):
+                    continue
+                if not is_macro_transition_passable(current, neighbor):
+                    continue
+                tentative_g = current_g + 1.0
+                if tentative_g >= float(g_score.get(neighbor, float('inf'))) - 1e-6:
+                    continue
+                parents[neighbor] = current
+                g_score[neighbor] = tentative_g
+                heuristic = math.hypot(goal_macro[0] - neighbor[0], goal_macro[1] - neighbor[1])
+                heappush(frontier_heap, (tentative_g + heuristic, tentative_g, neighbor))
+
+        self._store_macro_path(cache_key, ())
+        return (), span
+
+    def _macro_route_search_bounds(self, macro_route, step, span, margin=1):
+        if not macro_route:
+            return None
+        min_macro_x = min(cell[0] for cell in macro_route) - int(margin)
+        max_macro_x = max(cell[0] for cell in macro_route) + int(margin)
+        min_macro_y = min(cell[1] for cell in macro_route) - int(margin)
+        max_macro_y = max(cell[1] for cell in macro_route) + int(margin)
+        fine_width = max(1, math.ceil(self.map_width / max(int(step), 1)))
+        fine_height = max(1, math.ceil(self.map_height / max(int(step), 1)))
+        min_cell_x = max(0, min_macro_x * int(span))
+        max_cell_x = min(fine_width - 1, (max_macro_x + 1) * int(span) - 1)
+        min_cell_y = max(0, min_macro_y * int(span))
+        max_cell_y = min(fine_height - 1, (max_macro_y + 1) * int(span) - 1)
+        return min_cell_x, max_cell_x, min_cell_y, max_cell_y
+
+    def _coarse_route_to_world_points(self, macro_route, step, span, start_point, end_point):
+        if not macro_route:
+            return []
+        points = [start_point]
+        for macro_cell in macro_route[1:-1]:
+            min_x, max_x, min_y, max_y = self._macro_cell_bounds(macro_cell, span)
+            center_cell = ((min_x + max_x) // 2, (min_y + max_y) // 2)
+            passable_center = self._find_nearest_passable_nav_cell(center_cell, step, search_radius=max(2, span))
+            if passable_center is None:
+                continue
+            points.append(self._nav_cell_center(passable_center, step))
+        points.append(end_point)
+        return self._sparsify_nav_path(points, max(step, step * span))
+
+    def _hierarchical_find_path(self, start, goal, start_point, end_point, step, max_height_delta_m=0.05, traversal_profile=None, max_iterations=None, max_runtime_sec=None):
+        return self._astar_find_path(
+            start,
+            goal,
+            start_point,
+            end_point,
+            step,
+            max_height_delta_m=max_height_delta_m,
+            traversal_profile=traversal_profile,
+            max_iterations=max_iterations,
+            max_runtime_sec=max_runtime_sec,
+        )
 
     def _nav_profile_signature(self, traversal_profile, max_height_delta_m):
         traversal_profile = traversal_profile or {}
@@ -1551,9 +2936,16 @@ class MapManager:
         target_world = self._nav_cell_center(target_cell, step)
         return math.hypot(target_world[0] - cell_world[0], target_world[1] - cell_world[1])
 
-    def _astar_find_path(self, start, goal, start_point, end_point, step, max_height_delta_m=0.05, traversal_profile=None, max_iterations=None, max_runtime_sec=None):
+    def _astar_find_path(self, start, goal, start_point, end_point, step, max_height_delta_m=0.05, traversal_profile=None, max_iterations=None, max_runtime_sec=None, allowed_bounds=None):
         traversal_profile = traversal_profile or {}
-        iteration_limit = int(max_iterations) if max_iterations is not None else 1200
+        if max_iterations is not None:
+            iteration_limit = int(max_iterations)
+        elif allowed_bounds is not None:
+            min_x, max_x, min_y, max_y = allowed_bounds
+            area = max(1, (max_x - min_x + 1) * (max_y - min_y + 1))
+            iteration_limit = min(1400, max(160, area * 3))
+        else:
+            iteration_limit = 1200
         if iteration_limit <= 0:
             iteration_limit = 1
         deadline = None
@@ -1625,6 +3017,10 @@ class MapManager:
             for neighbor in self._iter_nav_neighbors(current):
                 if neighbor in closed:
                     continue
+                if allowed_bounds is not None:
+                    min_x, max_x, min_y, max_y = allowed_bounds
+                    if not (min_x <= neighbor[0] <= max_x and min_y <= neighbor[1] <= max_y):
+                        continue
                 transition_cost = edge_cost(current, neighbor)
                 if math.isinf(transition_cost):
                     continue
@@ -2158,6 +3554,13 @@ class MapManager:
             ratio = step_index / sample_count
             sample_x = float(from_x) + (float(to_x) - float(from_x)) * ratio
             sample_y = float(from_y) + (float(to_y) - float(from_y)) * ratio
+            if not self.is_directionally_passable_segment(previous_x, previous_y, sample_x, sample_y, collision_radius=collision_radius, sample_stride=sample_stride):
+                return {
+                    'ok': False,
+                    'reason': 'conditional_direction',
+                    'start_height_m': start_sample['height_m'],
+                    'end_height_m': end_sample['height_m'],
+                }
             if not self.is_position_valid_for_radius(sample_x, sample_y, collision_radius=collision_radius):
                 return {
                     'ok': False,
@@ -2200,6 +3603,117 @@ class MapManager:
             'requires_step_alignment': requires_step_alignment,
             'step_heading_deg': step_heading_deg,
         }
+
+    def trace_movement_obstacle(self, from_x, from_y, to_x, to_y, max_height_delta_m=0.05, collision_radius=0.0, max_distance=None):
+        distance = math.hypot(float(to_x) - float(from_x), float(to_y) - float(from_y))
+        if distance <= 1e-6:
+            return None
+
+        trace_distance = distance
+        if max_distance is not None:
+            trace_distance = min(trace_distance, max(0.0, float(max_distance)))
+        if trace_distance <= 1e-6:
+            return None
+
+        ratio_limit = min(1.0, trace_distance / max(distance, 1e-6))
+        start_sample = self.sample_raster_layers(from_x, from_y)
+        previous_height = float(start_sample['height_m'])
+        previous_x = float(from_x)
+        previous_y = float(from_y)
+        sample_stride = max(1.0, float(self.terrain_grid_cell_size) * 0.35)
+        sample_count = max(1, int(math.ceil(trace_distance / sample_stride)))
+
+        for step_index in range(1, sample_count + 1):
+            ratio = ratio_limit * (step_index / sample_count)
+            sample_x = float(from_x) + (float(to_x) - float(from_x)) * ratio
+            sample_y = float(from_y) + (float(to_y) - float(from_y)) * ratio
+            if not self.is_directionally_passable_segment(previous_x, previous_y, sample_x, sample_y, collision_radius=collision_radius, sample_stride=sample_stride):
+                return {
+                    'reason': 'conditional_direction',
+                    'point': (float(sample_x), float(sample_y)),
+                    'previous_point': (float(previous_x), float(previous_y)),
+                    'distance': trace_distance * (step_index / sample_count),
+                }
+            if not self.is_position_valid_for_radius(sample_x, sample_y, collision_radius=collision_radius):
+                return {
+                    'reason': 'blocked',
+                    'point': (float(sample_x), float(sample_y)),
+                    'previous_point': (float(previous_x), float(previous_y)),
+                    'distance': trace_distance * (step_index / sample_count),
+                }
+            sample = self.sample_raster_layers(sample_x, sample_y)
+            if sample['move_blocked']:
+                return {
+                    'reason': 'blocked',
+                    'point': (float(sample_x), float(sample_y)),
+                    'previous_point': (float(previous_x), float(previous_y)),
+                    'distance': trace_distance * (step_index / sample_count),
+                }
+            height_delta = abs(float(sample['height_m']) - previous_height)
+            if height_delta > float(max_height_delta_m) + 1e-6:
+                if not self._segment_touches_step_surface(previous_x, previous_y, sample_x, sample_y):
+                    return {
+                        'reason': 'height_delta',
+                        'point': (float(sample_x), float(sample_y)),
+                        'previous_point': (float(previous_x), float(previous_y)),
+                        'distance': trace_distance * (step_index / sample_count),
+                    }
+            previous_height = float(sample['height_m'])
+            previous_x = sample_x
+            previous_y = sample_y
+        return None
+
+    def estimate_obstacle_extension_direction(self, obstacle_point, approach_point=None, sample_radius=None, sample_step=None):
+        self._ensure_raster_layers()
+        if obstacle_point is None:
+            return None
+
+        center_x = float(obstacle_point[0])
+        center_y = float(obstacle_point[1])
+        radius = max(float(sample_radius or 0.0), float(self.terrain_grid_cell_size) * 2.5, 20.0)
+        step = max(1, int(round(sample_step or max(2.0, float(self.terrain_grid_cell_size) * 0.5))))
+        blocked_points = []
+        min_x = max(0, int(math.floor(center_x - radius)))
+        max_x = min(self.map_width - 1, int(math.ceil(center_x + radius)))
+        min_y = max(0, int(math.floor(center_y - radius)))
+        max_y = min(self.map_height - 1, int(math.ceil(center_y + radius)))
+        for sample_y in range(min_y, max_y + 1, step):
+            for sample_x in range(min_x, max_x + 1, step):
+                if math.hypot(sample_x - center_x, sample_y - center_y) > radius + step * 0.5:
+                    continue
+                if self.sample_raster_layers(sample_x, sample_y)['move_blocked']:
+                    blocked_points.append((float(sample_x), float(sample_y)))
+
+        tangent = None
+        if len(blocked_points) >= 2:
+            samples = np.array(blocked_points, dtype=np.float32)
+            centered = samples - np.mean(samples, axis=0, keepdims=True)
+            covariance = centered.T @ centered
+            eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+            principal = eigenvectors[:, int(np.argmax(eigenvalues))]
+            norm = float(np.linalg.norm(principal))
+            if norm > 1e-6:
+                tangent = (float(principal[0] / norm), float(principal[1] / norm))
+
+        if tangent is None and approach_point is not None:
+            approach_dx = float(obstacle_point[0]) - float(approach_point[0])
+            approach_dy = float(obstacle_point[1]) - float(approach_point[1])
+            approach_length = math.hypot(approach_dx, approach_dy)
+            if approach_length > 1e-6:
+                tangent = (-approach_dy / approach_length, approach_dx / approach_length)
+
+        if tangent is None:
+            return None
+
+        normal = (-float(tangent[1]), float(tangent[0]))
+        if approach_point is not None:
+            outward = (float(approach_point[0]) - center_x, float(approach_point[1]) - center_y)
+            if normal[0] * outward[0] + normal[1] * outward[1] < 0.0:
+                normal = (-normal[0], -normal[1])
+        return {
+            'tangent': tangent,
+            'normal': normal,
+        }
     
     def is_position_valid(self, x, y):
         """检查位置是否有效（不在障碍物上）"""
@@ -2210,15 +3724,33 @@ class MapManager:
         self._ensure_raster_layers()
         if not (0 <= int(x) < self.map_width and 0 <= int(y) < self.map_height):
             return False
+        blocked_code = self.function_pass_mode_by_code['blocked']
         clearance_radius = max(0.0, float(collision_radius))
-        for probe_x, probe_y in self._nav_cell_probe_points((int(x), int(y)), clearance_radius):
-            sample = self.sample_raster_layers(probe_x, probe_y)
-            if sample['move_blocked']:
-                return False
-        return True
+        center_x, center_y = self._world_to_runtime_cell(x, y)
+        radius_cells_x = max(0, int(math.ceil(clearance_radius / max(self.runtime_cell_width_world, 1e-6))))
+        radius_cells_y = max(0, int(math.ceil(clearance_radius / max(self.runtime_cell_height_world, 1e-6))))
+        min_x = max(0, center_x - radius_cells_x)
+        max_x = min(self.runtime_grid_width - 1, center_x + radius_cells_x)
+        min_y = max(0, center_y - radius_cells_y)
+        max_y = min(self.runtime_grid_height - 1, center_y + radius_cells_y)
+        block_view = self.movement_block_map[min_y:max_y + 1, min_x:max_x + 1] | (
+            self.function_pass_map[min_y:max_y + 1, min_x:max_x + 1] == blocked_code
+        )
+        if not block_view.any():
+            return True
+        if clearance_radius <= 1e-6:
+            return not bool(block_view[center_y - min_y, center_x - min_x])
+
+        cell_xs, cell_ys = self._runtime_world_coordinate_axes(min_x, max_x, min_y, max_y)
+        x_grid, y_grid = np.meshgrid(cell_xs, cell_ys)
+        distance_limit = clearance_radius + max(self.runtime_cell_width_world, self.runtime_cell_height_world) * 0.55
+        within_radius = np.hypot(x_grid - float(x), y_grid - float(y)) <= distance_limit
+        return not bool(np.any(block_view & within_radius))
 
     def is_segment_valid_for_radius(self, from_x, from_y, to_x, to_y, collision_radius=0.0, sample_stride=None):
         self._ensure_raster_layers()
+        if not self.is_directionally_passable_segment(from_x, from_y, to_x, to_y, collision_radius=collision_radius, sample_stride=sample_stride):
+            return False
         distance = math.hypot(float(to_x) - float(from_x), float(to_y) - float(from_y))
         stride = max(1.0, float(sample_stride or self.terrain_grid_cell_size * 0.35))
         sample_count = max(1, int(math.ceil(distance / stride)))

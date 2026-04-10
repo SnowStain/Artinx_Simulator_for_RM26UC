@@ -14,20 +14,20 @@
 py -3.13 -m venv .venv
 ```
 
-2. 安装依赖
+1. 安装依赖
 
 ```powershell
 .venv\Scripts\python.exe -m pip install -U pip
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-3. 启动主模拟器
+1. 启动主模拟器
 
 ```powershell
 .venv\Scripts\python.exe simulator.py
 ```
 
-4. 启动独立地形/预设编辑器
+1. 启动独立地形/预设编辑器
 
 ```powershell
 .venv\Scripts\python.exe terrain_editor.py
@@ -38,10 +38,46 @@ py -3.13 -m venv .venv
 - start.bat
 - start_terrain_editor.bat
 
+### Windows 迁移到 3.12 / 3.13
+
+如果你当前机器已经装了多个 Python 版本，务必避免直接使用裸 `pip`，因为它很可能指向错误的解释器。
+
+推荐直接运行仓库内脚本：
+
+```powershell
+setup_windows_env.bat 3.13
+```
+
+如果本机只有 3.12，可改为：
+
+```powershell
+setup_windows_env.bat 3.12
+```
+
+如果 `py` 启动器找不到解释器，也可以直接传入绝对路径：
+
+```powershell
+setup_windows_env.bat C:\Users\kylin\AppData\Local\Programs\Python\Python312\python.exe
+```
+
+脚本会自动：
+
+- 删除旧 `.venv`
+- 用指定的 3.12/3.13 解释器重建 `.venv`
+- 用 `.venv\Scripts\python.exe -m pip` 安装全部依赖
+
+安装完成后，统一使用下面这些命令启动，不要再用系统全局 `python` 或 `pip`：
+
+```powershell
+.venv\Scripts\python.exe simulator.py
+.venv\Scripts\python.exe terrain_editor.py
+```
+
 ### 依赖说明
 
 - 项目使用 pygame-ce。
 - requirements.txt 中包含 moderngl 和 glcontext；如果你的 Python 版本没有对应 wheel，优先改用 Python 3.12 或 3.13，或者安装 MSVC Build Tools。
+- 如果你看到“当前解释器未安装 pygame 或 pygame-ce”，通常不是没装，而是装到了另一个 Python 版本里。请始终使用 `当前解释器 -m pip` 安装依赖。
 - 如果 PowerShell 拒绝执行 Activate.ps1，可以直接用 .venv\Scripts\python.exe 运行，无需激活环境。
 
 ## 当前覆盖的核心功能
@@ -57,6 +93,9 @@ py -3.13 -m venv .venv
 ### 2. 地图、设施与地形
 
 - 地图采用俯视图世界坐标，支持设施区域和地形栅格。
+- 地图运行时底层已细化为 `0.05m` 精度栅格，并拆分为独立二维通道连续存储。
+- 当前运行时通道至少包括：`height_map`、`terrain_type_map`、`movement_block_map`、`vision_block_map`、`vision_block_height_map`、`function_pass_map`、`function_heading_map`、`priority_map`。
+- 全地图运行时通道通过 NumPy `.npy` 二进制文件保存和加载，当前默认地图预设为 `basicMap`。
 - 设施可包含基地、前哨站、补给区、能量机关、采矿区、兑矿区、飞坡、台阶、狗洞、边界等。
 - MapManager 支持设施查询、区域命中、路径评估、最近可通点吸附和地图预设加载。
 - 台阶翻越已结合高度变化与边缘检测，不再只依赖手工设施标记。
@@ -68,7 +107,17 @@ py -3.13 -m venv .venv
 - enable_entity_movement=true 时，机器人和哨兵都会真实移动。
 - 运动会考虑碰撞半径、墙体/边界阻挡、地形通行、台阶过渡与非法回退点修复。
 - AI 导航会在可直达时直接走直线，不能直达时再进行路径搜索。
+- 路径搜索默认直接基于 `movement_block_map` 可通行矩阵执行运行时 A*，邻域访问走 NumPy 通道采样。
+- `find_path()` 会先尝试直达段短路，失败后再落到 0.05m runtime 栅格 A*，并复用路径缓存降低重复搜索开销。
 - 所有兵种都会显示程序设定的轨迹：地图上可看到导航线、预览路径、当前小目标点和最终目标。
+
+### 5. 视场角遮挡与视野检测
+
+- 视野检测从观测点出发，按给定朝向、视场角和最大距离生成可视扇区。
+- 底层实现使用 Bresenham 射线算法逐射线遍历 runtime 栅格，并用 `vision_block_map` 判断障碍遮挡。
+- `compute_fov_visibility()` 会返回被障碍裁切后的可视多边形，必要时也可返回整张 `visible_mask` 布尔矩阵。
+- `is_vision_line_clear()` 提供单条视线检测接口，供规则判定和渲染共用同一套遮挡逻辑。
+- 当前渲染层显示的 FOV 区域已经直接复用这套 runtime 视野计算结果，而不是固定半径假扇形。
 
 ### 4. 分段路径与小目标点
 
@@ -324,7 +373,7 @@ N 边图说明：
 
 - settings.json 的本地覆盖优先级高于 config.json；如果运行结果和代码默认值不一致，先检查 settings.json。
 - 当前项目里很多 AI/规则调参结果都以 settings.json 为准。
-- 当前 blank_map 是活动地图预设时，编辑器和主程序都会以它为起点装配场地。
+- 当前 basicMap 是活动地图预设时，编辑器和主程序都会以它为起点装配场地。
 
 ## 项目结构速览
 

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "name": "blankCanvas",
+  "saved_at": "2026-04-10T20:00:00",
+  "map": {
+    "image_path": "../basicMap/场地-俯视图.png",
+    "origin_x": 0,
+    "origin_y": 0,
+    "unit": "px",
+    "width": 2800,
+    "height": 1500,
+    "source_width": 1576,
+    "source_height": 873,
+    "strict_scale": true,
+    "field_length_m": 28.0,
+    "field_width_m": 15.0,
+    "facilities": [],
+    "terrain_grid": {
+      "cell_size": 1,
+      "cells": []
+    },
+    "function_grid": {
+      "cell_size": 1,
+      "cells": []
+    },
+    "runtime_grid": {
+      "resolution_m": 0.01,
+      "shape": [],
+      "channels": {}
+    }
+  }
+}

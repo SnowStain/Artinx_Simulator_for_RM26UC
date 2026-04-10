@@ -1,27 +1,31 @@
 {
   "simulator": {
-    "window_width": 1200,
-    "window_height": 800,
+    "window_width": 1560,
+    "window_height": 920,
     "fps": 50,
     "scale": 1.0,
+    "gpu_preferred": true,
     "debug": true,
     "show_facilities": true,
     "show_aim_fov": true,
     "enable_entity_movement": true
   },
   "map": {
-    "preset": "blank_map",
+    "preset": "basicMap",
     "image_path": "场地-俯视图.png",
     "origin_x": 0,
     "origin_y": 0,
     "unit": "px",
-    "width": 1576,
-    "height": 873,
+    "width": 2800,
+    "height": 1500,
+    "source_width": 1576,
+    "source_height": 873,
+    "strict_scale": true,
     "field_length_m": 28.0,
     "field_width_m": 15.0,
     "facilities": [],
     "terrain_grid": {
-      "cell_size": 8,
+      "cell_size": 1,
       "cells": []
     }
   },
@@ -88,12 +92,15 @@
     "update_interval_sec": 0.16,
     "path_replan_interval_sec": 0.9,
     "path_stale_recheck_interval_sec": 0.9,
-    "controller_worker_threads": 1,
+    "controller_worker_threads": 4,
+    "controller_shards_per_frame": 2,
+    "auto_aim_worker_threads": 2,
     "path_replans_per_update": 1,
     "pathfinder_time_budget_ms": 1.8,
     "pathfinder_total_budget_ms": 5.0,
     "pathfinder_max_iterations": 320,
     "pathfinder_max_attempts": 3,
+    "pathfinder_max_candidates": 1,
     "strategy": {
       "infantry": {
         "behavior": "patrol",

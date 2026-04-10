@@ -8,15 +8,19 @@ import os
 import random
 import time
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 
 from control.behavior_tree import Action, BehaviorContext, Condition, Selector, Sequence, SUCCESS, FAILURE
 from control.decision_plugins import load_decision_plugins
+from control.frame_context import AIFrameContext
+from control.navigation_planner import NavigationPlannerRuntime
+from control.pathfinding_worker_router import EntityPathfinderRouter
+from control.targeting_runtime import TargetingRuntime
 
 
 class AIController:
     EMPTY_PATH_PREVIEW = ()
+    TODO_DECISION_ID = 'todo_rebuild_decision_system'
     MAX_STRATEGY_STAGES = 4
     DEFAULT_ENGAGE_DISTANCE_M = 8.0
     COMMON_ROLE_KEY = 'common'
@@ -95,6 +99,12 @@ class AIController:
             'default_destination_types': ('fly_slope',),
         },
     )
+    TODO_ROLE_LABELS = {
+        'sentry': '哨兵决策 TODO',
+        'infantry': '步兵决策 TODO',
+        'hero': '英雄决策 TODO',
+        'engineer': '工程决策 TODO',
+    }
 
     def __init__(self, config):
         self.config = config
@@ -138,13 +148,17 @@ class AIController:
         self._last_behavior_reload_check_time = -1.0
         self.role_decision_specs = {}
         self.role_trees = {}
-        self._path_executor = ThreadPoolExecutor(max_workers=self._pathfinder_worker_threads)
+        self._pathfinder_router = EntityPathfinderRouter()
+        self._navigation_planner = NavigationPlannerRuntime(self, self._pathfinder_router)
+        self._targeting_runtime = TargetingRuntime(self)
+        self._frame_target_assessment_cache = {}
         self._refresh_behavior_runtime_overrides(force=True)
 
     def shutdown(self):
-        if self._path_executor is not None:
-            self._path_executor.shutdown(wait=False)
-            self._path_executor = None
+        router = getattr(self, '_pathfinder_router', None)
+        if router is not None:
+            router.shutdown()
+            self._pathfinder_router = None
 
     def __del__(self):
         self.shutdown()
@@ -155,6 +169,29 @@ class AIController:
             return 0.0
         phase = abs(hash(str(entity_id))) % 4096
         return (phase / 4096.0) * self._ai_update_interval
+
+    def _debug_feature_toggles(self):
+        simulator_config = self.config.get('simulator', {}) if isinstance(self.config, dict) else {}
+        toggles = simulator_config.get('debug_feature_toggles', {})
+        return toggles if isinstance(toggles, dict) else {}
+
+    def _debug_toggle_enabled(self, feature_id, default=True):
+        toggles = self._debug_feature_toggles()
+        if feature_id not in toggles:
+            return bool(default)
+        return bool(toggles.get(feature_id))
+
+    def _role_debug_key(self, entity):
+        role_key = self._role_key(entity)
+        if role_key not in {'hero', 'infantry', 'sentry', 'engineer'}:
+            return 'infantry'
+        return role_key
+
+    def _role_state_machine_enabled(self, entity):
+        return self._debug_toggle_enabled(f'state_machine.{self._role_debug_key(entity)}', True)
+
+    def _role_controller_feature_enabled(self, entity, feature_name):
+        return self._debug_toggle_enabled(f'controller.{self._role_debug_key(entity)}.{feature_name}', True)
 
     def _can_replan_path(self):
         if self._path_replans_remaining <= 0:
@@ -240,6 +277,8 @@ class AIController:
         }
 
     def _available_plugin_bindings_for_role(self, role_key):
+        if self._decision_system_disabled():
+            return []
         if role_key == self.COMMON_ROLE_KEY:
             return [dict(binding) for binding in self._common_terrain_policy_bindings()]
         bindings = []
@@ -636,6 +675,16 @@ class AIController:
         return dict(stages[0]) if stages else {}
 
     def get_available_decision_plugins(self, role_key):
+        if self._decision_system_disabled():
+            if role_key == self.COMMON_ROLE_KEY:
+                return []
+            return [{
+                'id': self.TODO_DECISION_ID,
+                'label': self.TODO_ROLE_LABELS.get(role_key, '决策系统 TODO'),
+                'description': '当前旧决策系统已移除，后续将在此接口上重建设计。',
+                'fallback': True,
+                'order': 0,
+            }]
         return [dict(binding) for binding in self._available_plugin_bindings_for_role(role_key)]
 
     def _canonical_decision_id(self, decision_id):
@@ -782,9 +831,30 @@ class AIController:
         self._behavior_override_path = override_path
         self._behavior_override_mtime = override_mtime
         self._behavior_override_payload = self._load_behavior_override_payload()
-        self.role_decision_specs = self._build_role_decision_specs()
-        self.role_trees = self._build_role_trees()
+        self.role_decision_specs = self._build_todo_role_decision_specs()
+        self.role_trees = {}
         return True
+
+    def _decision_system_disabled(self):
+        return True
+
+    def _todo_decision_action(self, context):
+        return self._idle_navigation_decision(context, 'TODO: 决策系统待重构，当前仅保留占位接口')
+
+    def _build_todo_role_decision_specs(self):
+        specs = {}
+        for role_key in ('sentry', 'infantry', 'hero', 'engineer'):
+            specs[role_key] = [
+                self._decision_spec(
+                    self.TODO_DECISION_ID,
+                    self.TODO_ROLE_LABELS.get(role_key, '决策系统 TODO'),
+                    None,
+                    self._todo_decision_action,
+                    fallback=True,
+                    description='当前旧决策系统已移除，后续将在此接口上重建设计。',
+                )
+            ]
+        return specs
 
     def _behavior_condition_registry(self):
         return {
@@ -2311,6 +2381,31 @@ class AIController:
         entity.ai_decision_weights = ranked
         entity.ai_decision_top3 = ranked[:3]
 
+    def _decision_spec_by_id(self, role_key, decision_id):
+        for spec in self.role_decision_specs.get(role_key, ()):
+            if spec.get('id') == decision_id:
+                return spec
+        return None
+
+    def _execute_forced_test_decision(self, context, decision_id):
+        if not decision_id:
+            return None, ''
+        spec = self._decision_spec_by_id(context.data.get('role_key'), decision_id)
+        if spec is None:
+            return None, ''
+        action = spec.get('action')
+        if action is None:
+            return None, ''
+        try:
+            decision = action(context)
+        except Exception:
+            return None, ''
+        if decision is None:
+            return None, ''
+        resolved = dict(decision)
+        resolved.setdefault('summary', f'测试模式强制执行 {spec.get("label", decision_id)}')
+        return resolved, f'_action_{spec.get("id", decision_id)}'
+
     def get_decision_destination_preview_regions(self, role_key, decision_id, map_manager, team=None):
         if map_manager is None:
             return []
@@ -2704,142 +2799,43 @@ class AIController:
         entity.ai_navigation_path_valid = bool(path_valid)
 
     def _build_navigation_search_request(self, entity, target_point, map_manager, step_limit, traversal_profile):
-        budget_scale = self._pathfinder_distance_scale(entity, target_point, map_manager)
-        total_budget_sec = self._pathfinder_total_budget_sec * budget_scale
-        base_steps = [max(map_manager.terrain_grid_cell_size * 4, 18)]
-        if self._pathfinder_use_dual_resolution:
-            base_steps.append(max(map_manager.terrain_grid_cell_size * 2, 12))
-        candidate_points = self._target_region_candidate_points(entity, target_point, map_manager)
-        if self._pathfinder_try_resolved_target:
-            resolved_target = map_manager.find_nearest_passable_point(
-                target_point,
-                collision_radius=float(traversal_profile.get('collision_radius', 0.0)),
-                search_radius=max(72, map_manager.terrain_grid_cell_size * 10),
-                step=max(4, map_manager.terrain_grid_cell_size),
-            )
-            if resolved_target is not None and resolved_target != target_point:
-                candidate_points.append(resolved_target)
-        search_plans = [
-            {
-                'steps': tuple(base_steps),
-                'max_iterations': max(self._pathfinder_max_iterations, int(self._pathfinder_max_iterations * budget_scale)),
-                'max_runtime_sec': self._pathfinder_time_budget_sec * budget_scale,
-            },
-            {
-                'steps': tuple(sorted({max(map_manager.terrain_grid_cell_size, 8), max(map_manager.terrain_grid_cell_size * 2, 12), *base_steps})),
-                'max_iterations': max(1200, int(self._pathfinder_max_iterations * 2 * budget_scale)),
-                'max_runtime_sec': max(0.006, self._pathfinder_time_budget_sec * 1.6 * budget_scale),
-            },
-        ]
-        resolved_candidates = []
-        seen_candidates = set()
-        for candidate in candidate_points:
-            resolved_candidate = self._resolve_navigation_target(candidate, map_manager, entity=entity)
-            if resolved_candidate is None:
-                continue
-            key = (round(float(resolved_candidate[0]), 2), round(float(resolved_candidate[1]), 2))
-            if key in seen_candidates:
-                continue
-            seen_candidates.add(key)
-            resolved_candidates.append((float(resolved_candidate[0]), float(resolved_candidate[1])))
-        resolved_candidates.sort(key=lambda point: math.hypot(point[0] - float(entity.position['x']), point[1] - float(entity.position['y'])))
-        max_candidates = max(2, int(self._ai_config.get('pathfinder_max_candidates', 4)))
-        return {
-            'start_point': (float(entity.position['x']), float(entity.position['y'])),
-            'target_point': (float(target_point[0]), float(target_point[1])),
-            'step_limit': float(step_limit),
-            'traversal_profile': dict(traversal_profile or {}),
-            'search_plans': tuple(search_plans),
-            'resolved_candidates': tuple(resolved_candidates[:max_candidates]),
-            'total_budget_sec': float(total_budget_sec),
-        }
+        return self._navigation_planner.build_search_request(entity, target_point, map_manager, step_limit, traversal_profile)
 
     def _run_navigation_search_request(self, map_manager, request):
-        resolved_candidates = tuple(request.get('resolved_candidates', ()))
-        if not resolved_candidates:
-            return self.EMPTY_PATH_PREVIEW
-        start_time = time.perf_counter()
-        total_budget_sec = float(request.get('total_budget_sec', 0.0))
-        deadline = start_time + total_budget_sec if total_budget_sec > 0.0 else None
-        attempts = 0
-        for search_plan in tuple(request.get('search_plans', ())):
-            if deadline is not None and time.perf_counter() >= deadline:
-                break
-            for candidate in resolved_candidates:
-                for grid_step in tuple(search_plan.get('steps', ())):
-                    if attempts >= self._pathfinder_max_attempts:
-                        return self.EMPTY_PATH_PREVIEW
-                    if deadline is not None:
-                        remaining_budget = deadline - time.perf_counter()
-                        if remaining_budget <= 0.0:
-                            return self.EMPTY_PATH_PREVIEW
-                        runtime_limit = min(float(search_plan.get('max_runtime_sec', 0.0)), remaining_budget)
-                    else:
-                        runtime_limit = float(search_plan.get('max_runtime_sec', 0.0))
-                    if runtime_limit <= 0.0002:
-                        return self.EMPTY_PATH_PREVIEW
-                    attempts += 1
-                    path = map_manager.find_path(
-                        request['start_point'],
-                        candidate,
-                        max_height_delta_m=float(request.get('step_limit', 0.05)),
-                        grid_step=grid_step,
-                        traversal_profile=request.get('traversal_profile', {}),
-                        max_iterations=search_plan.get('max_iterations'),
-                        max_runtime_sec=runtime_limit,
-                    )
-                    if path:
-                        return tuple((float(point[0]), float(point[1])) for point in path)
-        return self.EMPTY_PATH_PREVIEW
+        return self._navigation_planner.run_search_request(map_manager, request)
 
     def _finalize_navigation_search_path(self, entity, raw_path, target_point, map_manager):
-        raw_path = tuple(raw_path or self.EMPTY_PATH_PREVIEW)
-        if not raw_path:
-            return self.EMPTY_PATH_PREVIEW
-        if not self._is_path_traversable(entity, raw_path, map_manager):
-            return self.EMPTY_PATH_PREVIEW
-        expanded_path = self._expand_path_with_step_transitions(entity, raw_path, map_manager)
-        return tuple(self._segment_path_points(expanded_path, map_manager, entity=entity))
+        return self._navigation_planner.finalize_search_path(entity, raw_path, target_point, map_manager)
 
     def _consume_pending_navigation_search(self, entity, target_point, map_manager, state, request_signature):
-        future = state.get('pending_path_future') if isinstance(state, dict) else None
-        if future is None or state.get('pending_request_signature') != request_signature:
-            return None, False
-        if not future.done():
-            return None, True
-        state.pop('pending_path_future', None)
-        state.pop('pending_request_signature', None)
-        state.pop('pending_target_point', None)
-        try:
-            raw_path = tuple(future.result() or self.EMPTY_PATH_PREVIEW)
-        except Exception:
-            raw_path = self.EMPTY_PATH_PREVIEW
-        return self._finalize_navigation_search_path(entity, raw_path, target_point, map_manager), False
+        return self._navigation_planner.consume_pending_search(entity, target_point, map_manager, state, request_signature)
 
     def _submit_navigation_search(self, entity, target_point, map_manager, step_limit, traversal_profile, state, request_signature):
-        if self._path_executor is None:
-            return False
-        request = self._build_navigation_search_request(entity, target_point, map_manager, step_limit, traversal_profile)
-        state['pending_path_future'] = self._path_executor.submit(self._run_navigation_search_request, map_manager, request)
-        state['pending_request_signature'] = request_signature
-        state['pending_target_point'] = (float(target_point[0]), float(target_point[1]))
-        return True
+        return self._navigation_planner.submit_search(entity, target_point, map_manager, step_limit, traversal_profile, state, request_signature)
 
     def _clear_navigation_overlay_state(self, entity):
         self._set_navigation_overlay_state(entity, waypoint=None, preview=self.EMPTY_PATH_PREVIEW, path_valid=False, region_radius=0.0, traversal_state='idle')
 
-    def update(self, entities, map_manager=None, rules_engine=None, game_time=0.0, game_duration=0.0, controlled_entity_ids=None):
+    def update(self, entities, map_manager=None, rules_engine=None, game_time=0.0, game_duration=0.0, controlled_entity_ids=None, controlled_entities=None, shared_frame=None):
         if self._last_behavior_reload_check_time < 0.0 or game_time - self._last_behavior_reload_check_time >= self._behavior_reload_check_interval:
             self._last_behavior_reload_check_time = game_time
             self._refresh_behavior_runtime_overrides()
         controlled_ids = None if controlled_entity_ids is None else set(controlled_entity_ids)
+        if controlled_entities is not None and controlled_ids is None:
+            controlled_ids = {entity.id for entity in controlled_entities}
+        update_entities = tuple(controlled_entities) if controlled_entities is not None else tuple(entities)
+        frame_view = shared_frame if isinstance(shared_frame, AIFrameContext) else None
         self._cleanup_runtime_state(entities, controlled_ids)
         self._movement_status_cache.clear()
+        self._frame_target_assessment_cache.clear()
         self._path_replans_remaining = self._path_replans_per_update
-        for entity in entities:
+        for entity in update_entities:
             if controlled_ids is not None and entity.id not in controlled_ids:
                 continue
             if not self._should_control_entity(entity):
+                continue
+            if not self._role_state_machine_enabled(entity):
+                self._maintain_continuous_motion(entity)
                 continue
             last_update = self._last_ai_update_time.get(entity.id)
             if last_update is None:
@@ -2849,11 +2845,26 @@ class AIController:
                 self._maintain_continuous_motion(entity)
                 continue
             self._last_ai_update_time[entity.id] = game_time
-            context = self._build_context(entity, entities, map_manager, rules_engine, game_time, game_duration)
+            context = self._build_context(entity, entities, map_manager, rules_engine, game_time, game_duration, shared_frame=frame_view)
+            if self._decision_system_disabled():
+                decision = self._todo_decision_action(context)
+                bt_node = f'_action_{self.TODO_DECISION_ID}'
+                decision['bt_node'] = bt_node
+                self._store_decision_diagnostics(entity, context, bt_node)
+                self._apply_decision(entity, decision, rules_engine)
+                continue
             tree = self.role_trees.get(context.data['role_key'])
             if tree is None:
                 self._apply_idle_decision(entity, '未定义角色行为树')
                 continue
+            forced_test_decision_id = str(getattr(entity, 'test_forced_decision_id', '') or '').strip()
+            if forced_test_decision_id:
+                forced_decision, forced_bt_node = self._execute_forced_test_decision(context, forced_test_decision_id)
+                if forced_decision is not None:
+                    forced_decision['bt_node'] = forced_bt_node
+                    self._store_decision_diagnostics(entity, context, forced_bt_node)
+                    self._apply_decision(entity, forced_decision, rules_engine)
+                    continue
             result = tree.tick(context)
             decision = context.data.get('decision')
             if result == FAILURE or decision is None:
@@ -2862,6 +2873,12 @@ class AIController:
             decision['bt_node'] = bt_node
             self._store_decision_diagnostics(entity, context, bt_node)
             self._apply_decision(entity, decision, rules_engine)
+
+    def maintain_entities_motion(self, entities):
+        for entity in tuple(entities or ()):
+            if not self._should_control_entity(entity):
+                continue
+            self._maintain_continuous_motion(entity)
 
     def _cleanup_runtime_state(self, entities, controlled_ids=None):
         active_ids = {
@@ -2884,6 +2901,9 @@ class AIController:
             stale_ids = [entity_id for entity_id in runtime_map.keys() if entity_id not in active_ids]
             for entity_id in stale_ids:
                 runtime_map.pop(entity_id, None)
+        router = getattr(self, '_pathfinder_router', None)
+        if router is not None:
+            router.prune(active_ids)
 
     def _should_control_entity(self, entity):
         if not entity.is_alive():
@@ -2892,26 +2912,43 @@ class AIController:
             return False
         return True
 
-    def _build_context(self, entity, entities, map_manager, rules_engine, game_time, game_duration):
+    def _build_context(self, entity, entities, map_manager, rules_engine, game_time, game_duration, shared_frame=None):
         role_key = self._role_key(entity)
         strategy = self.ai_strategy.get(role_key, self.ai_strategy.get('infantry', {}))
         opening_phase = game_time <= min(45.0, max(30.0, game_duration * 0.12 if game_duration > 0 else 45.0))
-        enemies = [other for other in entities if other.team != entity.team and other.is_alive()]
-        allies = [other for other in entities if other.team == entity.team and other.id != entity.id and other.is_alive()]
+        frame_view = shared_frame if isinstance(shared_frame, AIFrameContext) else None
+        enemy_team = 'blue' if entity.team == 'red' else 'red'
+        if frame_view is not None:
+            enemies = list(frame_view.enemies_for(entity.team))
+            allies = list(frame_view.allies_for(entity.team, exclude_id=entity.id))
+            own_outpost = frame_view.structure(entity.team, 'outpost')
+            own_base = frame_view.structure(entity.team, 'base')
+            enemy_outpost = frame_view.structure(enemy_team, 'outpost')
+            enemy_base = frame_view.structure(enemy_team, 'base')
+            allied_sentry = frame_view.first_role(entity.team, 'sentry')
+            allied_hero = frame_view.first_role(entity.team, 'hero')
+            allied_infantry = frame_view.first_role(entity.team, 'infantry', exclude_id=entity.id)
+            allied_engineer = frame_view.first_role(entity.team, 'engineer')
+            enemy_hero = frame_view.first_role(enemy_team, 'hero')
+            enemy_engineer = frame_view.first_role(enemy_team, 'engineer')
+            team_health_current, team_health_max, team_health_ratio = frame_view.health_snapshot(entity.team)
+        else:
+            enemies = [other for other in entities if other.team != entity.team and other.is_alive()]
+            allies = [other for other in entities if other.team == entity.team and other.id != entity.id and other.is_alive()]
+            own_outpost = self._find_entity(entities, entity.team, 'outpost')
+            own_base = self._find_entity(entities, entity.team, 'base')
+            enemy_outpost = self._find_entity(entities, enemy_team, 'outpost')
+            enemy_base = self._find_entity(entities, enemy_team, 'base')
+            allied_sentry = self._find_entity(entities, entity.team, 'sentry')
+            allied_hero = self._find_entity_by_role(entities, entity.team, 'hero')
+            allied_infantry = self._find_entity_by_role(entities, entity.team, 'infantry', exclude_id=entity.id)
+            allied_engineer = self._find_entity_by_role(entities, entity.team, 'engineer')
+            enemy_hero = self._find_entity_by_role(entities, enemy_team, 'hero')
+            enemy_engineer = self._find_entity_by_role(entities, enemy_team, 'engineer')
+            team_health_current, team_health_max, team_health_ratio = self._team_health_snapshot(entities, entity.team)
         target = self.select_priority_target(entity, enemies, strategy, rules_engine)
         nearby_allies = [other for other in allies if self._distance(entity, other) <= self._meters_to_world_units(5.0, map_manager)]
         nearby_enemies = [other for other in enemies if self._distance(entity, other) <= self._meters_to_world_units(6.0, map_manager)]
-        own_outpost = self._find_entity(entities, entity.team, 'outpost')
-        own_base = self._find_entity(entities, entity.team, 'base')
-        enemy_team = 'blue' if entity.team == 'red' else 'red'
-        enemy_outpost = self._find_entity(entities, enemy_team, 'outpost')
-        enemy_base = self._find_entity(entities, enemy_team, 'base')
-        allied_sentry = self._find_entity(entities, entity.team, 'sentry')
-        allied_hero = self._find_entity_by_role(entities, entity.team, 'hero')
-        allied_infantry = self._find_entity_by_role(entities, entity.team, 'infantry', exclude_id=entity.id)
-        allied_engineer = self._find_entity_by_role(entities, entity.team, 'engineer')
-        enemy_hero = self._find_entity_by_role(entities, enemy_team, 'hero')
-        enemy_engineer = self._find_entity_by_role(entities, enemy_team, 'engineer')
         energy_anchor = self.get_energy_anchor(entity.team, map_manager)
         energy_snapshot = rules_engine.get_energy_mechanism_snapshot(entity.team) if rules_engine is not None and hasattr(rules_engine, 'get_energy_mechanism_snapshot') else {'can_activate': False, 'state': 'inactive'}
         mining_anchor = self.get_mining_anchor(entity, map_manager)
@@ -2919,10 +2956,12 @@ class AIController:
         map_center = self.get_map_center(map_manager)
         health_ratio = 0.0 if entity.max_health <= 0 else entity.health / entity.max_health
         heat_ratio = 0.0 if entity.max_heat <= 0 else entity.heat / entity.max_heat
-        team_health_current, team_health_max, team_health_ratio = self._team_health_snapshot(entities, entity.team)
         frontline_enemy_base_health = self._frontline_health_near_enemy_base(entities, entity.team, enemy_base, map_manager)
         frontline_pressure_override = team_health_max > 1e-6 and frontline_enemy_base_health >= team_health_max * 0.30
-        half_pressure = self._combat_half_pressure_counts(entities, entity.team, map_center[0] if map_center is not None else 0.0)
+        if frame_view is not None:
+            half_pressure = frame_view.pressure_snapshot(entity.team)
+        else:
+            half_pressure = self._combat_half_pressure_counts(entities, entity.team, map_center[0] if map_center is not None else 0.0)
         supply_health_threshold = self._supply_health_threshold_ratio(entity, map_manager)
         needs_heal_supply = health_ratio <= supply_health_threshold and not frontline_pressure_override
         low_ammo_threshold = int(strategy.get('low_ammo_threshold', 40 if entity.type == 'sentry' else 25))
@@ -3076,6 +3115,13 @@ class AIController:
         entity.ai_decision = decision.get('summary', '')
         entity.ai_behavior_node = decision.get('bt_node', '')
         entity.target = decision.get('target')
+        structure_lob_target_type = str(decision.get('structure_lob_target_type', '') or '').strip()
+        entity.hero_structure_lob_active = bool(structure_lob_target_type)
+        entity.hero_structure_lob_target_type = structure_lob_target_type or None
+        entity.hero_deployment_forced_off = bool(decision.get('disengage_deployment', False))
+        if entity.hero_deployment_forced_off:
+            entity.hero_deployment_active = False
+            entity.hero_deployment_state = 'inactive'
         entity.ai_navigation_target = decision.get('navigation_target')
         entity.ai_movement_target = decision.get('movement_target')
         entity.ai_navigation_radius = float(decision.get('navigation_radius', 0.0) or 0.0)
@@ -3492,6 +3538,8 @@ class AIController:
     def _should_push_base(self, context):
         if context.data.get('role_key') not in {'sentry', 'infantry', 'hero'}:
             return False
+        if context.data.get('role_key') == 'hero' and self._hero_prefers_ranged(context.entity):
+            return False
         enemy_base = context.data.get('enemy_base')
         if enemy_base is None or not enemy_base.is_alive():
             return False
@@ -3533,7 +3581,7 @@ class AIController:
         opening_ammo_target = int(context.data.get('strategy', {}).get('opening_ammo_target', 340))
         return gold >= ammo_cost > 0 and getattr(entity, 'ammo', 0) < opening_ammo_target
 
-    def _set_decision(self, context, summary, target=None, target_point=None, speed=None, posture=None, preferred_route=None, fire_control='idle', chassis_state='normal', turret_state='searching', angular_velocity=0.0, orbit=False, navigation_radius=None):
+    def _set_decision(self, context, summary, target=None, target_point=None, speed=None, posture=None, preferred_route=None, fire_control='idle', chassis_state='normal', turret_state='searching', angular_velocity=0.0, orbit=False, navigation_radius=None, structure_lob_target_type=None, disengage_deployment=False):
         entity = context.entity
         if target is not None and chassis_state == 'normal':
             chassis_state = 'spin'
@@ -3574,6 +3622,8 @@ class AIController:
             'turret_state': turret_state,
             'angular_velocity': angular_velocity,
             'posture': posture,
+            'structure_lob_target_type': structure_lob_target_type,
+            'disengage_deployment': bool(disengage_deployment),
         }
         return SUCCESS
 
@@ -4158,7 +4208,8 @@ class AIController:
             max_height_delta_m=resolved_step_limit,
         )
         if result.get('ok'):
-            requires_step = bool(isinstance(traversal, dict) and str(traversal.get('facility_type', '')) in {'first_step', 'second_step'})
+            traversal_type = str(traversal.get('facility_type', '')) if isinstance(traversal, dict) else ''
+            requires_step = bool(result.get('requires_step_alignment')) or traversal_type in {'first_step', 'second_step', 'terrain_step'}
             status = {
                 'passable': True,
                 'requires_step': requires_step,
@@ -4201,6 +4252,30 @@ class AIController:
         self._movement_status_cache[cache_key] = status
         return status
 
+    def _front_obstacle_probe_distance(self, map_manager):
+        if map_manager is None:
+            return 0.0
+        return max(float(getattr(map_manager, 'terrain_grid_cell_size', 8)) * 4.0, self._meters_to_world_units(1.5, map_manager))
+
+    def _front_obstacle_clear(self, entity, from_point, to_point, map_manager, step_limit=None):
+        if map_manager is None or from_point is None or to_point is None:
+            return False
+        distance = math.hypot(float(to_point[0]) - float(from_point[0]), float(to_point[1]) - float(from_point[1]))
+        if distance <= 1e-6:
+            return True
+        resolved_step_limit = float(step_limit if step_limit is not None else getattr(entity, 'max_terrain_step_height_m', 0.05))
+        trace_distance = min(distance, self._front_obstacle_probe_distance(map_manager))
+        obstacle = map_manager.trace_movement_obstacle(
+            float(from_point[0]),
+            float(from_point[1]),
+            float(to_point[0]),
+            float(to_point[1]),
+            max_height_delta_m=resolved_step_limit,
+            collision_radius=float(getattr(entity, 'collision_radius', 0.0)),
+            max_distance=trace_distance,
+        )
+        return obstacle is None
+
     def _probe_segment_detour(self, entity, from_point, to_point, map_manager, step_limit=None):
         if map_manager is None or from_point is None or to_point is None:
             return self.EMPTY_PATH_PREVIEW
@@ -4211,147 +4286,109 @@ class AIController:
         delta_x = end_x - start_x
         delta_y = end_y - start_y
         distance = math.hypot(delta_x, delta_y)
-        if distance <= max(20.0, float(getattr(entity, 'collision_radius', 0.0)) * 1.2):
+        collision_radius = float(getattr(entity, 'collision_radius', 0.0))
+        if distance <= max(20.0, collision_radius * 1.2):
+            return self.EMPTY_PATH_PREVIEW
+
+        resolved_step_limit = float(step_limit if step_limit is not None else getattr(entity, 'max_terrain_step_height_m', 0.05))
+        front_probe_distance = min(distance, self._front_obstacle_probe_distance(map_manager))
+        obstacle = map_manager.trace_movement_obstacle(
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+            max_height_delta_m=resolved_step_limit,
+            collision_radius=collision_radius,
+            max_distance=front_probe_distance,
+        )
+        if obstacle is None:
             return self.EMPTY_PATH_PREVIEW
 
         direction_x = delta_x / max(distance, 1e-6)
         direction_y = delta_y / max(distance, 1e-6)
-        normal_x = -direction_y
-        normal_y = direction_x
-        collision_radius = float(getattr(entity, 'collision_radius', 0.0))
-        base_offset = max(float(map_manager.terrain_grid_cell_size) * 1.4, collision_radius * 1.5, 18.0)
-        lateral_multipliers = (1.0, 1.45, 1.9, 2.35)
-        midpoint_ratios = (0.18, 0.30, 0.42, 0.58, 0.70, 0.82)
-        near_start_ratios = (0.08, 0.14, 0.22)
-        near_end_ratios = (0.78, 0.86, 0.92)
-        pair_ratios = ((0.12, 0.88), (0.18, 0.82), (0.24, 0.76), (0.34, 0.66))
-        search_radius = int(max(44.0, collision_radius * 4.0, float(map_manager.terrain_grid_cell_size) * 3.0))
+        extension = map_manager.estimate_obstacle_extension_direction(
+            obstacle.get('point'),
+            approach_point=obstacle.get('previous_point'),
+            sample_radius=max(float(map_manager.terrain_grid_cell_size) * 3.0, collision_radius * 2.5, 20.0),
+            sample_step=max(2, int(round(float(map_manager.terrain_grid_cell_size) * 0.5))),
+        )
+        outward_x = float(obstacle.get('previous_point', (start_x, start_y))[0]) - float(obstacle.get('point', (start_x, start_y))[0])
+        outward_y = float(obstacle.get('previous_point', (start_x, start_y))[1]) - float(obstacle.get('point', (start_x, start_y))[1])
+        outward_length = math.hypot(outward_x, outward_y)
+        if outward_length <= 1e-6:
+            outward_x = -direction_x
+            outward_y = -direction_y
+            outward_length = math.hypot(outward_x, outward_y)
+        outward_x /= max(outward_length, 1e-6)
+        outward_y /= max(outward_length, 1e-6)
+
+        if extension is not None:
+            tangent_x, tangent_y = extension.get('tangent', (0.0, 0.0))
+            normal_x, normal_y = extension.get('normal', (outward_x, outward_y))
+        else:
+            tangent_x, tangent_y = -direction_y, direction_x
+            normal_x, normal_y = outward_x, outward_y
+
+        tangent_length = math.hypot(tangent_x, tangent_y)
+        if tangent_length <= 1e-6:
+            return self.EMPTY_PATH_PREVIEW
+        tangent_x /= tangent_length
+        tangent_y /= tangent_length
+        normal_length = math.hypot(normal_x, normal_y)
+        if normal_length <= 1e-6:
+            normal_x, normal_y = outward_x, outward_y
+            normal_length = math.hypot(normal_x, normal_y)
+        normal_x /= max(normal_length, 1e-6)
+        normal_y /= max(normal_length, 1e-6)
+
+        slide_step = max(float(map_manager.terrain_grid_cell_size) * 1.25, collision_radius * 1.1, 10.0)
+        clearance = max(float(map_manager.terrain_grid_cell_size) * 0.9, collision_radius + 4.0, 8.0)
+        search_radius = int(max(slide_step * 2.5, clearance * 2.0, 20.0))
         search_step = max(4, int(map_manager.terrain_grid_cell_size))
-        seen_paths = set()
-        best_path = self.EMPTY_PATH_PREVIEW
-        best_score = None
+        max_slide_distance = max(self._meters_to_world_units(6.0, map_manager), front_probe_distance * 2.5)
+        max_slide_steps = max(4, int(math.ceil(max_slide_distance / max(slide_step, 1.0))))
+        best_partial_path = self.EMPTY_PATH_PREVIEW
+        best_partial_remaining = float('inf')
 
-        def resolve_probe(point_x, point_y):
-            resolved = map_manager.find_nearest_passable_point(
-                (point_x, point_y),
-                collision_radius=collision_radius,
-                search_radius=search_radius,
-                step=search_step,
-            )
-            if resolved is None:
-                return None
-            candidate = (float(resolved[0]), float(resolved[1]))
-            if math.hypot(candidate[0] - start_x, candidate[1] - start_y) <= max(8.0, collision_radius * 0.75):
-                return None
-            if math.hypot(candidate[0] - end_x, candidate[1] - end_y) <= max(8.0, collision_radius * 0.75):
-                return None
-            return candidate
-
-        def legs_passable(points):
-            previous = (start_x, start_y)
-            total_score = 0.0
-            for current in points:
-                status = self._basic_movement_segment_status(entity, previous, current, map_manager, step_limit=step_limit)
-                if not status['passable']:
-                    return None
-                total_score += math.hypot(float(current[0]) - float(previous[0]), float(current[1]) - float(previous[1]))
-                previous = current
-            final_status = self._basic_movement_segment_status(entity, previous, (end_x, end_y), map_manager, step_limit=step_limit)
-            if not final_status['passable']:
-                return None
-            total_score += math.hypot(end_x - float(previous[0]), end_y - float(previous[1]))
-            return total_score
-
-        for side in (1.0, -1.0):
-            for offset_mult in lateral_multipliers:
-                lateral_offset = base_offset * offset_mult
-                forward_bias = min(distance * 0.14, lateral_offset * 0.35)
-                immediate_forward = max(10.0, min(distance * 0.18, lateral_offset * 0.9))
-                for ratio in near_start_ratios:
-                    anchor_x = start_x + delta_x * ratio
-                    anchor_y = start_y + delta_y * ratio
-                    for forward_mult in (0.0, 0.45, 0.9, -0.25):
-                        candidate = resolve_probe(
-                            anchor_x + normal_x * side * lateral_offset + direction_x * immediate_forward * forward_mult,
-                            anchor_y + normal_y * side * lateral_offset + direction_y * immediate_forward * forward_mult,
-                        )
-                        if candidate is None:
-                            continue
-                        path_points = (candidate,)
-                        key = tuple((round(point[0], 2), round(point[1], 2)) for point in path_points)
-                        if key in seen_paths:
-                            continue
-                        seen_paths.add(key)
-                        score = legs_passable(path_points)
-                        if score is None:
-                            continue
-                        if best_score is None or score < best_score:
-                            best_score = score
-                            best_path = path_points
-                for ratio in midpoint_ratios:
-                    center_x = start_x + delta_x * ratio
-                    center_y = start_y + delta_y * ratio
-                    for bias_sign in (0.0, 1.0, -1.0):
-                        candidate = resolve_probe(
-                            center_x + normal_x * side * lateral_offset + direction_x * forward_bias * bias_sign,
-                            center_y + normal_y * side * lateral_offset + direction_y * forward_bias * bias_sign,
-                        )
-                        if candidate is None:
-                            continue
-                        path_points = (candidate,)
-                        key = tuple((round(point[0], 2), round(point[1], 2)) for point in path_points)
-                        if key in seen_paths:
-                            continue
-                        seen_paths.add(key)
-                        score = legs_passable(path_points)
-                        if score is None:
-                            continue
-                        if best_score is None or score < best_score:
-                            best_score = score
-                            best_path = path_points
-                for ratio in near_end_ratios:
-                    anchor_x = start_x + delta_x * ratio
-                    anchor_y = start_y + delta_y * ratio
-                    candidate = resolve_probe(
-                        anchor_x + normal_x * side * lateral_offset,
-                        anchor_y + normal_y * side * lateral_offset,
-                    )
-                    if candidate is None:
-                        continue
-                    path_points = (candidate,)
-                    key = tuple((round(point[0], 2), round(point[1], 2)) for point in path_points)
-                    if key in seen_paths:
-                        continue
-                    seen_paths.add(key)
-                    score = legs_passable(path_points)
-                    if score is None:
-                        continue
-                    if best_score is None or score < best_score:
-                        best_score = score
-                        best_path = path_points
-                for start_ratio, end_ratio in pair_ratios:
-                    first_probe = resolve_probe(
-                        start_x + delta_x * start_ratio + normal_x * side * lateral_offset,
-                        start_y + delta_y * start_ratio + normal_y * side * lateral_offset,
-                    )
-                    second_probe = resolve_probe(
-                        start_x + delta_x * end_ratio + normal_x * side * lateral_offset,
-                        start_y + delta_y * end_ratio + normal_y * side * lateral_offset,
-                    )
-                    if first_probe is None or second_probe is None:
-                        continue
-                    path_points = (first_probe, second_probe)
-                    key = tuple((round(point[0], 2), round(point[1], 2)) for point in path_points)
-                    if key in seen_paths:
-                        continue
-                    seen_paths.add(key)
-                    score = legs_passable(path_points)
-                    if score is None:
-                        continue
-                    if best_score is None or score < best_score:
-                        best_score = score
-                        best_path = path_points
-        return tuple(best_path)
+        for tangent_sign in (1.0, -1.0):
+            slide_dir_x = tangent_x * tangent_sign
+            slide_dir_y = tangent_y * tangent_sign
+            current_point = (start_x, start_y)
+            path_points = []
+            visited = set()
+            for _ in range(max_slide_steps):
+                raw_point = (
+                    current_point[0] + slide_dir_x * slide_step + normal_x * clearance,
+                    current_point[1] + slide_dir_y * slide_step + normal_y * clearance,
+                )
+                resolved = map_manager.find_nearest_passable_point(
+                    raw_point,
+                    collision_radius=collision_radius,
+                    search_radius=search_radius,
+                    step=search_step,
+                )
+                if resolved is None:
+                    break
+                candidate = (float(resolved[0]), float(resolved[1]))
+                candidate_key = (round(candidate[0], 2), round(candidate[1], 2))
+                if candidate_key in visited:
+                    break
+                visited.add(candidate_key)
+                if math.hypot(candidate[0] - current_point[0], candidate[1] - current_point[1]) <= max(4.0, collision_radius * 0.35):
+                    continue
+                segment_status = self._basic_movement_segment_status(entity, current_point, candidate, map_manager, step_limit=step_limit)
+                if not segment_status['passable']:
+                    break
+                if not path_points or path_points[-1] != candidate:
+                    path_points.append(candidate)
+                current_point = candidate
+                remaining_distance = math.hypot(end_x - current_point[0], end_y - current_point[1])
+                if remaining_distance < best_partial_remaining:
+                    best_partial_remaining = remaining_distance
+                    best_partial_path = tuple(path_points)
+                if self._front_obstacle_clear(entity, current_point, (end_x, end_y), map_manager, step_limit=step_limit):
+                    return tuple(path_points)
+        return tuple(best_partial_path)
 
     def _movement_segment_status(self, entity, from_point, to_point, map_manager, step_limit=None):
         resolved_step_limit = float(step_limit if step_limit is not None else getattr(entity, 'max_terrain_step_height_m', 0.05))
@@ -4695,11 +4732,11 @@ class AIController:
             return FAILURE
         anchor = self._outpost_pressure_highground_anchor(context)
         if anchor is None:
-            return self._action_hero_lob_structure(context, enemy_base, '敌方前哨站已倒，英雄转火基地并保持远距离吊射')
+            return self._action_hero_lob_structure(context, enemy_base, '敌方前哨站已倒，英雄转火基地并保持远距离吊射', structure_lob_target_type='base', disengage_deployment=True)
         speed = self._meters_to_world_units(1.9, context.map_manager)
         target = self.entity_to_target(enemy_base, context.entity)
         if self._distance_to_point(context.entity, anchor) > self._meters_to_world_units(0.8, context.map_manager):
-            return self._set_decision(context, '敌方前哨站已倒，远程英雄转入己方高地增益区吊射敌方基地', target=target, target_point=anchor, speed=speed, preferred_route={'target': anchor}, turret_state='aiming')
+            return self._set_decision(context, '敌方前哨站已倒，远程英雄转入己方高地增益区吊射敌方基地', target=target, target_point=anchor, speed=speed, preferred_route={'target': anchor}, turret_state='aiming', structure_lob_target_type='base', disengage_deployment=True)
         context.data['decision'] = {
             'summary': '远程英雄占据己方高地增益区，对敌方基地实施吊射',
             'target': target,
@@ -4712,16 +4749,18 @@ class AIController:
             'turret_state': 'aiming',
             'angular_velocity': 0.0,
             'posture': None,
+            'structure_lob_target_type': 'base',
+            'disengage_deployment': True,
         }
         return SUCCESS
 
-    def _action_hero_lob_structure(self, context, target_entity, summary):
+    def _action_hero_lob_structure(self, context, target_entity, summary, structure_lob_target_type=None, disengage_deployment=False):
         preferred_distance = self._meters_to_world_units(7.0, context.map_manager)
         anchor = self._hero_ranged_highground_anchor(context) or self._structure_lob_anchor(context.entity, target_entity, context.data.get('own_base'), preferred_distance)
         speed = self._meters_to_world_units(1.9, context.map_manager)
         target = self.entity_to_target(target_entity, context.entity)
         if self._distance_to_point(context.entity, anchor) > self._meters_to_world_units(0.8, context.map_manager):
-            return self._set_decision(context, summary, target=target, target_point=anchor, speed=speed, preferred_route={'target': anchor}, turret_state='aiming')
+            return self._set_decision(context, summary, target=target, target_point=anchor, speed=speed, preferred_route={'target': anchor}, turret_state='aiming', structure_lob_target_type=structure_lob_target_type, disengage_deployment=disengage_deployment)
         context.data['decision'] = {
             'summary': summary,
             'target': target,
@@ -4734,6 +4773,8 @@ class AIController:
             'turret_state': 'aiming',
             'angular_velocity': 0.0,
             'posture': None,
+            'structure_lob_target_type': structure_lob_target_type,
+            'disengage_deployment': bool(disengage_deployment),
         }
         return SUCCESS
 
@@ -4760,110 +4801,19 @@ class AIController:
         return self._set_decision(context, '沿关键设施轮巡，保持阵型与视野', target=context.data.get('target'), target_point=patrol_target, speed=speed, turret_state='aiming' if context.data.get('target') else 'searching', angular_velocity=12.0)
 
     def _priority_target_threat_score(self, source_entity, target_entity):
-        role_key = self._role_key(target_entity)
-        threat_score = {
-            'hero': 320.0,
-            'sentry': 300.0,
-            'infantry': 240.0,
-            'engineer': 100.0,
-        }.get(role_key, 160.0)
-        if target_entity.type == 'outpost':
-            threat_score = 150.0
-        elif target_entity.type == 'base':
-            threat_score = 110.0
-        if getattr(source_entity, 'last_damage_source_id', None) == target_entity.id:
-            threat_score += 120.0
-        target_state = getattr(target_entity, 'target', None)
-        if isinstance(target_state, dict) and target_state.get('id') == source_entity.id:
-            threat_score += 100.0
-        if getattr(target_entity, 'fire_control_state', 'idle') == 'firing':
-            threat_score += 70.0
-        return threat_score
+        return self._targeting_runtime.priority_target_threat_score(source_entity, target_entity)
+
+    def _target_assessment(self, entity, other, distance, rules_engine):
+        return self._targeting_runtime.target_assessment(entity, other, distance, rules_engine)
 
     def _priority_target_score(self, entity, other, priority_map, rules_engine=None, max_distance=None):
-        distance = self._distance(entity, other)
-        if max_distance is not None and distance > max_distance:
-            return None
-
-        hp_ratio = 1.0
-        if float(getattr(other, 'max_health', 0.0)) > 0.0:
-            hp_ratio = max(0.0, min(1.0, float(getattr(other, 'health', 0.0)) / float(other.max_health)))
-        reference_distance = max_distance if max_distance is not None else self._meters_to_world_units(9.0)
-        distance_score = max(0.0, 1.0 - distance / max(reference_distance, 1e-6)) * 180.0
-        finish_score = (1.0 - hp_ratio) * 140.0
-        if float(getattr(other, 'health', 0.0)) <= max(1.0, float(getattr(other, 'max_health', 0.0)) * 0.28):
-            finish_score += 75.0
-
-        visibility_score = 0.0
-        if rules_engine is not None and entity.type in {'robot', 'sentry'} and getattr(entity, 'robot_type', '') != '工程':
-            assessment = rules_engine.evaluate_auto_aim_target(entity, other, distance=distance, require_fov=False)
-            if assessment.get('can_track', False):
-                visibility_score += 220.0
-                if assessment.get('can_auto_aim', False):
-                    visibility_score += 60.0
-            elif not assessment.get('line_of_sight', True):
-                visibility_score -= 180.0
-
-        score = priority_map.get(other.type, 0) * 220.0
-        score += self._priority_target_threat_score(entity, other)
-        score += distance_score
-        score += finish_score
-        score += visibility_score
-        if other.type in {'outpost', 'base'} and distance <= self._meters_to_world_units(8.5):
-            score += 50.0
-        return score
+        return self._targeting_runtime.priority_target_score(entity, other, priority_map, rules_engine=rules_engine, max_distance=max_distance)
 
     def _select_priority_target_entity(self, entity, enemies, strategy, rules_engine=None, max_distance=None):
-        enemy_base = None
-        enemy_outpost_alive = False
-        for other in enemies:
-            if other.type == 'base':
-                enemy_base = other
-            elif other.type == 'outpost' and other.is_alive():
-                enemy_outpost_alive = True
-        base_unlocked = False
-        if enemy_base is not None and enemy_base.is_alive() and not enemy_outpost_alive:
-            if rules_engine is not None and hasattr(rules_engine, 'is_base_shielded'):
-                base_unlocked = not bool(rules_engine.is_base_shielded(enemy_base))
-            else:
-                base_unlocked = True
-        if base_unlocked:
-            return enemy_base
-
-        priority_targets = strategy.get('priority_targets', ['sentry', 'robot', 'outpost', 'base'])
-        priority_map = {target_type: len(priority_targets) - index for index, target_type in enumerate(priority_targets)}
-        visible_combat_target_exists = False
-        if rules_engine is not None and entity.type in {'robot', 'sentry'}:
-            for other in enemies:
-                if other.type not in {'robot', 'sentry'}:
-                    continue
-                distance = self._distance(entity, other)
-                if max_distance is not None and distance > max_distance:
-                    continue
-                assessment = rules_engine.evaluate_auto_aim_target(entity, other, distance=distance, require_fov=False)
-                if assessment.get('can_track', False):
-                    visible_combat_target_exists = True
-                    break
-        best_target = None
-        best_score = None
-        for other in enemies:
-            if other.type == 'base' and rules_engine is not None and hasattr(rules_engine, 'is_base_shielded') and rules_engine.is_base_shielded(other):
-                continue
-            if visible_combat_target_exists and other.type in {'outpost', 'base'}:
-                continue
-            score = self._priority_target_score(entity, other, priority_map, rules_engine=rules_engine, max_distance=max_distance)
-            if score is None:
-                continue
-            if best_score is None or score > best_score:
-                best_score = score
-                best_target = other
-        return best_target
+        return self._targeting_runtime.select_priority_target_entity(entity, enemies, strategy, rules_engine=rules_engine, max_distance=max_distance)
 
     def select_priority_target(self, entity, enemies, strategy, rules_engine=None, max_distance=None):
-        best_target = self._select_priority_target_entity(entity, enemies, strategy, rules_engine=rules_engine, max_distance=max_distance)
-        if best_target is None:
-            return None
-        return self.entity_to_target(best_target, entity)
+        return self._targeting_runtime.select_priority_target(entity, enemies, strategy, rules_engine=rules_engine, max_distance=max_distance)
 
     def entity_to_target(self, target_entity, source_entity):
         distance = self._distance(source_entity, target_entity)
@@ -5103,6 +5053,18 @@ class AIController:
             'second_step': '主动翻越二级台阶抢占高差路线',
         }
         target_point = plan.get('target')
+        if target_point is not None and context.map_manager is not None:
+            traversal = context.map_manager.describe_segment_traversal(
+                float(context.entity.position['x']),
+                float(context.entity.position['y']),
+                float(target_point[0]),
+                float(target_point[1]),
+                max_height_delta_m=float(getattr(context.entity, 'max_terrain_step_height_m', 0.35)),
+            )
+            if isinstance(traversal, dict) and str(traversal.get('facility_type', '')) == facility_type:
+                policy_points = self._terrain_policy_path_points(context.entity, traversal, context.map_manager)
+                if policy_points:
+                    target_point = policy_points[0]
         speed = self._meters_to_world_units(1.8, context.map_manager)
         target = context.data.get('target')
         return self._set_decision(
@@ -5590,6 +5552,8 @@ class AIController:
             self._clear_navigation_overlay_state(entity)
             return 0.0, 0.0
         target_point = self._resolve_navigation_target(target_point, map_manager, entity=entity)
+        planning_enabled = self._role_controller_feature_enabled(entity, 'path_planning')
+        avoidance_enabled = self._role_controller_feature_enabled(entity, 'avoidance')
         current_time = float(self._last_ai_update_time.get(entity.id, 0.0))
         forced_escape_anchor = self._active_infantry_supply_escape_anchor(entity, map_manager, current_time)
         if forced_escape_anchor is not None:
@@ -5600,7 +5564,7 @@ class AIController:
             )
             self._set_navigation_overlay_state(entity, waypoint=forced_escape_anchor, preview=preview, path_valid=False, region_radius=0.0, traversal_state='passable')
             desired_velocity = self.move_towards(entity, forced_escape_anchor, self._resolved_navigation_speed(entity, speed, forced_escape_anchor, map_manager))
-            return self._avoid_static_obstacles(entity, desired_velocity, map_manager)
+            return self._avoid_static_obstacles(entity, desired_velocity, map_manager) if avoidance_enabled else desired_velocity
         region_radius = self._target_region_radius(entity, target_point, map_manager)
         if self._is_target_reached(entity, target_point, map_manager):
             self._clear_navigation_overlay_state(entity)
@@ -5613,9 +5577,17 @@ class AIController:
         if map_manager is None:
             self._set_navigation_overlay_state(entity, waypoint=target_point, preview=(target_point,), path_valid=True, region_radius=region_radius, traversal_state='passable')
             return self.move_towards(entity, target_point, self._resolved_navigation_speed(entity, speed, target_point, map_manager))
+        if not planning_enabled:
+            preview = (
+                (float(entity.position['x']), float(entity.position['y'])),
+                (float(target_point[0]), float(target_point[1])),
+            )
+            self._set_navigation_overlay_state(entity, waypoint=target_point, preview=preview, path_valid=False, region_radius=region_radius, traversal_state='direct')
+            desired_velocity = self.move_towards(entity, target_point, self._resolved_navigation_speed(entity, speed, target_point, map_manager))
+            return self._avoid_static_obstacles(entity, desired_velocity, map_manager) if avoidance_enabled else desired_velocity
         next_point = self._next_path_waypoint(entity, target_point, map_manager)
         desired_velocity = self.move_towards(entity, next_point, self._resolved_navigation_speed(entity, speed, next_point, map_manager))
-        return self._avoid_static_obstacles(entity, desired_velocity, map_manager)
+        return self._avoid_static_obstacles(entity, desired_velocity, map_manager) if avoidance_enabled else desired_velocity
 
     def _avoid_static_obstacles(self, entity, desired_velocity, map_manager):
         vx, vy = desired_velocity
@@ -5697,6 +5669,7 @@ class AIController:
         direct_traverse_distance = self._distance_to_point(entity, target_point)
         direct_traverse_limit = math.hypot(float(map_manager.map_width), float(map_manager.map_height))
         current_time = self._last_ai_update_time.get(entity.id, 0.0)
+        pathfinding_enabled = self._role_controller_feature_enabled(entity, 'pathfinding')
         state = self._entity_path_state.get(entity.id)
         direct_target_signature = (round(float(target_point[0]), 1), round(float(target_point[1]), 1))
         direct_status = None
@@ -5739,6 +5712,17 @@ class AIController:
             preview = self._build_path_preview(entity, segmented_path, direct_index)
             self._set_navigation_overlay_state(entity, waypoint=direct_waypoint, preview=preview, path_valid=True, region_radius=self._target_region_radius(entity, target_point, map_manager), traversal_state=traversal_state)
             return direct_waypoint
+
+        if not pathfinding_enabled:
+            midpoint = self._temporary_midpoint_waypoint(entity, target_point, map_manager)
+            fallback_point = midpoint or (float(target_point[0]), float(target_point[1]))
+            preview = (
+                (float(entity.position['x']), float(entity.position['y'])),
+                fallback_point,
+                (float(target_point[0]), float(target_point[1])),
+            )
+            self._set_navigation_overlay_state(entity, waypoint=fallback_point, preview=preview, path_valid=False, region_radius=self._target_region_radius(entity, target_point, map_manager), traversal_state='blocked')
+            return fallback_point
 
         raster_version = getattr(map_manager, 'raster_version', 0)
         step_limit = float(getattr(entity, 'max_terrain_step_height_m', 0.05))
@@ -6088,82 +6072,6 @@ class AIController:
         path_state = 'step-passable' if any(self._movement_segment_status(entity, preview[idx], preview[idx + 1], map_manager)['requires_step'] for idx in range(len(preview) - 1)) else 'passable'
         self._set_navigation_overlay_state(entity, waypoint=path[index], preview=preview, path_valid=True, region_radius=self._target_region_radius(entity, target_point, map_manager), traversal_state=path_state)
         return path[index]
-
-    def _search_navigation_path(self, entity, target_point, map_manager, step_limit, traversal_profile):
-        start_time = time.perf_counter()
-        budget_scale = self._pathfinder_distance_scale(entity, target_point, map_manager)
-        total_budget_sec = self._pathfinder_total_budget_sec * budget_scale
-        deadline = start_time + total_budget_sec if total_budget_sec > 0 else None
-        base_steps = [max(map_manager.terrain_grid_cell_size * 4, 18)]
-        if self._pathfinder_use_dual_resolution:
-            base_steps.append(max(map_manager.terrain_grid_cell_size * 2, 12))
-        candidate_points = self._target_region_candidate_points(entity, target_point, map_manager)
-        if self._pathfinder_try_resolved_target:
-            resolved_target = map_manager.find_nearest_passable_point(
-                target_point,
-                collision_radius=float(traversal_profile.get('collision_radius', 0.0)),
-                search_radius=max(72, map_manager.terrain_grid_cell_size * 10),
-                step=max(4, map_manager.terrain_grid_cell_size),
-            )
-            if resolved_target is not None and resolved_target != target_point:
-                candidate_points.append(resolved_target)
-        search_plans = [
-            {
-                'steps': tuple(base_steps),
-                'max_iterations': max(self._pathfinder_max_iterations, int(self._pathfinder_max_iterations * budget_scale)),
-                'max_runtime_sec': self._pathfinder_time_budget_sec * budget_scale,
-            },
-            {
-                'steps': tuple(sorted({max(map_manager.terrain_grid_cell_size, 8), max(map_manager.terrain_grid_cell_size * 2, 12), *base_steps})),
-                'max_iterations': max(1200, int(self._pathfinder_max_iterations * 2 * budget_scale)),
-                'max_runtime_sec': max(0.006, self._pathfinder_time_budget_sec * 1.6 * budget_scale),
-            },
-        ]
-        resolved_candidates = []
-        seen_candidates = set()
-        for candidate in candidate_points:
-            resolved_candidate = self._resolve_navigation_target(candidate, map_manager, entity=entity)
-            if resolved_candidate is None:
-                continue
-            key = (round(float(resolved_candidate[0]), 2), round(float(resolved_candidate[1]), 2))
-            if key in seen_candidates:
-                continue
-            seen_candidates.add(key)
-            resolved_candidates.append((float(resolved_candidate[0]), float(resolved_candidate[1])))
-        resolved_candidates.sort(key=lambda point: math.hypot(point[0] - float(entity.position['x']), point[1] - float(entity.position['y'])))
-        max_candidates = max(2, int(self._ai_config.get('pathfinder_max_candidates', 4)))
-        resolved_candidates = resolved_candidates[:max_candidates]
-        attempts = 0
-        for search_plan in search_plans:
-            if deadline is not None and time.perf_counter() >= deadline:
-                break
-            for candidate in resolved_candidates:
-                for grid_step in search_plan['steps']:
-                    if attempts >= self._pathfinder_max_attempts:
-                        return self.EMPTY_PATH_PREVIEW
-                    if deadline is not None:
-                        remaining_budget = deadline - time.perf_counter()
-                        if remaining_budget <= 0:
-                            return self.EMPTY_PATH_PREVIEW
-                        runtime_limit = min(float(search_plan['max_runtime_sec']), remaining_budget)
-                    else:
-                        runtime_limit = float(search_plan['max_runtime_sec'])
-                    if runtime_limit <= 0.0002:
-                        return self.EMPTY_PATH_PREVIEW
-                    attempts += 1
-                    path = map_manager.find_path(
-                        (entity.position['x'], entity.position['y']),
-                        candidate,
-                        max_height_delta_m=step_limit,
-                        grid_step=grid_step,
-                        traversal_profile=traversal_profile,
-                        max_iterations=search_plan['max_iterations'],
-                        max_runtime_sec=runtime_limit,
-                    )
-                    if self._is_path_traversable(entity, path, map_manager):
-                        expanded_path = self._expand_path_with_step_transitions(entity, path, map_manager)
-                        return tuple(self._segment_path_points(expanded_path, map_manager, entity=entity))
-        return self.EMPTY_PATH_PREVIEW
 
     def _expand_path_with_step_transitions(self, entity, path, map_manager):
         if not path:

@@ -8,7 +8,7 @@ from pygame_compat import pygame
 
 class RendererSidebarMixin:
     def render_sidebar(self, game_engine):
-        if self.viewport is None or self.edit_mode == 'none':
+        if self.viewport is None:
             return
 
         panel_rect = pygame.Rect(
@@ -19,15 +19,337 @@ class RendererSidebarMixin:
         )
         pygame.draw.rect(self.screen, self.colors['panel'], panel_rect)
         pygame.draw.line(self.screen, self.colors['panel_border'], panel_rect.topleft, panel_rect.bottomleft, 1)
-        title = self.font.render(self._mode_label(self.edit_mode), True, self.colors['panel_text'])
+        title = self.font.render('对局控制' if self.edit_mode == 'none' else self._mode_label(self.edit_mode), True, self.colors['panel_text'])
         self.screen.blit(title, (panel_rect.x + 16, panel_rect.y + 16))
 
-        if self.edit_mode == 'terrain':
+        if self.edit_mode == 'none':
+            self.render_match_control_panel(game_engine, panel_rect)
+        elif self.edit_mode == 'terrain':
             self.render_terrain_editor_panel(game_engine, panel_rect)
         elif self.edit_mode == 'entity':
             self.render_entity_panel(game_engine, panel_rect)
         elif self.edit_mode == 'rules':
             self.render_rules_panel(game_engine, panel_rect)
+
+        if self.edit_mode == 'none' and game_engine.is_single_unit_test_mode():
+            decision_rect = pygame.Rect(
+                panel_rect.right,
+                panel_rect.y,
+                self.decision_panel_width,
+                panel_rect.height,
+            )
+            pygame.draw.rect(self.screen, self.colors['panel'], decision_rect)
+            pygame.draw.line(self.screen, self.colors['panel_border'], decision_rect.topleft, decision_rect.bottomleft, 1)
+            decision_title = self.font.render('决策可视化', True, self.colors['panel_text'])
+            self.screen.blit(decision_title, (decision_rect.x + 16, decision_rect.y + 16))
+            self.render_single_unit_decision_panel(game_engine, decision_rect)
+
+    def render_match_control_panel(self, game_engine, panel_rect):
+        y = panel_rect.y + 56
+        mouse_pos = pygame.mouse.get_pos()
+        hover_lines = None
+        intro_lines = [
+            '完整模式保留标准对局推进。',
+            '单兵种测试下仅主控兵种允许运动。',
+        ]
+        for line in intro_lines:
+            text = self.tiny_font.render(line, True, self.colors['panel_text'])
+            self.screen.blit(text, (panel_rect.x + 16, y))
+            y += 18
+
+        y += 8
+        mode_title = self.small_font.render('对局模式', True, self.colors['panel_text'])
+        self.screen.blit(mode_title, (panel_rect.x + 16, y))
+        y += 28
+
+        full_rect = pygame.Rect(panel_rect.x + 16, y, 92, 28)
+        single_rect = pygame.Rect(panel_rect.x + 116, y, 110, 28)
+        self._draw_mode_button(full_rect, '完整', getattr(game_engine, 'match_mode', 'full') == 'full')
+        self._draw_mode_button(single_rect, '单兵种测试', getattr(game_engine, 'match_mode', 'full') == 'single_unit_test')
+        self.panel_actions.append((full_rect, 'match_mode:full'))
+        self.panel_actions.append((single_rect, 'match_mode:single_unit_test'))
+        if full_rect.collidepoint(mouse_pos):
+            hover_lines = ['完整游戏对局，完全由程序控制对局']
+        elif single_rect.collidepoint(mouse_pos):
+            hover_lines = ['对单个兵种的实战决策检视']
+        y += 42
+
+        if not game_engine.is_single_unit_test_mode():
+            summary_lines = [
+                '当前不注入人工待办决策。',
+                '若要检查单兵种决策，请切换到单兵种测试。',
+            ]
+            for line in summary_lines:
+                text = self.tiny_font.render(line, True, self.colors['panel_text'])
+                self.screen.blit(text, (panel_rect.x + 16, y))
+                y += 18
+            self.single_unit_decision_list_rect = None
+            if hover_lines:
+                self._draw_text_tooltip(panel_rect, hover_lines, mouse_pos)
+            return
+
+        focus_team = getattr(game_engine, 'single_unit_test_team', 'red')
+        focus_key = getattr(game_engine, 'single_unit_test_entity_key', 'robot_1')
+        focus_entity = game_engine.get_single_unit_test_focus_entity()
+
+        team_title = self.small_font.render('主控方', True, self.colors['panel_text'])
+        self.screen.blit(team_title, (panel_rect.x + 16, y))
+        y += 28
+        red_rect = pygame.Rect(panel_rect.x + 16, y, 72, 26)
+        blue_rect = pygame.Rect(panel_rect.x + 96, y, 72, 26)
+        self._draw_mode_button(red_rect, '红方', focus_team == 'red')
+        self._draw_mode_button(blue_rect, '蓝方', focus_team == 'blue')
+        self.panel_actions.append((red_rect, 'test_focus_team:red'))
+        self.panel_actions.append((blue_rect, 'test_focus_team:blue'))
+        y += 38
+
+        unit_title = self.small_font.render('主控兵种', True, self.colors['panel_text'])
+        self.screen.blit(unit_title, (panel_rect.x + 16, y))
+        y += 28
+        unit_specs = [
+            ('robot_1', '英雄'),
+            ('robot_2', '工程'),
+            ('robot_3', '步兵1'),
+            ('robot_4', '步兵2'),
+            ('robot_7', '哨兵'),
+        ]
+        button_width = 88
+        for index, (entity_key, label) in enumerate(unit_specs):
+            row = index // 3
+            column = index % 3
+            rect = pygame.Rect(panel_rect.x + 16 + column * (button_width + 8), y + row * 34, button_width, 26)
+            self._draw_mode_button(rect, label, focus_key == entity_key)
+            self.panel_actions.append((rect, f'test_focus_entity:{entity_key}'))
+        y += 76
+
+        status_lines = [
+            '测试控制',
+            '浏览模式下可拖拽所有战斗单位位置。',
+            f'当前主控: {getattr(focus_entity, "id", "未找到")}',
+            '当前决策与待办决策见右侧决策栏。',
+        ]
+        for index, line in enumerate(status_lines):
+            font = self.small_font if index == 0 else self.tiny_font
+            text = font.render(line, True, self.colors['panel_text'])
+            self.screen.blit(text, (panel_rect.x + 16, y))
+            y += 22 if index == 0 else 18
+
+        y += 6
+        base_title = self.small_font.render('基地血量', True, self.colors['panel_text'])
+        self.screen.blit(base_title, (panel_rect.x + 16, y))
+        y += 28
+        for team in ('red', 'blue'):
+            base = game_engine.entity_manager.get_entity(f'{team}_base')
+            row_rect = pygame.Rect(panel_rect.x + 16, y, panel_rect.width - 32, 28)
+            pygame.draw.rect(self.screen, self.colors['panel_row'], row_rect, border_radius=5)
+            label = '红方基地' if team == 'red' else '蓝方基地'
+            hp_text = f'{int(getattr(base, "health", 0.0))}/{int(getattr(base, "max_health", 0.0))}'
+            self.screen.blit(self.tiny_font.render(label, True, self.colors['panel_text']), (row_rect.x + 8, row_rect.y + 7))
+            self.screen.blit(self.tiny_font.render(hp_text, True, self.colors['panel_text']), (row_rect.x + 92, row_rect.y + 7))
+            minus_rect = pygame.Rect(row_rect.right - 60, row_rect.y + 4, 24, 20)
+            plus_rect = pygame.Rect(row_rect.right - 30, row_rect.y + 4, 24, 20)
+            pygame.draw.rect(self.screen, self.colors['toolbar_button'], minus_rect, border_radius=4)
+            pygame.draw.rect(self.screen, self.colors['toolbar_button'], plus_rect, border_radius=4)
+            self.screen.blit(self.tiny_font.render('-', True, self.colors['white']), (minus_rect.x + 8, minus_rect.y + 2))
+            self.screen.blit(self.tiny_font.render('+', True, self.colors['white']), (plus_rect.x + 7, plus_rect.y + 2))
+            self.panel_actions.append((minus_rect, f'test_base_hp:{team}:-250'))
+            self.panel_actions.append((plus_rect, f'test_base_hp:{team}:250'))
+            y += 34
+
+        self.single_unit_decision_list_rect = None
+
+        if hover_lines:
+            self._draw_text_tooltip(panel_rect, hover_lines, mouse_pos)
+
+    def render_single_unit_decision_panel(self, game_engine, panel_rect):
+        y = panel_rect.y + 56
+        focus_entity = game_engine.get_single_unit_test_focus_entity()
+        decision_top3 = [] if focus_entity is None else [item for item in getattr(focus_entity, 'ai_decision_top3', ()) if isinstance(item, dict)]
+        next_specs = list(game_engine.get_single_unit_test_next_decision_specs())
+        decision_summary = '待机' if focus_entity is None else str(getattr(focus_entity, 'ai_decision', '') or '待机')
+        current_decision = '' if focus_entity is None else str(getattr(focus_entity, 'ai_decision_selected', '') or '')
+        forced_decision = '' if focus_entity is None else str(getattr(focus_entity, 'test_forced_decision_id', '') or '')
+
+        summary_title = self.small_font.render('当下决策', True, self.colors['panel_text'])
+        self.screen.blit(summary_title, (panel_rect.x + 16, y))
+        y += 30
+
+        summary_lines = [
+            f'主控实体: {getattr(focus_entity, "id", "未找到")}',
+            f'当前分支: {current_decision or "无"}',
+            f'待办分支: {forced_decision or "未设置"}',
+            decision_summary,
+        ]
+        for index, line in enumerate(summary_lines):
+            rendered = self.tiny_font.render(line, True, self.colors['panel_text'])
+            self.screen.blit(rendered, (panel_rect.x + 16, y))
+            y += 18
+
+        y += 8
+        top3_title = self.small_font.render('决策 Top3', True, self.colors['panel_text'])
+        self.screen.blit(top3_title, (panel_rect.x + 16, y))
+        y += 28
+        if decision_top3:
+            for item in decision_top3[:3]:
+                row_rect = pygame.Rect(panel_rect.x + 16, y, panel_rect.width - 32, 30)
+                pygame.draw.rect(self.screen, self.colors['panel_row'], row_rect, border_radius=5)
+                label = str(item.get('label') or item.get('id') or '未命名决策')
+                weight = float(item.get('weight', 0.0))
+                matched = bool(item.get('matched', False))
+                suffix = ' 命中' if matched else ''
+                text = self.tiny_font.render(f'{label} | {weight * 100:.0f}%{suffix}', True, self.colors['panel_text'])
+                self.screen.blit(text, (row_rect.x + 8, row_rect.y + 7))
+                y += 34
+        else:
+            self.screen.blit(self.tiny_font.render('当前无可展示候选决策', True, self.colors['panel_text']), (panel_rect.x + 16, y))
+            y += 22
+
+        y += 6
+        next_title = self.small_font.render('后续候选', True, self.colors['panel_text'])
+        self.screen.blit(next_title, (panel_rect.x + 16, y))
+        y += 28
+        if next_specs:
+            for spec in next_specs[:3]:
+                row_rect = pygame.Rect(panel_rect.x + 16, y, panel_rect.width - 32, 28)
+                pygame.draw.rect(self.screen, self.colors['panel_row'], row_rect, border_radius=5)
+                text = self.tiny_font.render(str(spec.get('label', spec.get('id', ''))), True, self.colors['panel_text'])
+                self.screen.blit(text, (row_rect.x + 8, row_rect.y + 7))
+                y += 32
+        else:
+            self.screen.blit(self.tiny_font.render('当前无法推断下一步候选', True, self.colors['panel_text']), (panel_rect.x + 16, y))
+            y += 22
+
+        y += 6
+        decision_title = self.small_font.render('主控待办决策', True, self.colors['panel_text'])
+        self.screen.blit(decision_title, (panel_rect.x + 16, y))
+        clear_rect = pygame.Rect(panel_rect.right - 96, y - 2, 80, 24)
+        self._draw_mode_button(clear_rect, '清除待办', False)
+        self.panel_actions.append((clear_rect, 'test_decision_clear'))
+        y += 30
+
+        decision_specs = list(game_engine.get_single_unit_test_decision_specs())
+        available_height = max(60, panel_rect.bottom - y - 16)
+        row_height = 30
+        max_visible = max(1, available_height // row_height)
+        max_scroll = max(0, len(decision_specs) - max_visible)
+        self.single_unit_decision_scroll = max(0, min(max_scroll, self.single_unit_decision_scroll))
+        visible_count = min(len(decision_specs), max_visible)
+        self.single_unit_decision_list_rect = pygame.Rect(panel_rect.x + 16, y, panel_rect.width - 32, max(row_height, visible_count * row_height))
+        visible_specs = decision_specs[self.single_unit_decision_scroll:self.single_unit_decision_scroll + max_visible]
+
+        for visible_index, spec in enumerate(visible_specs):
+            row_y = y + visible_index * row_height
+            rect = pygame.Rect(panel_rect.x + 16, row_y, panel_rect.width - 32, 26)
+            is_forced = spec.get('id') == forced_decision
+            is_running = spec.get('id') == current_decision
+            pygame.draw.rect(self.screen, self.colors['panel_row_active'] if (is_forced or is_running) else self.colors['panel_row'], rect, border_radius=5)
+            suffix = ' [待办]' if is_forced else (' [当前]' if is_running else '')
+            label = self.tiny_font.render(f'{spec.get("label", spec.get("id", ""))}{suffix}', True, self.colors['panel_text'])
+            self.screen.blit(label, (rect.x + 8, rect.y + 6))
+            self.panel_actions.append((rect, f'test_decision:{spec.get("id", "")}'))
+
+    def render_debug_panel(self, game_engine, panel_rect):
+        y = panel_rect.y + 56
+        intro_lines = [
+            '右侧按钮用于快速禁用高耗时模块。',
+            '控制器和状态机支持按兵种折叠调试。',
+        ]
+        for line in intro_lines:
+            text = self.tiny_font.render(line, True, self.colors['panel_text'])
+            self.screen.blit(text, (panel_rect.x + 16, y))
+            y += 18
+        header = self.small_font.render('运行系统', True, self.colors['panel_text'])
+        self.screen.blit(header, (panel_rect.x + 16, y + 4))
+        y += 28
+        y = self._render_debug_toggle_row(panel_rect, y, '实体更新', 'debug_toggle:entity_update', game_engine.feature_enabled('entity_update'))
+        y = self._render_debug_foldout_header(panel_rect, y, '控制器', 'debug_toggle:controller', game_engine.feature_enabled('controller'), 'controller')
+        if self.debug_panel_expanded.get('controller', False):
+            y = self._render_controller_role_toggles(panel_rect, y, game_engine)
+        y = self._render_debug_toggle_row(panel_rect, y, '物理', 'debug_toggle:physics', game_engine.feature_enabled('physics'))
+        y = self._render_debug_toggle_row(panel_rect, y, '自瞄', 'debug_toggle:auto_aim', game_engine.feature_enabled('auto_aim'))
+        y = self._render_debug_toggle_row(panel_rect, y, '规则', 'debug_toggle:rules', game_engine.feature_enabled('rules'))
+        y = self._render_debug_foldout_header(panel_rect, y, '状态机', None, True, 'state_machine')
+        if self.debug_panel_expanded.get('state_machine', False):
+            y = self._render_state_machine_role_toggles(panel_rect, y, game_engine)
+
+        header = self.small_font.render('显示调试', True, self.colors['panel_text'])
+        self.screen.blit(header, (panel_rect.x + 16, y + 4))
+        y += 28
+        y = self._render_debug_toggle_row(panel_rect, y, '实体渲染', 'toggle_entities', self.show_entities)
+        y = self._render_debug_toggle_row(panel_rect, y, '设施标注', 'toggle_facilities', self.show_facilities)
+        y = self._render_debug_toggle_row(panel_rect, y, '自瞄视场', 'toggle_aim_fov', self.show_aim_fov)
+        self._render_debug_toggle_row(panel_rect, y, '性能浮层', 'toggle_perf_overlay', bool(getattr(game_engine, 'show_perf_overlay', False)))
+
+    def _render_debug_toggle_row(self, panel_rect, y, label, action, enabled):
+        row_rect = pygame.Rect(panel_rect.x + 16, y, panel_rect.width - 32, 28)
+        pygame.draw.rect(self.screen, self.colors['panel_row'], row_rect, border_radius=6)
+        pygame.draw.rect(self.screen, self.colors['panel_border'], row_rect, 1, border_radius=6)
+        label_text = self.tiny_font.render(label, True, self.colors['panel_text'])
+        self.screen.blit(label_text, (row_rect.x + 10, row_rect.y + 7))
+        button_rect = pygame.Rect(row_rect.right - 66, row_rect.y + 3, 56, 22)
+        pygame.draw.rect(self.screen, self.colors['green'] if enabled else self.colors['toolbar_button'], button_rect, border_radius=5)
+        button_text = self.tiny_font.render('开' if enabled else '关', True, self.colors['white'])
+        self.screen.blit(button_text, button_text.get_rect(center=button_rect.center))
+        self.panel_actions.append((button_rect, action))
+        return y + 34
+
+    def _render_debug_foldout_header(self, panel_rect, y, label, toggle_action, enabled, section_id):
+        row_rect = pygame.Rect(panel_rect.x + 16, y, panel_rect.width - 32, 28)
+        pygame.draw.rect(self.screen, self.colors['panel_row'], row_rect, border_radius=6)
+        pygame.draw.rect(self.screen, self.colors['panel_border'], row_rect, 1, border_radius=6)
+        expanded = bool(self.debug_panel_expanded.get(section_id, False))
+        arrow_text = self.tiny_font.render('▼' if expanded else '▶', True, self.colors['panel_text'])
+        self.screen.blit(arrow_text, (row_rect.x + 8, row_rect.y + 6))
+        label_text = self.tiny_font.render(label, True, self.colors['panel_text'])
+        self.screen.blit(label_text, (row_rect.x + 24, row_rect.y + 7))
+        fold_rect = pygame.Rect(row_rect.x, row_rect.y, row_rect.width - 74, row_rect.height)
+        self.panel_actions.append((fold_rect, f'debug_fold:{section_id}'))
+        if toggle_action is not None:
+            button_rect = pygame.Rect(row_rect.right - 66, row_rect.y + 3, 56, 22)
+            pygame.draw.rect(self.screen, self.colors['green'] if enabled else self.colors['toolbar_button'], button_rect, border_radius=5)
+            button_text = self.tiny_font.render('开' if enabled else '关', True, self.colors['white'])
+            self.screen.blit(button_text, button_text.get_rect(center=button_rect.center))
+            self.panel_actions.append((button_rect, toggle_action))
+        return y + 34
+
+    def _render_controller_role_toggles(self, panel_rect, y, game_engine):
+        role_specs = [('英雄', 'hero'), ('步兵', 'infantry'), ('哨兵', 'sentry'), ('工程', 'engineer')]
+        button_specs = [('寻路', 'pathfinding'), ('规划', 'path_planning'), ('避障', 'avoidance')]
+        for role_label, role_key in role_specs:
+            row_rect = pygame.Rect(panel_rect.x + 24, y, panel_rect.width - 48, 28)
+            pygame.draw.rect(self.screen, self.colors['panel_row_active'], row_rect, border_radius=6)
+            pygame.draw.rect(self.screen, self.colors['panel_border'], row_rect, 1, border_radius=6)
+            label_text = self.tiny_font.render(role_label, True, self.colors['panel_text'])
+            self.screen.blit(label_text, (row_rect.x + 8, row_rect.y + 7))
+            button_x = row_rect.x + 58
+            for button_label, feature_name in button_specs:
+                feature_id = f'controller.{role_key}.{feature_name}'
+                enabled = game_engine.feature_enabled(feature_id)
+                button_rect = pygame.Rect(button_x, row_rect.y + 3, 52, 22)
+                pygame.draw.rect(self.screen, self.colors['green'] if enabled else self.colors['toolbar_button'], button_rect, border_radius=5)
+                text = self.tiny_font.render(button_label, True, self.colors['white'])
+                self.screen.blit(text, text.get_rect(center=button_rect.center))
+                self.panel_actions.append((button_rect, f'debug_toggle:{feature_id}'))
+                button_x += 56
+            y += 32
+        return y + 4
+
+    def _render_state_machine_role_toggles(self, panel_rect, y, game_engine):
+        for role_label, role_key in (('英雄', 'hero'), ('步兵', 'infantry'), ('哨兵', 'sentry'), ('工程', 'engineer')):
+            feature_id = f'state_machine.{role_key}'
+            row_rect = pygame.Rect(panel_rect.x + 24, y, panel_rect.width - 48, 28)
+            pygame.draw.rect(self.screen, self.colors['panel_row_active'], row_rect, border_radius=6)
+            pygame.draw.rect(self.screen, self.colors['panel_border'], row_rect, 1, border_radius=6)
+            label_text = self.tiny_font.render(role_label, True, self.colors['panel_text'])
+            self.screen.blit(label_text, (row_rect.x + 8, row_rect.y + 7))
+            button_rect = pygame.Rect(row_rect.right - 66, row_rect.y + 3, 56, 22)
+            enabled = game_engine.feature_enabled(feature_id)
+            pygame.draw.rect(self.screen, self.colors['green'] if enabled else self.colors['toolbar_button'], button_rect, border_radius=5)
+            button_text = self.tiny_font.render('开' if enabled else '关', True, self.colors['white'])
+            self.screen.blit(button_text, button_text.get_rect(center=button_rect.center))
+            self.panel_actions.append((button_rect, f'debug_toggle:{feature_id}'))
+            y += 32
+        return y + 4
 
     def render_facility_panel(self, game_engine, panel_rect):
         y = panel_rect.y + 56
@@ -175,61 +497,16 @@ class RendererSidebarMixin:
             y += 18
 
         brush = self._selected_terrain_brush_def()
-        height_rect = pygame.Rect(panel_rect.right - 138, y + 2, 124, 22)
-        height_active = self._is_numeric_input_active('terrain_brush', 'brush')
-        height_text = f"{brush.get('height_m', 0.0):.2f}"
-        if height_active and self.active_numeric_input is not None:
-            height_text = self.active_numeric_input['text']
-        label = self.tiny_font.render(f"笔刷高度: {brush.get('height_m', 0.0):.2f}m", True, self.colors['panel_text'])
+        label = self.tiny_font.render(f"笔刷高度: {brush.get('height_m', 0.0):.2f}m（顶部工具栏设置）", True, self.colors['panel_text'])
         self.screen.blit(label, (panel_rect.x + 16, y + 5))
-        self._draw_input_box(height_rect, height_text, height_active)
-        self.panel_actions.append((height_rect, 'height_input:terrain_brush:brush'))
-        y += 34
-
-        radius_text = self.tiny_font.render(f'笔刷半径: {self.terrain_brush_radius}', True, self.colors['panel_text'])
-        self.screen.blit(radius_text, (panel_rect.x + 16, y + 5))
-        minus_rect = pygame.Rect(panel_rect.x + 110, y + 1, 24, 22)
-        plus_rect = pygame.Rect(panel_rect.x + 140, y + 1, 24, 22)
-        pygame.draw.rect(self.screen, self.colors['toolbar_button'], minus_rect, border_radius=4)
-        pygame.draw.rect(self.screen, self.colors['toolbar_button'], plus_rect, border_radius=4)
-        self.screen.blit(self.tiny_font.render('-', True, self.colors['white']), (minus_rect.x + 8, minus_rect.y + 3))
-        self.screen.blit(self.tiny_font.render('+', True, self.colors['white']), (plus_rect.x + 7, plus_rect.y + 3))
-        self.panel_actions.append((minus_rect, 'terrain_brush_radius:-1'))
-        self.panel_actions.append((plus_rect, 'terrain_brush_radius:1'))
-        y += 34
-
-        layer_toggle_rect = pygame.Rect(panel_rect.x + 16, y, 104, 26)
-        alpha_minus_rect = pygame.Rect(panel_rect.x + 132, y + 1, 24, 24)
-        alpha_plus_rect = pygame.Rect(panel_rect.x + 194, y + 1, 24, 24)
-        alpha_value_rect = pygame.Rect(panel_rect.x + 162, y, 28, 26)
-        self._draw_mode_button(layer_toggle_rect, '高度图层', self.height_layer_enabled)
-        pygame.draw.rect(self.screen, self.colors['toolbar_button'], alpha_minus_rect, border_radius=4)
-        pygame.draw.rect(self.screen, self.colors['toolbar_button'], alpha_plus_rect, border_radius=4)
-        self.screen.blit(self.tiny_font.render('-', True, self.colors['white']), (alpha_minus_rect.x + 8, alpha_minus_rect.y + 3))
-        self.screen.blit(self.tiny_font.render('+', True, self.colors['white']), (alpha_plus_rect.x + 7, alpha_plus_rect.y + 3))
-        alpha_percent = int(round(self.height_layer_alpha / 255.0 * 100))
-        alpha_text = self.tiny_font.render(str(alpha_percent), True, self.colors['panel_text'])
-        self.screen.blit(alpha_text, alpha_text.get_rect(center=alpha_value_rect.center))
-        self.panel_actions.append((layer_toggle_rect, 'height_layer_toggle'))
-        self.panel_actions.append((alpha_minus_rect, 'height_layer_alpha:-16'))
-        self.panel_actions.append((alpha_plus_rect, 'height_layer_alpha:16'))
-        y += 34
-
-        step_text = self.tiny_font.render(f'分层步进: {self.height_layer_step_m:.2f}m', True, self.colors['panel_text'])
-        self.screen.blit(step_text, (panel_rect.x + 16, y + 4))
         y += 28
 
-        smooth_text = self.tiny_font.render('区域平滑: 先框选区域，再点 1-3', True, self.colors['panel_text'])
+        radius_text = self.tiny_font.render(f'笔刷半径: {self.terrain_brush_radius}（顶部工具栏设置）', True, self.colors['panel_text'])
+        self.screen.blit(radius_text, (panel_rect.x + 16, y + 5))
+        y += 28
+
+        smooth_text = self.tiny_font.render(f'区域平滑强度: {self.terrain_smooth_strength}（工具栏设置，0=关闭）', True, self.colors['panel_text'])
         self.screen.blit(smooth_text, (panel_rect.x + 16, y + 5))
-        smooth_1_rect = pygame.Rect(panel_rect.x + 178, y, 28, 24)
-        smooth_2_rect = pygame.Rect(panel_rect.x + 212, y, 28, 24)
-        smooth_3_rect = pygame.Rect(panel_rect.x + 246, y, 28, 24)
-        self._draw_mode_button(smooth_1_rect, '1', self.terrain_smooth_strength == 1)
-        self._draw_mode_button(smooth_2_rect, '2', self.terrain_smooth_strength == 2)
-        self._draw_mode_button(smooth_3_rect, '3', self.terrain_smooth_strength == 3)
-        self.panel_actions.append((smooth_1_rect, 'terrain_smooth_apply:1'))
-        self.panel_actions.append((smooth_2_rect, 'terrain_smooth_apply:2'))
-        self.panel_actions.append((smooth_3_rect, 'terrain_smooth_apply:3'))
         y += 32
 
         preview_height = 196
@@ -513,6 +790,23 @@ class RendererSidebarMixin:
         text = self.tiny_font.render(label, True, self.colors['panel_text'])
         self.screen.blit(text, (rect.x + 10, rect.y + 5))
 
+    def _draw_text_tooltip(self, clamp_rect, lines, anchor_pos):
+        if not lines or anchor_pos is None:
+            return
+        rendered_lines = [self.tiny_font.render(str(line), True, self.colors['white']) for line in lines]
+        width = max(line.get_width() for line in rendered_lines) + 20
+        height = 12 + sum(line.get_height() + 4 for line in rendered_lines)
+        tooltip = pygame.Surface((width, height), pygame.SRCALPHA)
+        tooltip.fill((18, 24, 30, 228))
+        pygame.draw.rect(tooltip, (245, 247, 250, 180), tooltip.get_rect(), 1, border_radius=8)
+        y = 8
+        for rendered in rendered_lines:
+            tooltip.blit(rendered, (10, y))
+            y += rendered.get_height() + 4
+        box_x = min(clamp_rect.right - width - 8, max(clamp_rect.x + 8, anchor_pos[0] + 16))
+        box_y = min(clamp_rect.bottom - height - 8, max(clamp_rect.y + 8, anchor_pos[1] + 16))
+        self.screen.blit(tooltip, (box_x, box_y))
+
     def _draw_input_box(self, rect, text, active):
         pygame.draw.rect(self.screen, self.colors['white'], rect, border_radius=4)
         border_color = self.colors['toolbar_button_active'] if active else self.colors['panel_border']
@@ -593,23 +887,7 @@ class RendererSidebarMixin:
 
         overlay = pygame.Surface((self.window_width, self.window_height), pygame.SRCALPHA)
         grid_width, grid_height = map_manager._grid_dimensions()
-
-        if self.height_layer_enabled:
-            for grid_y in range(grid_height):
-                for grid_x in range(grid_width):
-                    x1, y1, x2, y2 = map_manager._grid_cell_bounds(grid_x, grid_y)
-                    sx1, sy1 = self.world_to_screen(x1, y1)
-                    sx2, sy2 = self.world_to_screen(x2 + 1, y2 + 1)
-                    rect = pygame.Rect(sx1, sy1, max(1, sx2 - sx1), max(1, sy2 - sy1))
-                    if rect.right < self.viewport['map_x'] or rect.left > self.viewport['map_x'] + self.viewport['map_width']:
-                        continue
-                    if rect.bottom < self.viewport['map_y'] or rect.top > self.viewport['map_y'] + self.viewport['map_height']:
-                        continue
-                    height_m = map_manager._sample_grid_height(grid_x, grid_y)
-                    color = self._height_layer_color(height_m)
-                    outline = self._height_layer_outline_color(height_m)
-                    pygame.draw.rect(overlay, (*color, self.height_layer_alpha), rect)
-                    pygame.draw.rect(overlay, (*outline, min(255, self.height_layer_alpha + 36)), rect, 1)
+        self._blit_world_surface(self._get_world_terrain_grid_overlay_surface(map_manager), self._map_rect())
 
         if self.mouse_world is not None:
             brush = self._selected_terrain_brush_def()
@@ -625,8 +903,9 @@ class RendererSidebarMixin:
                     rect = pygame.Rect(sx1, sy1, max(1, sx2 - sx1), max(1, sy2 - sy1))
                     pygame.draw.rect(overlay, (*color, 72), rect)
                     pygame.draw.rect(overlay, (*self.colors['white'], 160), rect, 1)
-        if self.selected_terrain_cell_key:
-            grid_x, grid_y = map_manager._decode_terrain_cell_key(self.selected_terrain_cell_key)
+        selection_keys = self._terrain_selection_keys()
+        for key in sorted(selection_keys):
+            grid_x, grid_y = map_manager._decode_terrain_cell_key(key)
             x1, y1, x2, y2 = map_manager._grid_cell_bounds(grid_x, grid_y)
             sx1, sy1 = self.world_to_screen(x1, y1)
             sx2, sy2 = self.world_to_screen(x2 + 1, y2 + 1)

@@ -18,10 +18,47 @@ from entities.entity_manager import EntityManager
 from physics.physics_engine import PhysicsEngine
 from rules.rules_engine import RulesEngine
 from control.controller import Controller
-from state_machine.sentry_state_machine import SentryStateMachine
+# Try relative import if the file exists in the same project
+try:
+    from state_machine.sentry_state_machine import SentryStateMachine
+except ModuleNotFoundError:
+    # Fallback: try importing from current directory or adjust as needed
+    try:
+        from .sentry_state_machine import SentryStateMachine
+    except ModuleNotFoundError:
+        # As a last resort, define a dummy class to avoid runtime errors
+        class SentryStateMachine:
+            def update(self, entity):
+                pass
 
 
 class GameEngine:
+    MATCH_MODES = {'full', 'single_unit_test'}
+    SINGLE_UNIT_TEST_ENTITY_KEYS = ('robot_1', 'robot_2', 'robot_3', 'robot_4', 'robot_7')
+    DEBUG_FEATURE_DEFAULTS = {
+        'entity_update': True,
+        'controller': True,
+        'physics': True,
+        'auto_aim': True,
+        'rules': True,
+        'controller.hero.pathfinding': True,
+        'controller.hero.path_planning': True,
+        'controller.hero.avoidance': True,
+        'controller.infantry.pathfinding': True,
+        'controller.infantry.path_planning': True,
+        'controller.infantry.avoidance': True,
+        'controller.sentry.pathfinding': True,
+        'controller.sentry.path_planning': True,
+        'controller.sentry.avoidance': True,
+        'controller.engineer.pathfinding': True,
+        'controller.engineer.path_planning': True,
+        'controller.engineer.avoidance': True,
+        'state_machine.hero': True,
+        'state_machine.infantry': True,
+        'state_machine.sentry': True,
+        'state_machine.engineer': True,
+    }
+
     def __init__(self, config, config_manager=None, config_path='config.json'):
         self.config = config
         self.config_manager = config_manager
@@ -31,6 +68,10 @@ class GameEngine:
         self.fps = config.get('simulator', {}).get('fps', 50)
         self.dt = 1.0 / self.fps
         self.config['rules'] = RulesEngine.build_rule_config(self.config.get('rules', {}))
+        self._auto_aim_worker_threads = max(1, int(self.config.get('ai', {}).get('auto_aim_worker_threads', 1) or 1))
+        self._auto_aim_executor = None
+        self._auto_aim_future = None
+        self.debug_feature_toggles = self._load_debug_feature_toggles()
 
         # 初始化各系统
         self._create_systems()
@@ -59,9 +100,6 @@ class GameEngine:
         self._last_update_breakdown = None
         self._last_event_ms = 0.0
         self._perf_log_session_id = None
-        self._auto_aim_worker_threads = max(1, int(self.config.get('ai', {}).get('auto_aim_worker_threads', 1) or 1))
-        self._auto_aim_executor = None
-        self._auto_aim_future = None
         self._restart_auto_aim_executor(wait=False)
 
         # 游戏状态
@@ -72,9 +110,225 @@ class GameEngine:
         self.match_started = False
         self._game_over_announced = False
         self._configured_initial_positions = deepcopy(self.config.get('entities', {}).get('initial_positions', {}))
+        simulator_config = self.config.setdefault('simulator', {})
+        self.match_mode = str(simulator_config.get('match_mode', 'full') or 'full')
+        self.single_unit_test_team = str(simulator_config.get('single_unit_test_team', 'red') or 'red')
+        self.single_unit_test_entity_key = str(simulator_config.get('single_unit_test_entity_key', 'robot_1') or 'robot_1')
+        self._normalize_match_mode_settings()
+
+    def _load_debug_feature_toggles(self):
+        stored = self.config.get('simulator', {}).get('debug_feature_toggles', {})
+        toggles = dict(self.DEBUG_FEATURE_DEFAULTS)
+        if isinstance(stored, dict):
+            for key in toggles:
+                if key in stored:
+                    toggles[key] = bool(stored[key])
+            if 'sentry' in stored:
+                toggles['state_machine.sentry'] = bool(stored['sentry'])
+        self.config.setdefault('simulator', {})['debug_feature_toggles'] = dict(toggles)
+        return toggles
+
+    def feature_enabled(self, feature_id):
+        return bool(self.debug_feature_toggles.get(feature_id, True))
+
+    def set_feature_enabled(self, feature_id, enabled):
+        if feature_id not in self.DEBUG_FEATURE_DEFAULTS:
+            return False
+        value = bool(enabled)
+        self.debug_feature_toggles[feature_id] = value
+        self.config.setdefault('simulator', {}).setdefault('debug_feature_toggles', {})[feature_id] = value
+        if feature_id == 'auto_aim' and not value:
+            self._shutdown_auto_aim_worker(cancel_futures=True)
+        return True
+
+    def toggle_feature_enabled(self, feature_id):
+        new_value = not self.feature_enabled(feature_id)
+        if not self.set_feature_enabled(feature_id, new_value):
+            return None
+        return new_value
 
     def _restore_initial_positions_config(self):
         self.config.setdefault('entities', {})['initial_positions'] = deepcopy(self._configured_initial_positions)
+
+    def _normalize_match_mode_settings(self):
+        if self.match_mode not in self.MATCH_MODES:
+            self.match_mode = 'full'
+        if self.single_unit_test_team not in {'red', 'blue'}:
+            self.single_unit_test_team = 'red'
+        if self.single_unit_test_entity_key not in self.SINGLE_UNIT_TEST_ENTITY_KEYS:
+            self.single_unit_test_entity_key = 'robot_1'
+        simulator_config = self.config.setdefault('simulator', {})
+        simulator_config['match_mode'] = self.match_mode
+        simulator_config['single_unit_test_team'] = self.single_unit_test_team
+        simulator_config['single_unit_test_entity_key'] = self.single_unit_test_entity_key
+
+    def is_single_unit_test_mode(self):
+        return self.match_mode == 'single_unit_test'
+
+    def clear_all_forced_test_decisions(self):
+        for entity in getattr(self.entity_manager, 'entities', ()): 
+            entity.test_forced_decision_id = ''
+
+    def set_match_mode(self, mode):
+        normalized = str(mode or 'full')
+        if normalized not in self.MATCH_MODES:
+            normalized = 'full'
+        if normalized == self.match_mode:
+            return False
+        self.match_mode = normalized
+        if self.match_mode == 'full':
+            self.clear_all_forced_test_decisions()
+        self._normalize_match_mode_settings()
+        return True
+
+    def set_single_unit_test_focus(self, team=None, entity_key=None):
+        changed = False
+        if team is not None:
+            normalized_team = str(team or 'red')
+            if normalized_team in {'red', 'blue'} and normalized_team != self.single_unit_test_team:
+                self.single_unit_test_team = normalized_team
+                changed = True
+        if entity_key is not None:
+            normalized_key = str(entity_key or 'robot_1')
+            if normalized_key in self.SINGLE_UNIT_TEST_ENTITY_KEYS and normalized_key != self.single_unit_test_entity_key:
+                self.single_unit_test_entity_key = normalized_key
+                changed = True
+        if changed:
+            self.clear_all_forced_test_decisions()
+            self._normalize_match_mode_settings()
+        return changed
+
+    def get_single_unit_test_focus_id(self):
+        self._normalize_match_mode_settings()
+        return f'{self.single_unit_test_team}_{self.single_unit_test_entity_key}'
+
+    def get_single_unit_test_focus_entity(self):
+        return self.entity_manager.get_entity(self.get_single_unit_test_focus_id())
+
+    def get_single_unit_test_focus_entity_id(self):
+        entity = self.get_single_unit_test_focus_entity()
+        return getattr(entity, 'id', None)
+
+    def get_single_unit_test_controlled_entity_ids(self):
+        focus_entity_id = self.get_single_unit_test_focus_entity_id()
+        if not self.is_single_unit_test_mode() or not focus_entity_id:
+            return None
+        return {focus_entity_id}
+
+    def _clear_single_unit_test_inactive_entity_state(self):
+        if not self.is_single_unit_test_mode():
+            return
+        focus_entity_id = self.get_single_unit_test_focus_entity_id()
+        for entity in getattr(self.entity_manager, 'entities', ()):
+            if getattr(entity, 'type', None) not in {'robot', 'sentry'}:
+                continue
+            if entity.id == focus_entity_id:
+                continue
+            entity.ai_decision = '单兵种测试待机'
+            entity.ai_behavior_node = ''
+            entity.ai_decision_selected = ''
+            entity.ai_decision_weights = ()
+            entity.ai_decision_top3 = ()
+            entity.ai_navigation_target = None
+            entity.ai_movement_target = None
+            entity.ai_navigation_waypoint = None
+            entity.ai_path_preview = ()
+            entity.ai_navigation_subgoals = ()
+            entity.ai_navigation_path_valid = False
+            entity.ai_navigation_radius = 0.0
+            entity.target = None
+            entity.auto_aim_locked = False
+            entity.auto_aim_hit_probability = 0.0
+            entity.fire_control_state = 'idle'
+            entity.test_forced_decision_id = ''
+
+    def _freeze_non_focus_single_unit_entities(self):
+        if not self.is_single_unit_test_mode():
+            return
+        focus_entity_id = self.get_single_unit_test_focus_entity_id()
+        for entity in getattr(self.entity_manager, 'entities', ()): 
+            if getattr(entity, 'type', None) not in {'robot', 'sentry'}:
+                continue
+            if entity.id == focus_entity_id:
+                continue
+            entity.set_velocity(0.0, 0.0, 0.0)
+            entity.angular_velocity = 0.0
+
+    def get_single_unit_test_next_decision_specs(self):
+        focus_entity = self.get_single_unit_test_focus_entity()
+        role_key = self._role_key_for_entity(focus_entity)
+        if role_key is None:
+            return ()
+        controller = getattr(self, 'controller', None)
+        ai_controllers = getattr(controller, '_ai_controllers', ()) if controller is not None else ()
+        if not ai_controllers:
+            return ()
+        specs = list(ai_controllers[0].role_decision_specs.get(role_key, ()))
+        if not specs:
+            return ()
+        anchor_id = str(getattr(focus_entity, 'test_forced_decision_id', '') or getattr(focus_entity, 'ai_decision_selected', '') or '')
+        anchor_index = -1
+        for index, spec in enumerate(specs):
+            if spec.get('id') == anchor_id:
+                anchor_index = index
+                break
+        if anchor_index < 0:
+            candidate_specs = specs[:3]
+        else:
+            candidate_specs = specs[anchor_index + 1:anchor_index + 4]
+            if len(candidate_specs) < 3:
+                candidate_specs.extend(specs[:max(0, 3 - len(candidate_specs))])
+        return tuple({'id': spec.get('id', ''), 'label': spec.get('label', spec.get('id', ''))} for spec in candidate_specs if spec.get('id'))
+
+    def _role_key_for_entity(self, entity):
+        if entity is None:
+            return None
+        if getattr(entity, 'type', None) == 'sentry':
+            return 'sentry'
+        return {
+            '英雄': 'hero',
+            '工程': 'engineer',
+            '步兵': 'infantry',
+        }.get(getattr(entity, 'robot_type', ''), 'infantry')
+
+    def get_single_unit_test_decision_specs(self):
+        entity = self.get_single_unit_test_focus_entity()
+        role_key = self._role_key_for_entity(entity)
+        if role_key is None:
+            return ()
+        controller = getattr(self, 'controller', None)
+        ai_controllers = getattr(controller, '_ai_controllers', ()) if controller is not None else ()
+        if not ai_controllers:
+            return ()
+        specs = ai_controllers[0].role_decision_specs.get(role_key, ())
+        return tuple({'id': spec.get('id', ''), 'label': spec.get('label', spec.get('id', ''))} for spec in specs if spec.get('id'))
+
+    def set_single_unit_test_decision(self, decision_id=''):
+        focus_entity = self.get_single_unit_test_focus_entity()
+        if focus_entity is None:
+            return False
+        normalized = str(decision_id or '').strip()
+        valid_ids = {spec['id'] for spec in self.get_single_unit_test_decision_specs()}
+        if normalized and normalized not in valid_ids:
+            return False
+        self.clear_all_forced_test_decisions()
+        focus_entity.test_forced_decision_id = normalized
+        return True
+
+    def set_structure_health(self, team, structure_type, health_value):
+        entity = self.entity_manager.get_entity(f'{team}_{structure_type}')
+        if entity is None:
+            return False
+        clamped = max(0.0, min(float(getattr(entity, 'max_health', 0.0)), float(health_value)))
+        entity.health = clamped
+        entity.state = 'idle' if clamped > 0.0 else 'destroyed'
+        return True
+
+    def adjust_structure_health(self, team, structure_type, delta):
+        entity = self.entity_manager.get_entity(f'{team}_{structure_type}')
+        if entity is None:
+            return False
+        return self.set_structure_health(team, structure_type, float(entity.health) + float(delta))
 
     def _create_systems(self):
         old_controller = getattr(self, 'controller', None)
@@ -168,6 +422,8 @@ class GameEngine:
         """保存设施、站位和规则到本地 setting 文件。"""
         self.config['map']['facilities'] = self.map_manager.export_facilities_config()
         self.config['map']['terrain_grid'] = self.map_manager.export_terrain_grid_config()
+        self.config['map']['function_grid'] = self.map_manager.export_function_grid_config()
+        self.config['map']['runtime_grid'] = self.map_manager.export_runtime_grid_config()
         self.config['entities']['initial_positions'] = self.entity_manager.export_initial_positions()
         self._configured_initial_positions = deepcopy(self.config['entities']['initial_positions'])
         self.config['rules'] = RulesEngine.build_rule_config(self.config.get('rules', {}))
@@ -349,49 +605,63 @@ class GameEngine:
         self.game_time += self.dt
         self._frame_index += 1
         self.rules_engine.start_frame(self._frame_index)
+
+        self._freeze_non_focus_single_unit_entities()
+        self._clear_single_unit_test_inactive_entity_state()
         
         # 更新实体状态
         entity_start = time.perf_counter() if measure_perf else 0.0
-        self.entity_manager.update(self.dt)
+        if self.feature_enabled('entity_update'):
+            self.entity_manager.update(self.dt)
         entity_end = time.perf_counter() if measure_perf else 0.0
         
         # 控制处理
         controller_start = time.perf_counter() if measure_perf else 0.0
-        self.controller.update(
-            self.entity_manager.entities,
-            self.map_manager,
-            self.rules_engine,
-            self.game_time,
-            self.game_duration,
-        )
+        if self.feature_enabled('controller'):
+            self.controller.update(
+                self.entity_manager.entities,
+                self.map_manager,
+                self.rules_engine,
+                self.game_time,
+                self.game_duration,
+                controlled_entity_ids=self.get_single_unit_test_controlled_entity_ids(),
+            )
+            self._freeze_non_focus_single_unit_entities()
+            self._clear_single_unit_test_inactive_entity_state()
         controller_end = time.perf_counter() if measure_perf else 0.0
 
         # 物理模拟
         physics_start = time.perf_counter() if measure_perf else 0.0
-        self.physics_engine.update(self.entity_manager.entities, self.map_manager, self.rules_engine, dt=self.dt)
+        if self.feature_enabled('physics'):
+            self.physics_engine.update(self.entity_manager.entities, self.map_manager, self.rules_engine, dt=self.dt)
         physics_end = time.perf_counter() if measure_perf else 0.0
 
         # 通用自瞄：除工程外的战斗单位自动锁定最近敌人
         auto_aim_start = time.perf_counter() if measure_perf else 0.0
-        self._update_general_auto_aim()
+        if self.feature_enabled('auto_aim'):
+            self._update_general_auto_aim()
+        else:
+            self._shutdown_auto_aim_worker(cancel_futures=True)
         auto_aim_end = time.perf_counter() if measure_perf else 0.0
 
         # 规则检查
         rules_start = time.perf_counter() if measure_perf else 0.0
-        self.rules_engine.update(
-            self.entity_manager.entities,
-            map_manager=self.map_manager,
-            dt=self.dt,
-            game_time=self.game_time,
-            game_duration=self.game_duration,
-        )
+        if self.feature_enabled('rules'):
+            self.rules_engine.update(
+                self.entity_manager.entities,
+                map_manager=self.map_manager,
+                dt=self.dt,
+                game_time=self.game_time,
+                game_duration=self.game_duration,
+            )
         rules_end = time.perf_counter() if measure_perf else 0.0
         
         # 更新哨兵状态机
         sentry_start = time.perf_counter() if measure_perf else 0.0
-        for entity in self.entity_manager.entities:
-            if entity.type == 'sentry':
-                self.sentry_state_machine.update(entity)
+        if self.feature_enabled('state_machine.sentry'):
+            for entity in self.entity_manager.entities:
+                if entity.type == 'sentry':
+                    self.sentry_state_machine.update(entity)
         sentry_end = time.perf_counter() if measure_perf else 0.0
 
         self._last_update_breakdown = {
@@ -442,11 +712,19 @@ class GameEngine:
             return
 
         track_speed = float(self.rules_engine.rules.get('shooting', {}).get('auto_aim_track_speed_deg_per_sec', 180.0))
+        controlled_ids = self.get_single_unit_test_controlled_entity_ids()
 
         for entity in self.entity_manager.entities:
             if not entity.is_alive():
                 continue
             if entity.type not in {'robot', 'sentry'}:
+                continue
+            if controlled_ids is not None and entity.id not in controlled_ids:
+                entity.target = None
+                entity.auto_aim_locked = False
+                entity.auto_aim_hit_probability = 0.0
+                entity.fire_control_state = 'idle'
+                self._clear_auto_aim_lock(entity)
                 continue
             if getattr(entity, 'respawn_weak_active', False):
                 entity.target = None

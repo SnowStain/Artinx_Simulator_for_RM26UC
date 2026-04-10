@@ -10,12 +10,17 @@ class ConfigManager:
     def __init__(self):
         self.config = {}
 
+    def _map_folder_preset_path(self, preset_name, config_path=None):
+        name = os.path.splitext(str(preset_name or '').strip())[0]
+        return os.path.join(self._workspace_root(config_path), 'maps', name, 'map.json')
+
     def _workspace_root(self, config_path=None):
         path = config_path or self.config.get('_config_path', 'config.json')
         return os.path.dirname(os.path.abspath(path))
     
     def _read_json(self, config_path):
-        with open(config_path, 'r', encoding='utf-8') as f:
+        # Use utf-8-sig so files saved with BOM can still be parsed.
+        with open(config_path, 'r', encoding='utf-8-sig') as f:
             return json.load(f)
 
     def _deep_merge(self, base, override):
@@ -38,9 +43,47 @@ class ConfigManager:
             return None
         if os.path.isabs(preset_ref):
             return preset_ref
+        workspace_root = self._workspace_root(config_path)
+        normalized_ref = preset_ref.replace('\\', '/').strip('/')
+        if '/' in normalized_ref:
+            if not normalized_ref.lower().endswith('.json'):
+                normalized_ref = f'{normalized_ref}.json'
+            return os.path.join(workspace_root, normalized_ref)
+        folder_candidate = os.path.join(workspace_root, 'maps', preset_ref, 'map.json')
+        if os.path.exists(folder_candidate):
+            return folder_candidate
         if not preset_ref.lower().endswith('.json'):
             preset_ref = f'{preset_ref}.json'
-        return os.path.join(self._workspace_root(config_path), 'map_presets', preset_ref)
+        legacy_candidate = os.path.join(workspace_root, 'map_presets', preset_ref)
+        if os.path.exists(legacy_candidate):
+            return legacy_candidate
+        return self._map_folder_preset_path(preset_ref, config_path)
+
+    def list_map_presets(self, config_path=None):
+        workspace_root = self._workspace_root(config_path)
+        discovered = []
+        seen = set()
+
+        maps_dir = os.path.join(workspace_root, 'maps')
+        if os.path.isdir(maps_dir):
+            for entry in sorted(os.listdir(maps_dir)):
+                candidate = os.path.join(maps_dir, entry, 'map.json')
+                if not os.path.isfile(candidate):
+                    continue
+                if entry not in seen:
+                    discovered.append(entry)
+                    seen.add(entry)
+
+        legacy_dir = os.path.join(workspace_root, 'map_presets')
+        if os.path.isdir(legacy_dir):
+            for entry in sorted(os.listdir(legacy_dir)):
+                if not entry.lower().endswith('.json'):
+                    continue
+                name = os.path.splitext(entry)[0]
+                if name not in seen:
+                    discovered.append(name)
+                    seen.add(name)
+        return discovered
 
     def load_map_preset(self, preset_name, config_path=None):
         preset_path = self._resolve_map_preset_path(preset_name, config_path)
@@ -53,7 +96,9 @@ class ConfigManager:
             preset_map = payload
         if not isinstance(preset_map, dict):
             return None
-        return deepcopy(preset_map)
+        preset_map = deepcopy(preset_map)
+        preset_map['_preset_path'] = preset_path
+        return preset_map
 
     def _resolve_behavior_preset_path(self, preset_name, config_path=None):
         if not preset_name:
@@ -86,6 +131,8 @@ class ConfigManager:
         merged = deepcopy(config)
         merged['map'] = self._deep_merge(merged.get('map', {}), preset_map)
         merged['map']['preset'] = preset_name
+        if preset_map.get('_preset_path'):
+            merged['map']['_preset_path'] = preset_map.get('_preset_path')
         return merged
 
     def load_config(self, config_path, settings_path='settings.json'):
@@ -147,12 +194,16 @@ class ConfigManager:
         if preset_name:
             map_payload['preset'] = preset_name
         else:
+            map_payload['coordinate_space'] = map_config.get('coordinate_space', 'world')
             map_payload['facilities'] = deepcopy(map_config.get('facilities', []))
             map_payload['terrain_grid'] = deepcopy(map_config.get('terrain_grid', {}))
+            map_payload['function_grid'] = deepcopy(map_config.get('function_grid', {}))
+            map_payload['runtime_grid'] = deepcopy(map_config.get('runtime_grid', {}))
         return {
             'simulator': {
                 'show_facilities': config.get('simulator', {}).get('show_facilities', True),
                 'show_aim_fov': config.get('simulator', {}).get('show_aim_fov', True),
+                'show_entities': config.get('simulator', {}).get('show_entities', True),
                 'enable_entity_movement': config.get('simulator', {}).get('enable_entity_movement', False),
                 'show_perf_overlay': config.get('simulator', {}).get('show_perf_overlay', True),
                 'enable_perf_logging': config.get('simulator', {}).get('enable_perf_logging', True),
@@ -160,9 +211,15 @@ class ConfigManager:
                 'enable_perf_file_logging': config.get('simulator', {}).get('enable_perf_file_logging', True),
                 'perf_sample_window': config.get('simulator', {}).get('perf_sample_window', 20000),
                 'perf_log_interval_sec': config.get('simulator', {}).get('perf_log_interval_sec', 5.0),
+                'debug_feature_toggles': deepcopy(config.get('simulator', {}).get('debug_feature_toggles', {})),
             },
             'ai': {
                 'behavior_preset': config.get('ai', {}).get('behavior_preset', ''),
+                'controller_worker_threads': config.get('ai', {}).get('controller_worker_threads', 2),
+                'controller_shards_per_frame': config.get('ai', {}).get('controller_shards_per_frame', 1),
+                'auto_aim_worker_threads': config.get('ai', {}).get('auto_aim_worker_threads', 1),
+                'path_replans_per_update': config.get('ai', {}).get('path_replans_per_update', 1),
+                'pathfinder_max_candidates': config.get('ai', {}).get('pathfinder_max_candidates', 2),
             },
             'map': map_payload,
             'entities': {
@@ -185,23 +242,32 @@ class ConfigManager:
                 'unit': map_config.get('unit', 'px'),
                 'width': map_config.get('width'),
                 'height': map_config.get('height'),
+                'source_width': map_config.get('source_width', map_config.get('width')),
+                'source_height': map_config.get('source_height', map_config.get('height')),
+                'strict_scale': bool(map_config.get('strict_scale', True)),
+                'coordinate_space': map_config.get('coordinate_space', 'world'),
                 'field_length_m': map_config.get('field_length_m'),
                 'field_width_m': map_config.get('field_width_m'),
                 'facilities': deepcopy(map_config.get('facilities', [])),
                 'terrain_grid': deepcopy(map_config.get('terrain_grid', {})),
+                'function_grid': deepcopy(map_config.get('function_grid', {})),
+                'runtime_grid': deepcopy(map_config.get('runtime_grid', {})),
             },
         }
         return payload
 
-    def save_map_preset(self, preset_name, config=None, config_path=None):
+    def save_map_preset(self, preset_name, config=None, config_path=None, map_manager=None):
         name = str(preset_name or '').strip()
         if not name:
             raise ValueError('preset_name is required')
-        preset_path = self._resolve_map_preset_path(name, config_path)
+        preset_path = self._map_folder_preset_path(name, config_path)
         directory = os.path.dirname(preset_path)
         if directory:
             os.makedirs(directory, exist_ok=True)
         payload = self.build_map_preset_payload(config or self.config, preset_name=name)
+        if map_manager is not None:
+            runtime_grid = map_manager.persist_runtime_grid_bundle(name, preset_path=preset_path)
+            payload.setdefault('map', {})['runtime_grid'] = runtime_grid
         with open(preset_path, 'w', encoding='utf-8') as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         return preset_path

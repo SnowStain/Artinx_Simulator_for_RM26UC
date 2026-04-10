@@ -78,6 +78,7 @@ class Entity:
         self.ai_decision_weights = ()
         self.ai_decision_top3 = ()
         self.ai_decision_selected = ''
+        self.test_forced_decision_id = ''
         self.search_angular_speed = 36.0
         self.fire_rate_hz = 8.0
         self.ammo_per_shot = 1
@@ -111,6 +112,8 @@ class Entity:
         self.trapezoid_highground_active = False
         self.terrain_buff_timer = 0.0
         self.fly_slope_airborne_timer = 0.0
+        self.fly_slope_airborne_height_m = 0.0
+        self.fly_slope_immunity_armed = False
         self.supply_cooldown = 0.0
         self.supply_ammo_claimed = 0
         self.exchange_cooldown = 0.0
@@ -139,11 +142,14 @@ class Entity:
         self.hero_deployment_charge = 0.0
         self.hero_deployment_active = False
         self.hero_deployment_zone_active = False
+        self.hero_deployment_forced_off = False
         self.hero_deployment_state = 'inactive'
         self.hero_deployment_target_id = None
         self.hero_deployment_hit_probability = 0.0
         self.hero_deployment_hit_probability_target_id = None
         self.hero_deployment_hit_probability_updated_at = -1e9
+        self.hero_structure_lob_active = False
+        self.hero_structure_lob_target_type = None
         self.carried_minerals = 0
         self.carried_mineral_type = None
         self.mined_minerals_total = 0

@@ -723,9 +723,9 @@
         "push_base",
         "hero_opening_highground",
         "highground_assault",
-        "swarm_attack",
         "hero_lob_outpost",
-        "hero_lob_base"
+        "hero_lob_base",
+        "swarm_attack"
       ]
     },
     "sentry": {
