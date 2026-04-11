@@ -1,6 +1,6 @@
 # Robot Venue Map Asset Build Report
 
-- 执行时间: 2026-04-11T04:10:13
+- 执行时间: 2026-04-12T00:53:42
 - 输入文件: E:\Artinx\260111new\sentryBehaviorSimulator\maps\blankCanvas\map.json
 - 输入 schema: project_map_schema
 - 场地尺寸: 28.0m x 15.0m
@@ -19,8 +19,8 @@
 - 最终状态: passed
 - 主模型面数: 1096
 - 主模型大小: 64128 bytes
-- GLB 加载耗时: 4.423 ms
-- 构建峰值内存: 13.224 MB
+- GLB 加载耗时: 4.596 ms
+- 构建峰值内存: 2.661 MB
 
 ## 异常与告警
 

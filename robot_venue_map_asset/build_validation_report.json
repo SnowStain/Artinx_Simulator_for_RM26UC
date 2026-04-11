@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-04-11T04:10:13",
+  "generated_at": "2026-04-12T00:53:42",
   "status": "passed",
   "checks": [
     {
@@ -80,7 +80,7 @@
     }
   ],
   "metrics": {
-    "glb_load_ms": 4.423,
+    "glb_load_ms": 4.596,
     "moderngl_vertex_count": 642,
     "scene_size_xyz_m": [
       28.0,
@@ -94,9 +94,9 @@
       "venue_map_moderngl_data.npz": 15339
     },
     "face_count": 1096,
-    "elapsed_sec": 2.342,
-    "peak_memory_mb": 13.224,
-    "current_memory_mb": 12.656
+    "elapsed_sec": 2.283,
+    "peak_memory_mb": 2.661,
+    "current_memory_mb": 2.32
   },
   "warnings": [
     {

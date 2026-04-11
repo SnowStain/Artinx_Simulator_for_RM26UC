@@ -33,10 +33,10 @@ from rendering.renderer import Renderer
 
 def main():
     config_manager = ConfigManager()
-    config = config_manager.load_config('config.json', 'settings.json')
+    config = config_manager.load_config('config.json')
     config['_config_path'] = 'config.json'
-    config['_settings_path'] = 'settings.json'
     config.setdefault('simulator', {})['standalone_3d_program'] = True
+    config['simulator'].setdefault('terrain_scene_backend', 'pyglet_moderngl')
     config['simulator'].setdefault('player_projectile_ricochet_enabled', True)
 
     game_engine = GameEngine(config, config_manager=config_manager, config_path='config.json')

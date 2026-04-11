@@ -14,9 +14,31 @@ except Exception as exc:
     moderngl = None
     MODERNGL_IMPORT_ERROR = str(exc)
 
+try:
+    import pyglet
+    pyglet.options['shadow_window'] = False
+    PYGLET_IMPORT_ERROR = None
+except Exception as exc:
+    pyglet = None
+    PYGLET_IMPORT_ERROR = str(exc)
+
 
 def create_terrain_scene_backend(name):
     selected = str(name or 'auto').strip().lower()
+    if selected in {'auto', 'pyglet', 'pyglet_moderngl', 'pyglet-moderngl'} and moderngl is not None and pyglet is not None:
+        try:
+            return PygletModernGLTerrainSceneBackend()
+        except Exception as exc:
+            if selected in {'pyglet', 'pyglet_moderngl', 'pyglet-moderngl'}:
+                raise
+            reason = f'pyglet+moderngl init failed: {exc}'
+            return SoftwareTerrainSceneBackend(reason=reason, requested=selected)
+    if selected in {'pyglet', 'pyglet_moderngl', 'pyglet-moderngl'}:
+        if pyglet is None:
+            reason = f'pyglet unavailable: {PYGLET_IMPORT_ERROR or "import failed"}'
+        else:
+            reason = f'moderngl unavailable: {MODERNGL_IMPORT_ERROR or "import failed"}'
+        return SoftwareTerrainSceneBackend(reason=reason, requested=selected)
     if selected in {'auto', 'moderngl'} and moderngl is not None:
         try:
             return ModernGLTerrainSceneBackend()
@@ -31,8 +53,17 @@ def create_terrain_scene_backend(name):
     return SoftwareTerrainSceneBackend(requested=selected)
 
 
+def _terrain_scene_base_cell_size(map_manager):
+    getter = getattr(map_manager, 'terrain_scene_sample_cell_size', None)
+    if callable(getter):
+        return max(1.0, float(getter()))
+    return max(1.0, float(getattr(map_manager, 'terrain_grid_cell_size', 1.0)))
+
+
 def _sample_terrain_scene_data(renderer, map_manager, map_rgb):
-    full_grid_width, full_grid_height = map_manager._grid_dimensions()
+    base_cell_size = _terrain_scene_base_cell_size(map_manager)
+    full_grid_width = max(1, int(math.ceil(float(map_manager.map_width) / base_cell_size)))
+    full_grid_height = max(1, int(math.ceil(float(map_manager.map_height) / base_cell_size)))
     effective_max_cells_getter = getattr(renderer, '_effective_terrain_scene_max_cells', None)
     if callable(effective_max_cells_getter):
         max_scene_cells = max(6000, int(effective_max_cells_getter()))
@@ -41,7 +72,7 @@ def _sample_terrain_scene_data(renderer, map_manager, map_rgb):
     scene_step = max(1, int(math.ceil(math.sqrt(max((full_grid_width * full_grid_height) / max(max_scene_cells, 1), 1.0)))))
     cache_key = (
         int(getattr(map_manager, 'raster_version', 0)),
-        float(map_manager.terrain_grid_cell_size),
+        float(base_cell_size),
         int(map_manager.map_width),
         int(map_manager.map_height),
         int(max_scene_cells),
@@ -60,7 +91,6 @@ def _sample_terrain_scene_data(renderer, map_manager, map_rgb):
     terrain_type_map = layers['terrain_type_map']
     grid_width = max(1, int(math.ceil(full_grid_width / scene_step)))
     grid_height = max(1, int(math.ceil(full_grid_height / scene_step)))
-    base_cell_size = max(float(map_manager.terrain_grid_cell_size), 1.0)
     cell_size = base_cell_size * scene_step
     world_center_xs = np.minimum(
         map_manager.map_width - 1,
@@ -137,7 +167,7 @@ def _terrain_scene_focus_grid(renderer, map_manager, grid_width, grid_height, sc
     focus_world = getattr(renderer, 'terrain_scene_focus_world', None)
     if focus_world is None:
         return (grid_width - 1) / 2.0, (grid_height - 1) / 2.0
-    sampled_cell_size = max(float(map_manager.terrain_grid_cell_size) * max(1, int(scene_step)), 1e-6)
+    sampled_cell_size = max(_terrain_scene_base_cell_size(map_manager) * max(1, int(scene_step)), 1e-6)
     focus_grid_x = int(math.floor(float(focus_world[0]) / sampled_cell_size))
     focus_grid_y = int(math.floor(float(focus_world[1]) / sampled_cell_size))
     focus_grid_x = max(0, min(grid_width - 1, focus_grid_x))
@@ -387,11 +417,13 @@ class SoftwareTerrainSceneBackend:
 
 class ModernGLTerrainSceneBackend:
     name = 'moderngl'
+    default_status_label = 'moderngl'
 
     def __init__(self):
         if moderngl is None:
             raise RuntimeError('ModernGL is not available')
-        self.ctx = moderngl.create_standalone_context()
+        self._pyglet_window = None
+        self.ctx = self._create_context()
         self.program = self.ctx.program(
             vertex_shader='''
                 #version 330
@@ -421,13 +453,20 @@ class ModernGLTerrainSceneBackend:
         self.vao = None
         self.geometry_key = None
         self.scene_bounds = (1.0, 1.0, 1.0, 1)
-        self.status_label = 'moderngl'
+        self.status_label = self.default_status_label
+
+    def _create_context(self):
+        return moderngl.create_standalone_context()
+
+    def _make_context_current(self):
+        return None
 
     def render_scene(self, renderer, game_engine, size, map_rgb=None):
         width, height = int(size[0]), int(size[1])
         if width <= 0 or height <= 0:
             return pygame.Surface((1, 1))
 
+        self._make_context_current()
         self._ensure_framebuffer((width, height))
         self._ensure_geometry(renderer, game_engine.map_manager, map_rgb)
 
@@ -530,3 +569,38 @@ class ModernGLTerrainSceneBackend:
 
     def _look_at(self, eye, target, up):
         return _terrain_scene_look_at(eye, target, up)
+
+
+class PygletModernGLTerrainSceneBackend(ModernGLTerrainSceneBackend):
+    name = 'pyglet_moderngl'
+    default_status_label = 'pyglet+moderngl'
+
+    def _create_context(self):
+        if pyglet is None:
+            raise RuntimeError('pyglet is not available')
+        config_candidates = (
+            {'double_buffer': False, 'major_version': 3, 'minor_version': 3, 'depth_size': 24},
+            {'double_buffer': False, 'depth_size': 24},
+            {},
+        )
+        last_error = None
+        for config_kwargs in config_candidates:
+            window = None
+            try:
+                gl_config = pyglet.gl.Config(**config_kwargs)
+                window = pyglet.window.Window(width=16, height=16, visible=False, config=gl_config, caption='RM26 ModernGL Backend')
+                window.switch_to()
+                ctx = moderngl.create_context(require=330)
+                self._pyglet_window = window
+                return ctx
+            except Exception as exc:
+                last_error = exc
+                try:
+                    window.close()
+                except Exception:
+                    pass
+        raise RuntimeError(f'pyglet context init failed: {last_error}')
+
+    def _make_context_current(self):
+        if self._pyglet_window is not None:
+            self._pyglet_window.switch_to()

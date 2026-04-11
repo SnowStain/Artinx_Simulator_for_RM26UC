@@ -388,22 +388,22 @@ N 边图说明：
 ### 3. 地图预设与设置文件
 
 - config.json 提供基础配置。
-- settings.json 保存本地覆盖配置。
+- CommonSetting.json 保存本地常用参数和覆盖配置。
 - map_presets 目录保存地图预设。
-- 当前配置管理器支持仅在 settings 中保存 map.preset 引用，再从 map_presets 反向装配设施与 terrain_grid。
+- 当前配置管理器支持仅在 CommonSetting 中保存 map.preset 引用，再从 map_presets 反向装配设施与 terrain_grid。
 
 ### 4. 存档与性能日志
 
 - F5 保存当前对局。
 - F9 载入对局。
 - P 暂停/继续。
-- perf overlay 和 perf logging 可在 settings.json 中启用。
+- perf overlay 和 perf logging 可在 CommonSetting.json 中启用。
 - 运行时会把性能日志保存到 perf_logs 或 saves/perf_logs。
 
 ## 重要实现约束
 
-- settings.json 的本地覆盖优先级高于 config.json；如果运行结果和代码默认值不一致，先检查 settings.json。
-- 当前项目里很多 AI/规则调参结果都以 settings.json 为准。
+- CommonSetting.json 的本地覆盖优先级高于 config.json；如果运行结果和代码默认值不一致，先检查 CommonSetting.json。
+- 当前项目里很多 AI/规则调参结果都以 CommonSetting.json 为准；若该文件不存在，会兼容读取旧的 settings.json，并在下次保存时迁移到 CommonSetting.json。
 - 当前 basicMap 是活动地图预设时，编辑器和主程序都会以它为起点装配场地。
 
 ## 项目结构速览

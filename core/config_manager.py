@@ -7,8 +7,33 @@ from copy import deepcopy
 from datetime import datetime
 
 class ConfigManager:
+    DEFAULT_COMMON_SETTINGS_NAME = 'CommonSetting.json'
+    LEGACY_SETTINGS_NAME = 'settings.json'
+
     def __init__(self):
         self.config = {}
+
+    def _normalize_settings_path(self, settings_path, config_path=None):
+        if not settings_path:
+            return None
+        if os.path.isabs(settings_path):
+            return settings_path
+        return os.path.join(self._workspace_root(config_path), str(settings_path))
+
+    def default_settings_path(self, config_path=None):
+        return os.path.join(self._workspace_root(config_path), self.DEFAULT_COMMON_SETTINGS_NAME)
+
+    def resolve_settings_path(self, config_path=None, settings_path=None):
+        explicit_path = self._normalize_settings_path(settings_path, config_path)
+        if explicit_path:
+            return explicit_path
+        common_path = self.default_settings_path(config_path)
+        if os.path.exists(common_path):
+            return common_path
+        legacy_path = self._normalize_settings_path(self.LEGACY_SETTINGS_NAME, config_path)
+        if legacy_path and os.path.exists(legacy_path):
+            return legacy_path
+        return common_path
 
     def _map_folder_preset_path(self, preset_name, config_path=None):
         name = os.path.splitext(str(preset_name or '').strip())[0]
@@ -135,7 +160,7 @@ class ConfigManager:
             merged['map']['_preset_path'] = preset_map.get('_preset_path')
         return merged
 
-    def load_config(self, config_path, settings_path='settings.json'):
+    def load_config(self, config_path, settings_path=None):
         """加载基础配置，并叠加本地 setting 覆盖。"""
         if not os.path.exists(config_path):
             print(f"配置文件 {config_path} 不存在")
@@ -143,8 +168,10 @@ class ConfigManager:
             return self.config
 
         base_config = self._read_json(config_path)
-        if settings_path and os.path.exists(settings_path):
-            settings_config = self._read_json(settings_path)
+        resolved_settings_path = self.resolve_settings_path(config_path, settings_path)
+        save_settings_path = self._normalize_settings_path(settings_path, config_path) if settings_path else self.default_settings_path(config_path)
+        if resolved_settings_path and os.path.exists(resolved_settings_path):
+            settings_config = self._read_json(resolved_settings_path)
             self.config = self._deep_merge(base_config, settings_config)
         else:
             self.config = base_config
@@ -152,7 +179,7 @@ class ConfigManager:
         self.config = self._apply_map_preset(self.config, config_path)
 
         self.config['_config_path'] = config_path
-        self.config['_settings_path'] = settings_path
+        self.config['_settings_path'] = save_settings_path
         return self.config
     
     def get(self, key_path, default=None):
@@ -200,37 +227,11 @@ class ConfigManager:
             map_payload['function_grid'] = deepcopy(map_config.get('function_grid', {}))
             map_payload['runtime_grid'] = deepcopy(map_config.get('runtime_grid', {}))
         return {
-            'simulator': {
-                'show_facilities': config.get('simulator', {}).get('show_facilities', True),
-                'show_aim_fov': config.get('simulator', {}).get('show_aim_fov', True),
-                'show_entities': config.get('simulator', {}).get('show_entities', True),
-                'enable_entity_movement': config.get('simulator', {}).get('enable_entity_movement', False),
-                'player_look_sensitivity_deg': config.get('simulator', {}).get('player_look_sensitivity_deg', 0.18),
-                'player_pitch_sensitivity_deg': config.get('simulator', {}).get('player_pitch_sensitivity_deg', 0.12),
-                'show_perf_overlay': config.get('simulator', {}).get('show_perf_overlay', True),
-                'enable_perf_logging': config.get('simulator', {}).get('enable_perf_logging', True),
-                'enable_perf_breakdown': config.get('simulator', {}).get('enable_perf_breakdown', True),
-                'enable_perf_file_logging': config.get('simulator', {}).get('enable_perf_file_logging', True),
-                'perf_sample_window': config.get('simulator', {}).get('perf_sample_window', 20000),
-                'perf_log_interval_sec': config.get('simulator', {}).get('perf_log_interval_sec', 5.0),
-                'debug_feature_toggles': deepcopy(config.get('simulator', {}).get('debug_feature_toggles', {})),
-            },
-            'ai': {
-                'behavior_preset': config.get('ai', {}).get('behavior_preset', ''),
-                'controller_worker_threads': config.get('ai', {}).get('controller_worker_threads', 2),
-                'controller_shards_per_frame': config.get('ai', {}).get('controller_shards_per_frame', 1),
-                'controller_dispatch_interval_sec': config.get('ai', {}).get('controller_dispatch_interval_sec', 0.08),
-                'controller_time_budget_ms': config.get('ai', {}).get('controller_time_budget_ms', 12.0),
-                'player_control_dispatch_interval_sec': config.get('ai', {}).get('player_control_dispatch_interval_sec', 0.2),
-                'auto_aim_worker_threads': config.get('ai', {}).get('auto_aim_worker_threads', 1),
-                'path_replans_per_update': config.get('ai', {}).get('path_replans_per_update', 1),
-                'pathfinder_max_candidates': config.get('ai', {}).get('pathfinder_max_candidates', 2),
-            },
+            'simulator': deepcopy(config.get('simulator', {})),
+            'ai': deepcopy(config.get('ai', {})),
             'map': map_payload,
-            'entities': {
-                'initial_positions': deepcopy(config.get('entities', {}).get('initial_positions', {})),
-                'robot_levels': deepcopy(config.get('entities', {}).get('robot_levels', {})),
-            },
+            'physics': deepcopy(config.get('physics', {})),
+            'entities': deepcopy(config.get('entities', {})),
             'rules': deepcopy(config.get('rules', {})),
         }
 
@@ -282,6 +283,8 @@ class ConfigManager:
         if not name:
             raise ValueError('preset_name is required')
         preset_path = self._resolve_behavior_preset_path(name, config_path)
+        if not preset_path:
+            raise ValueError('unable to resolve behavior preset path')
         directory = os.path.dirname(preset_path)
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -291,7 +294,7 @@ class ConfigManager:
 
     def save_settings(self, settings_path=None, payload=None):
         """保存本地 setting 文件。"""
-        path = settings_path or self.config.get('_settings_path', 'settings.json')
+        path = settings_path or self.config.get('_settings_path') or self.default_settings_path(self.config.get('_config_path'))
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)

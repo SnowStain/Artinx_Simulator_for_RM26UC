@@ -231,8 +231,10 @@ class TerrainOverviewMixin:
     def _terrain_backend_badge_text(self, backend):
         name = getattr(backend, 'name', 'software')
         reason = getattr(backend, 'reason', '') or ''
-        if name == 'moderngl':
+        if name in {'moderngl', 'pyglet_moderngl'}:
             return '渲染后端: GPU / ModernGL'
+        if 'No module named' in reason and 'pyglet' in reason:
+            return '渲染后端: 软件回退 / 缺少 Pyglet'
         if 'No module named' in reason and 'moderngl' in reason:
             return '渲染后端: 软件回退 / 缺少 ModernGL'
         if 'init failed' in reason:
@@ -328,7 +330,8 @@ class TerrainOverviewMixin:
             view_width = map_manager.map_width
         if view_height is None:
             view_height = map_manager.map_height
-        source_overlay = self._get_world_terrain_grid_overlay_surface(map_manager)
+        draw_outlines = self._terrain_overlay_draw_outlines(map_manager, map_rect, view_width=view_width, view_height=view_height)
+        source_overlay = self._get_world_terrain_grid_overlay_surface(map_manager, draw_outlines=draw_outlines)
         source_rect = pygame.Rect(
             max(0, int(view_x)),
             max(0, int(view_y)),
@@ -337,7 +340,7 @@ class TerrainOverviewMixin:
         )
         if source_rect.width <= 0 or source_rect.height <= 0:
             return
-        scaled_overlay = pygame.transform.smoothscale(source_overlay.subsurface(source_rect), map_rect.size)
+        scaled_overlay = pygame.transform.scale(source_overlay.subsurface(source_rect), map_rect.size)
         surface.blit(scaled_overlay, map_rect.topleft)
 
     def _ensure_terrain_3d_window(self):
@@ -555,7 +558,7 @@ class TerrainOverviewMixin:
                 'erase': '橡皮擦',
                 'shape': '高级形状',
             }.get(getattr(self, 'terrain_workflow_mode', 'brush'), getattr(self, 'terrain_workflow_mode', 'brush'))
-            shape_label = {'circle': '圆形', 'rect': '矩形', 'polygon': '多边形', 'line': '直线', 'slope': '斜坡', 'smooth': 'Smooth'}.get(self.terrain_shape_mode, self.terrain_shape_mode)
+            shape_label = {'circle': '圆形', 'rect': '矩形', 'polygon': '多边形', 'line': '直线', 'slope': '斜坡', 'smooth': 'Smooth', 'smooth_polygon': 'Smooth多边形'}.get(self.terrain_shape_mode, self.terrain_shape_mode)
             selected_label = f'工具 {workflow_label}  高度 {self.terrain_brush["height_m"]:.2f}m'
             if self.terrain_workflow_mode == 'shape':
                 selected_label += f'  形状 {shape_label}'
@@ -596,12 +599,14 @@ class TerrainOverviewMixin:
                 line_button = pygame.Rect(194, row3_y, 50, 28)
                 slope_button = pygame.Rect(250, row3_y, 58, 28)
                 smooth_button = pygame.Rect(314, row3_y, 74, 28)
+                smooth_polygon_button = pygame.Rect(394, row3_y, 102, 28)
                 self._draw_surface_button(surface, circle_button, '圆形', self.terrain_shape_mode == 'circle')
                 self._draw_surface_button(surface, rect_button, '矩形', self.terrain_shape_mode == 'rect')
                 self._draw_surface_button(surface, polygon_button, '多边形', self.terrain_shape_mode == 'polygon')
                 self._draw_surface_button(surface, line_button, '直线', self.terrain_shape_mode == 'line')
                 self._draw_surface_button(surface, slope_button, '斜坡', self.terrain_shape_mode == 'slope')
                 self._draw_surface_button(surface, smooth_button, 'Smooth', self.terrain_shape_mode == 'smooth')
+                self._draw_surface_button(surface, smooth_polygon_button, '平滑多边形', self.terrain_shape_mode == 'smooth_polygon')
                 self.terrain_overview_ui['buttons'].extend([
                     (circle_button, 'terrain_shape:circle'),
                     (rect_button, 'terrain_shape:rect'),
@@ -609,14 +614,18 @@ class TerrainOverviewMixin:
                     (line_button, 'terrain_shape:line'),
                     (slope_button, 'terrain_shape:slope'),
                     (smooth_button, 'terrain_shape:smooth'),
+                    (smooth_polygon_button, 'terrain_shape:smooth_polygon'),
                 ])
-                if self.terrain_shape_mode == 'smooth':
-                    strength_x = smooth_button.right + 8
+                if self.terrain_shape_mode in {'smooth', 'smooth_polygon'}:
+                    strength_x = smooth_polygon_button.right + 8
                     for value in range(4):
                         strength_rect = pygame.Rect(strength_x, row3_y, 32, 28)
                         self._draw_surface_button(surface, strength_rect, str(value), self.terrain_smooth_strength == value)
                         self.terrain_overview_ui['buttons'].append((strength_rect, f'terrain_smooth_strength:set:{value}'))
                         strength_x = strength_rect.right + 6
+                    confirm_rect = pygame.Rect(strength_x + 4, row3_y, 56, 28)
+                    self._draw_surface_button(surface, confirm_rect, '确定', True)
+                    self.terrain_overview_ui['buttons'].append((confirm_rect, 'terrain_smooth_confirm'))
         elif (self._selected_region_option() or {}).get('type') != 'wall':
             circle_button = pygame.Rect(18, row2_y, 64, 28)
             rect_button = pygame.Rect(88, row2_y, 64, 28)
@@ -771,7 +780,7 @@ class TerrainOverviewMixin:
             preview_points = [(map_rect.x + int((point[0] - view_x) * scale_x), map_rect.y + int((point[1] - view_y) * scale_y)) for point in polygon_preview_points]
             preview_world = None
             if self.mouse_world is not None:
-                if self._terrain_shape_tool_active() and self.terrain_shape_mode == 'polygon':
+                if self._terrain_shape_tool_active() and self.terrain_shape_mode in {'polygon', 'smooth_polygon'}:
                     preview_world = self._current_terrain_target(self.mouse_world)
                 elif self._terrain_shape_tool_active() and self.terrain_shape_mode == 'slope' and not self._slope_direction_mode_active():
                     preview_world = self._current_terrain_target(self.mouse_world)
@@ -808,9 +817,9 @@ class TerrainOverviewMixin:
                 '地形建模工具',
                 '1/2/3/4: 框选 / 刷子 / 橡皮擦 / 高级',
                 '滚轮改半径，Shift+滚轮改高度',
-                '高级模式保留圆形、矩形、多边形、直线、斜坡',
+                '高级模式保留圆形、矩形、多边形、直线、斜坡、平滑多边形',
                 '斜坡: 先闭合区域，再左键两次设置坡向箭头',
-                '平滑: 先框选区域，再在工具栏设置 0-3，其中 0 为关闭',
+                '平滑: 先框选或画平滑多边形，再在工具栏设置 0-3，最后点确定',
             ]
             for index, line in enumerate(lines):
                 font = self.small_font if index == 0 else self.tiny_font
@@ -1423,7 +1432,7 @@ class TerrainOverviewMixin:
             hover_x = map_rect.x + int(self.mouse_world[0] * scale_x)
             hover_y = map_rect.y + int(self.mouse_world[1] * scale_y)
             if self._terrain_brush_active():
-                if self._terrain_shape_tool_active() and self.terrain_shape_mode == 'polygon' and self.polygon_points:
+                if self._terrain_shape_tool_active() and self.terrain_shape_mode in {'polygon', 'smooth_polygon'} and self.polygon_points:
                     points = [(map_rect.x + int(point[0] * scale_x), map_rect.y + int(point[1] * scale_y)) for point in self.polygon_points]
                     preview_world = self._current_terrain_target(self.mouse_world)
                     points.append((map_rect.x + int(preview_world[0] * scale_x), map_rect.y + int(preview_world[1] * scale_y)))
@@ -1564,7 +1573,7 @@ class TerrainOverviewMixin:
         sampled_heights = data['sampled_heights']
         best = None
 
-        if backend_name == 'moderngl':
+        if backend_name in {'moderngl', 'pyglet_moderngl'}:
             width, height = scene_rect.size
             vertical_scale = 0.82
             max_height = max(1.0, float(np.max(sampled_heights) * vertical_scale))
@@ -1707,11 +1716,18 @@ class TerrainOverviewMixin:
                     if len(self.polygon_points) >= 3:
                         self._commit_terrain_polygon(game_engine)
                     return True
+                if self._terrain_brush_active() and self.terrain_shape_mode == 'smooth_polygon':
+                    if len(self.polygon_points) >= 3:
+                        self._commit_terrain_smooth_polygon(game_engine)
+                    return True
                 if self._terrain_brush_active() and self.terrain_shape_mode == 'slope':
                     if self._slope_direction_mode_active():
                         self._commit_terrain_slope_polygon(game_engine)
                     elif len(self.polygon_points) >= 3:
                         self._begin_terrain_slope_direction(game_engine)
+                    return True
+                if self._terrain_brush_active() and self.terrain_shape_mode == 'smooth':
+                    self._smooth_selected_terrain_cells(game_engine)
                     return True
             if self._terrain_brush_active():
                 if event.key == pygame.K_LEFTBRACKET:

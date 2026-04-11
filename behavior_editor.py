@@ -112,13 +112,13 @@ class BehaviorEditorEngine:
         {'id': f'node_{index}', 'label': f'跨越节点 {index}'} for index in range(1, MAX_STRATEGY_STAGES + 1)
     )
 
-    def __init__(self, config_path='config.json', settings_path='settings.json'):
+    def __init__(self, config_path='config.json', settings_path=None):
         self.config_path = config_path
-        self.settings_path = settings_path
         self.config_manager = ConfigManager()
         self.config = self.config_manager.load_config(config_path, settings_path)
         self.config['_config_path'] = config_path
-        self.config['_settings_path'] = settings_path
+        self.settings_path = self.config.get('_settings_path', self.config_manager.default_settings_path(config_path))
+        self.config['_settings_path'] = self.settings_path
         self.map_manager = MapManager(self.config)
         self.map_manager.load_map()
         self.ai_controller = AIController(self.config)

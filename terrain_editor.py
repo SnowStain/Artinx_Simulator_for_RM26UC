@@ -19,13 +19,13 @@ from rendering.renderer import Renderer
 
 
 class TerrainEditorEngine:
-    def __init__(self, config_path='config.json', settings_path='settings.json'):
+    def __init__(self, config_path='config.json', settings_path=None):
         self.config_path = config_path
-        self.settings_path = settings_path
         self.config_manager = ConfigManager()
         self.config = self.config_manager.load_config(config_path, settings_path)
         self.config['_config_path'] = config_path
-        self.config['_settings_path'] = settings_path
+        self.settings_path = self.config.get('_settings_path', self.config_manager.default_settings_path(config_path))
+        self.config['_settings_path'] = self.settings_path
         self.logs = []
         self.max_logs = 8
         self.running = False
@@ -38,7 +38,7 @@ class TerrainEditorEngine:
         self.rules_engine = SimpleNamespace(game_over=False, auto_aim_max_distance=0.0)
         self.preset_name = self._sanitize_preset_name(self.config.get('map', {}).get('preset', 'latest_map'))
         self.available_map_names = []
-        self.map_manager = MapManager(self.config)
+        self.map_manager = MapManager(self._build_editor_map_config())
         self.undo_stack = []
         self.redo_stack = []
         self.max_undo_steps = 50
@@ -64,6 +64,15 @@ class TerrainEditorEngine:
         sanitized = re.sub(r'[<>:"/\\|?*]+', '_', raw)
         return sanitized or 'latest_map'
 
+    def _build_editor_map_config(self):
+        editor_config = deepcopy(self.config)
+        map_config = editor_config.setdefault('map', {})
+        runtime_grid = dict(map_config.get('runtime_grid', {}) or {})
+        runtime_grid['channels'] = {}
+        runtime_grid['shape'] = []
+        map_config['runtime_grid'] = runtime_grid
+        return editor_config
+
     def reload_map_manager(self):
         with self._map_sync_lock:
             self._map_sync_generation += 1
@@ -71,7 +80,7 @@ class TerrainEditorEngine:
         old_map_manager = getattr(self, 'map_manager', None)
         if old_map_manager is not None and hasattr(old_map_manager, 'shutdown'):
             old_map_manager.shutdown()
-        self.map_manager = MapManager(self.config)
+        self.map_manager = MapManager(self._build_editor_map_config())
         self.map_manager.load_map()
 
     def shutdown(self):

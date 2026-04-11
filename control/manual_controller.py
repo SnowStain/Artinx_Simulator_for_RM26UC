@@ -4,6 +4,7 @@
 import math
 
 from pygame_compat import pygame
+from control.player_look import clamp_entity_pitch, set_player_mouse_input_settings
 
 class ManualController:
     def __init__(self, config):
@@ -12,16 +13,15 @@ class ManualController:
         self.max_angular_speed = config.get('physics', {}).get('max_angular_speed', 180)
         self.enable_entity_movement = config.get('simulator', {}).get('enable_entity_movement', True)
         simulator_config = config.get('simulator', {})
-        self.look_sensitivity_deg = float(simulator_config.get('player_look_sensitivity_deg', 0.18))
-        self.pitch_sensitivity_deg = float(simulator_config.get('player_pitch_sensitivity_deg', 0.12))
         self.player_turn_follow_rate_deg = float(simulator_config.get('player_turn_follow_rate_deg', 240.0))
         self.player_small_gyro_speed_deg = float(simulator_config.get('player_small_gyro_speed_deg', 420.0))
 
     def set_look_sensitivity(self, yaw_sensitivity_deg=None, pitch_sensitivity_deg=None):
-        if yaw_sensitivity_deg is not None:
-            self.look_sensitivity_deg = max(0.01, float(yaw_sensitivity_deg))
-        if pitch_sensitivity_deg is not None:
-            self.pitch_sensitivity_deg = max(0.01, float(pitch_sensitivity_deg))
+        set_player_mouse_input_settings(
+            self.config,
+            yaw_sensitivity_deg=yaw_sensitivity_deg,
+            pitch_sensitivity_deg=pitch_sensitivity_deg,
+        )
 
     def _speed_to_world_units(self):
         field_length_m = float(self.config.get('map', {}).get('field_length_m', 28.0))
@@ -36,9 +36,7 @@ class ManualController:
         return ((float(angle_deg) + 180.0) % 360.0) - 180.0
 
     def _clamp_pitch(self, entity, pitch_deg):
-        max_up = float(getattr(entity, 'max_pitch_up_deg', 25.0))
-        max_down = float(getattr(entity, 'max_pitch_down_deg', 25.0))
-        return max(-max_down, min(max_up, float(pitch_deg)))
+        return clamp_entity_pitch(entity, pitch_deg, config=self.config)
 
     def _pressed(self, keys, key_code):
         if hasattr(keys, 'get'):
@@ -139,7 +137,7 @@ class ManualController:
                 current_turret_angle = getattr(entity, 'turret_angle', None)
                 if current_turret_angle is None:
                     current_turret_angle = entity.angle
-                entity.turret_angle = (float(current_turret_angle) + yaw_delta * self.look_sensitivity_deg) % 360.0
+                entity.turret_angle = (float(current_turret_angle) + yaw_delta) % 360.0
                 entity.target = None
                 if view_aim_state is not None:
                     entity.manual_aim_point = {
@@ -154,7 +152,7 @@ class ManualController:
                     entity.manual_aim_point = None
 
             current_pitch = float(getattr(entity, 'gimbal_pitch_deg', 0.0))
-            entity.gimbal_pitch_deg = self._clamp_pitch(entity, current_pitch + pitch_delta * self.pitch_sensitivity_deg)
+            entity.gimbal_pitch_deg = self._clamp_pitch(entity, current_pitch + pitch_delta)
 
             if not self.enable_entity_movement:
                 entity.set_velocity(0.0, 0.0, 0.0)
@@ -215,7 +213,10 @@ class ManualController:
                     if movement_intensity > 1e-6:
                         target_chassis_angle = float(movement_angle_deg)
                     else:
-                        target_chassis_angle = float(getattr(entity, 'turret_angle', entity.angle))
+                        target_chassis_angle = getattr(entity, 'turret_angle', None)
+                        if target_chassis_angle is None:
+                            target_chassis_angle = entity.angle
+                        target_chassis_angle = float(target_chassis_angle)
                 else:
                     target_chassis_angle = getattr(entity, 'turret_angle', None)
                     if target_chassis_angle is None:

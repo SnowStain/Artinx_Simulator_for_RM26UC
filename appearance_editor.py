@@ -21,127 +21,149 @@ try:
 except Exception as exc:
     moderngl = None
     MODERNGL_PREVIEW_ERROR = str(exc)
+    def _build_geometry(self, profile):
+        vertices = []
+        render_width_scale = float(profile.get('body_render_width_scale', 0.82))
+        has_turret = float(profile.get('gimbal_length_m', 0.0)) > 1e-6 and float(profile.get('gimbal_body_height_m', 0.0)) > 1e-6
+        has_barrel = has_turret and float(profile.get('barrel_length_m', 0.0)) > 1e-6 and float(profile.get('barrel_radius_m', 0.0)) > 1e-6
+        has_front_climb = str(profile.get('front_climb_assist_style', 'none')) != 'none'
+        has_rear_climb = str(profile.get('rear_climb_assist_style', 'none')) != 'none'
+        body_y = float(profile['body_clearance_m']) + float(profile['body_height_m']) * 0.5
+        _append_preview_box(
+            vertices,
+            (0.0, body_y, 0.0),
+            (float(profile['body_length_m']) * 0.5, float(profile['body_height_m']) * 0.5, float(profile['body_width_m']) * 0.5 * render_width_scale),
+            profile['body_color_rgb'],
+        )
+        _append_preview_box(
+            vertices,
+            (0.0, body_y + float(profile['body_height_m']) * 0.36, 0.0),
+            (float(profile['body_length_m']) * 0.40, max(0.015, float(profile['body_height_m']) * 0.12), float(profile['body_width_m']) * 0.40 * render_width_scale),
+            [max(0, min(255, int(channel * 0.82 + 20))) for channel in profile['body_color_rgb']],
+        )
 
+        wheel_radius = max(0.018, float(profile['wheel_radius_m']))
+        wheel_half_z = max(0.018, float(profile['wheel_radius_m']) * 0.32)
+        for wheel_x, wheel_y in profile['custom_wheel_positions_m']:
+            _append_preview_cylinder(
+                vertices,
+                (float(wheel_x), wheel_radius, float(wheel_y) * render_width_scale),
+                wheel_radius,
+                wheel_half_z,
+                profile['wheel_color_rgb'],
+            )
 
-ROLE_ORDER = (
-    ('hero', '英雄'),
-    ('engineer', '工程'),
-    ('infantry', '步兵'),
-    ('sentry', '哨兵'),
-)
+        body_half_x = float(profile['body_length_m']) * 0.5
+        body_half_z = float(profile['body_width_m']) * 0.5 * render_width_scale
+        wheel_outer_z = max((abs(float(wheel_y)) * render_width_scale for _, wheel_y in profile.get('custom_wheel_positions_m', [])), default=body_half_z + wheel_radius * 0.55)
+        if has_front_climb:
+            plate_length = float(profile.get('front_climb_assist_plate_length_m', 0.05))
+            plate_width = float(profile.get('front_climb_assist_plate_width_m', 0.018))
+            plate_height = float(profile.get('front_climb_assist_plate_height_m', 0.18))
+            plate_forward = float(profile.get('front_climb_assist_forward_offset_m', 0.04))
+            plate_inner = float(profile.get('front_climb_assist_inner_offset_m', 0.06)) * render_width_scale
+            plate_center_x = body_half_x + plate_forward + plate_length * 0.5
+            plate_center_y = wheel_radius + plate_height * 0.5
+            plate_center_z = max(body_half_z * 0.45, wheel_outer_z - plate_inner)
+            for side_sign in (-1.0, 1.0):
+                _append_preview_box(vertices, (plate_center_x, plate_center_y, plate_center_z * side_sign), (plate_length * 0.5, plate_height * 0.5, plate_width * 0.5), [92, 96, 108])
+                _append_preview_box(vertices, (body_half_x * 0.78, body_y + float(profile['body_height_m']) * 0.22, plate_center_z * side_sign), (plate_length * 0.28, max(0.012, plate_height * 0.18), plate_width * 0.6), [122, 126, 136])
 
-PART_LABELS = {
-    'body': '底盘',
-    'wheel': '车轮',
-    'turret': '云台',
-    'barrel': '枪管',
-    'mount': '连接件',
-    'armor': '装甲板',
-    'armor_light': '装甲灯条',
-    'barrel_light': '枪管灯条',
-}
+        armor_gap = float(profile['armor_plate_gap_m'])
+        armor_half_h = float(profile['armor_plate_height_m']) * 0.5
+        armor_center_y = float(profile['body_clearance_m']) + float(profile['body_height_m']) * 0.55
+        armor_thickness = max(0.012, armor_gap * 0.75)
+        armor_color = profile['armor_color_rgb']
+        _append_preview_box(vertices, (body_half_x + armor_gap + armor_thickness * 0.5, armor_center_y, 0.0), (armor_thickness * 0.5, armor_half_h, float(profile['armor_plate_width_m']) * 0.5), armor_color)
+        _append_preview_box(vertices, (-(body_half_x + armor_gap + armor_thickness * 0.5), armor_center_y, 0.0), (armor_thickness * 0.5, armor_half_h, float(profile['armor_plate_width_m']) * 0.5), armor_color)
+        _append_preview_box(vertices, (0.0, armor_center_y, body_half_z + armor_gap + armor_thickness * 0.5), (float(profile['armor_plate_length_m']) * 0.5, armor_half_h, armor_thickness * 0.5), armor_color)
+        _append_preview_box(vertices, (0.0, armor_center_y, -(body_half_z + armor_gap + armor_thickness * 0.5)), (float(profile['armor_plate_length_m']) * 0.5, armor_half_h, armor_thickness * 0.5), armor_color)
+        armor_light_color = [110, 168, 255]
+        armor_light_half_x = float(profile.get('armor_light_length_m', 0.10)) * 0.5
+        armor_light_half_y = max(0.005, float(profile.get('armor_light_height_m', 0.02)) * 0.5)
+        armor_light_half_z = max(0.005, float(profile.get('armor_light_width_m', 0.02)) * 0.5)
+        _append_preview_box(vertices, (body_half_x + armor_gap + armor_thickness, armor_center_y, float(profile['armor_plate_width_m']) * 0.5 + armor_light_half_z), (armor_light_half_z, armor_light_half_y, armor_light_half_x), armor_light_color)
+        _append_preview_box(vertices, (body_half_x + armor_gap + armor_thickness, armor_center_y, -(float(profile['armor_plate_width_m']) * 0.5 + armor_light_half_z)), (armor_light_half_z, armor_light_half_y, armor_light_half_x), armor_light_color)
+        _append_preview_box(vertices, (-(body_half_x + armor_gap + armor_thickness), armor_center_y, float(profile['armor_plate_width_m']) * 0.5 + armor_light_half_z), (armor_light_half_z, armor_light_half_y, armor_light_half_x), armor_light_color)
+        _append_preview_box(vertices, (-(body_half_x + armor_gap + armor_thickness), armor_center_y, -(float(profile['armor_plate_width_m']) * 0.5 + armor_light_half_z)), (armor_light_half_z, armor_light_half_y, armor_light_half_x), armor_light_color)
+        _append_preview_box(vertices, (float(profile['armor_plate_length_m']) * 0.5 + armor_light_half_z, armor_center_y, body_half_z + armor_gap + armor_thickness), (armor_light_half_x, armor_light_half_y, armor_light_half_z), armor_light_color)
+        _append_preview_box(vertices, (-(float(profile['armor_plate_length_m']) * 0.5 + armor_light_half_z), armor_center_y, body_half_z + armor_gap + armor_thickness), (armor_light_half_x, armor_light_half_y, armor_light_half_z), armor_light_color)
+        _append_preview_box(vertices, (float(profile['armor_plate_length_m']) * 0.5 + armor_light_half_z, armor_center_y, -(body_half_z + armor_gap + armor_thickness)), (armor_light_half_x, armor_light_half_y, armor_light_half_z), armor_light_color)
+        _append_preview_box(vertices, (-(float(profile['armor_plate_length_m']) * 0.5 + armor_light_half_z), armor_center_y, -(body_half_z + armor_gap + armor_thickness)), (armor_light_half_x, armor_light_half_y, armor_light_half_z), armor_light_color)
 
+        if has_rear_climb:
+            upper_length = float(profile.get('rear_climb_assist_upper_length_m', 0.09))
+            lower_length = float(profile.get('rear_climb_assist_lower_length_m', 0.08))
+            bar_width = float(profile.get('rear_climb_assist_bar_width_m', 0.016))
+            upper_offset = float(profile.get('rear_climb_assist_upper_offset_m', 0.055))
+            lower_offset = float(profile.get('rear_climb_assist_lower_offset_m', 0.015))
+            rear_inner = float(profile.get('rear_climb_assist_inner_offset_m', 0.03)) * render_width_scale
+            rear_center_z = max(body_half_z * 0.45, wheel_outer_z - rear_inner)
+            upper_center_y = float(profile['body_clearance_m']) + float(profile['body_height_m']) + bar_width * 1.6
+            lower_center_y = max(bar_width * 0.7, float(profile['body_clearance_m']) * 0.58)
+            upper_center_x = -body_half_x - upper_offset + upper_length * 0.12
+            lower_center_x = -body_half_x - lower_offset + lower_length * 0.12
+            connector_center_x = (upper_center_x + lower_center_x) * 0.5
+            connector_center_y = (upper_center_y + lower_center_y) * 0.5
+            connector_height = max(bar_width, abs(upper_center_y - lower_center_y))
+            connector_length = max(bar_width * 1.15, abs(upper_center_x - lower_center_x) + bar_width * 0.5)
+            for side_sign in (-1.0, 1.0):
+                side_z = rear_center_z * side_sign
+                _append_preview_box(vertices, (upper_center_x, upper_center_y, side_z), (upper_length * 0.5, bar_width * 0.5, bar_width * 0.5), [106, 110, 120])
+                _append_preview_box(vertices, (lower_center_x, lower_center_y, side_z), (lower_length * 0.5, bar_width * 0.5, bar_width * 0.5), [92, 96, 108])
+                _append_preview_box(vertices, (connector_center_x, connector_center_y, side_z), (connector_length * 0.5, connector_height * 0.5, bar_width * 0.45), [116, 120, 132])
 
-def _normalize_profile_constraints(role_key, profile):
-    normalized = deepcopy(profile)
-    if 'barrel_length_m' not in normalized:
-        normalized['barrel_length_m'] = 0.48 if role_key == 'hero' else (0.0 if role_key == 'engineer' else 0.36)
-    if 'barrel_radius_m' not in normalized:
-        normalized['barrel_radius_m'] = 0.020 if role_key == 'hero' else (0.0 if role_key == 'engineer' else 0.015)
-    if role_key == 'engineer':
-        normalized['gimbal_length_m'] = 0.0
-        normalized['gimbal_width_m'] = 0.0
-        normalized['gimbal_body_height_m'] = 0.0
-        normalized['gimbal_mount_gap_m'] = 0.0
-        normalized['gimbal_mount_length_m'] = 0.0
-        normalized['gimbal_mount_width_m'] = 0.0
-        normalized['gimbal_mount_height_m'] = 0.0
-        normalized['barrel_length_m'] = 0.0
-        normalized['barrel_radius_m'] = 0.0
-    return normalized
+        if has_turret:
+            turret_offset_x = float(profile['gimbal_offset_x_m'])
+            turret_offset_z = float(profile['gimbal_offset_y_m'])
+            if float(profile.get('gimbal_mount_height_m', 0.0)) > 1e-6:
+                _append_preview_box(
+                    vertices,
+                    (turret_offset_x, body_y + float(profile['body_height_m']) * 0.5 + float(profile['gimbal_mount_height_m']) * 0.5, turret_offset_z),
+                    (max(0.02, float(profile['gimbal_mount_length_m']) * 0.5), max(0.02, float(profile['gimbal_mount_height_m']) * 0.5), max(0.02, float(profile['gimbal_mount_width_m']) * 0.5 * render_width_scale)),
+                    [96, 100, 112],
+                )
+            turret_center_y = float(profile['gimbal_height_m'])
+            _append_preview_box(
+                vertices,
+                (turret_offset_x, turret_center_y, turret_offset_z),
+                (float(profile['gimbal_length_m']) * 0.5, float(profile['gimbal_body_height_m']) * 0.5, float(profile['gimbal_width_m']) * 0.5 * render_width_scale),
+                profile['turret_color_rgb'],
+            )
+            if has_barrel:
+                barrel_length = float(profile['barrel_length_m'])
+                barrel_radius = max(0.005, float(profile['barrel_radius_m']))
+                _append_preview_box(
+                    vertices,
+                    (turret_offset_x + float(profile['gimbal_length_m']) * 0.5 + barrel_length * 0.5, turret_center_y, turret_offset_z),
+                    (barrel_length * 0.5, barrel_radius, barrel_radius),
+                    profile['turret_color_rgb'],
+                )
+                barrel_light_half_x = float(profile.get('barrel_light_length_m', 0.10)) * 0.5
+                barrel_light_half_y = max(0.005, float(profile.get('barrel_light_height_m', 0.02)) * 0.5)
+                barrel_light_half_z = max(0.005, float(profile.get('barrel_light_width_m', 0.02)) * 0.5)
+                barrel_light_center_x = turret_offset_x + float(profile['gimbal_length_m']) * 0.5 + barrel_length * 0.45
+                _append_preview_box(vertices, (barrel_light_center_x, turret_center_y, turret_offset_z + barrel_light_half_z * 3.0), (barrel_light_half_x, barrel_light_half_y, barrel_light_half_z), armor_light_color)
+                _append_preview_box(vertices, (barrel_light_center_x, turret_center_y, turret_offset_z - barrel_light_half_z * 3.0), (barrel_light_half_x, barrel_light_half_y, barrel_light_half_z), armor_light_color)
 
+        if str(profile.get('arm_style', 'none')) == 'fixed_7':
+            _append_preview_box(vertices, (0.0, body_y + float(profile['body_height_m']) * 0.95, 0.0), (0.03, 0.22, 0.03), [172, 176, 184])
+            _append_preview_box(vertices, (float(profile['body_length_m']) * 0.16, body_y + float(profile['body_height_m']) + 0.18, 0.0), (0.18, 0.03, 0.03), [188, 192, 198])
 
-def _default_profile(role_key):
-    base_profiles = {
-        'hero': {
-            'body_length_m': 0.65,
-            'body_width_m': 0.55,
-            'body_height_m': 0.20,
-            'body_clearance_m': 0.10,
-            'wheel_radius_m': 0.08,
-            'gimbal_length_m': 0.35,
-            'gimbal_width_m': 0.15,
-            'gimbal_body_height_m': 0.15,
-            'gimbal_mount_gap_m': 0.10,
-            'gimbal_mount_length_m': 0.12,
-            'gimbal_mount_width_m': 0.12,
-            'gimbal_mount_height_m': 0.10,
-            'barrel_length_m': 0.48,
-            'barrel_radius_m': 0.020,
-            'gimbal_height_m': 0.475,
-            'gimbal_offset_x_m': 0.0,
-            'gimbal_offset_y_m': 0.0,
-            'armor_plate_width_m': 0.24,
-            'armor_plate_length_m': 0.24,
-            'armor_plate_height_m': 0.24,
-            'armor_plate_gap_m': 0.02,
-            'armor_light_length_m': 0.12,
-            'armor_light_width_m': 0.025,
-            'armor_light_height_m': 0.025,
-            'barrel_light_length_m': 0.12,
-            'barrel_light_width_m': 0.02,
-            'barrel_light_height_m': 0.02,
-            'body_render_width_scale': 0.82,
-            'wheel_style': 'mecanum',
-            'suspension_style': 'none',
-            'arm_style': 'none',
-        },
-        'engineer': {
-            'body_length_m': 0.55,
-            'body_width_m': 0.50,
-            'body_height_m': 0.20,
-            'body_clearance_m': 0.10,
-            'wheel_radius_m': 0.08,
-            'gimbal_length_m': 0.0,
-            'gimbal_width_m': 0.0,
-            'gimbal_body_height_m': 0.0,
-            'gimbal_mount_gap_m': 0.0,
-            'gimbal_mount_length_m': 0.0,
-            'gimbal_mount_width_m': 0.0,
-            'gimbal_mount_height_m': 0.0,
-            'barrel_length_m': 0.0,
-            'barrel_radius_m': 0.0,
-            'gimbal_height_m': 0.42,
-            'gimbal_offset_x_m': 0.0,
-            'gimbal_offset_y_m': 0.0,
-            'armor_plate_width_m': 0.16,
-            'armor_plate_length_m': 0.16,
-            'armor_plate_height_m': 0.16,
-            'armor_plate_gap_m': 0.02,
-            'armor_light_length_m': 0.10,
-            'armor_light_width_m': 0.02,
-            'armor_light_height_m': 0.02,
-            'barrel_light_length_m': 0.10,
-            'barrel_light_width_m': 0.02,
-            'barrel_light_height_m': 0.02,
-            'body_render_width_scale': 0.82,
-            'wheel_style': 'mecanum',
-            'suspension_style': 'none',
-            'arm_style': 'fixed_7',
-        },
-        'infantry': {
-            'body_length_m': 0.50,
-            'body_width_m': 0.45,
-            'body_height_m': 0.20,
-            'body_clearance_m': 0.20,
-            'wheel_radius_m': 0.06,
-            'gimbal_length_m': 0.30,
-            'gimbal_width_m': 0.10,
-            'gimbal_body_height_m': 0.10,
-            'gimbal_mount_gap_m': 0.10,
-            'gimbal_mount_length_m': 0.10,
-            'gimbal_mount_width_m': 0.10,
-            'gimbal_mount_height_m': 0.10,
+        vertex_array = np.array(vertices, dtype='f4')
+        self.bounds_radius = max(
+            0.6,
+            float(profile['body_length_m']) * 0.9,
+            float(profile['body_width_m']) * 0.9,
+            float(profile.get('gimbal_length_m', 0.0)) + float(profile.get('barrel_length_m', 0.0)) * 0.8,
+            float(profile['gimbal_height_m']) + 0.25,
+        )
+        if self.vao is not None:
+            self.vao.release()
+        if self.vbo is not None:
+            self.vbo.release()
+        self.vbo = self.ctx.buffer(vertex_array.tobytes())
+        self.vao = self.ctx.vertex_array(self.program, [(self.vbo, '3f 3f 3f', 'in_position', 'in_color', 'in_normal')])
             'barrel_length_m': 0.36,
             'barrel_radius_m': 0.015,
             'gimbal_height_m': 0.55,
@@ -197,6 +219,7 @@ def _default_profile(role_key):
         },
     }
     profile = deepcopy(base_profiles[role_key])
+    _apply_climb_assist_defaults(role_key, profile)
     if profile['wheel_style'] == 'legged':
         wheel_y = profile['body_width_m'] * 0.5 + profile['wheel_radius_m'] * 0.55
         profile['custom_wheel_positions_m'] = [
@@ -505,13 +528,13 @@ class ModernGLAppearancePreview:
 
 
 class AppearanceEditorApp:
-    def __init__(self, config_path='config.json', settings_path='settings.json'):
+    def __init__(self, config_path='config.json', settings_path=None):
         self.config_path = config_path
-        self.settings_path = settings_path
         self.config_manager = ConfigManager()
         self.config = self.config_manager.load_config(config_path, settings_path)
         self.config['_config_path'] = config_path
-        self.config['_settings_path'] = settings_path
+        self.settings_path = self.config.get('_settings_path', self.config_manager.default_settings_path(config_path))
+        self.config['_settings_path'] = self.settings_path
         self.preset_path = self._resolve_preset_path()
         self.profiles = self._load_profiles()
         self.current_role = ROLE_ORDER[0][0]
@@ -620,6 +643,17 @@ class AppearanceEditorApp:
             {'part': 'barrel_light', 'label': '灯条宽度', 'kind': 'number', 'key': 'barrel_light_width_m', 'min': 0.005, 'max': 0.08, 'step': 0.005},
             {'part': 'barrel_light', 'label': '灯条高度', 'kind': 'number', 'key': 'barrel_light_height_m', 'min': 0.005, 'max': 0.08, 'step': 0.005},
             {'part': 'wheel', 'label': '轮半径', 'kind': 'number', 'key': 'wheel_radius_m', 'min': 0.03, 'max': 0.20, 'step': 0.005},
+            {'part': 'front_climb', 'label': '前板长度', 'kind': 'number', 'key': 'front_climb_assist_plate_length_m', 'min': 0.02, 'max': 0.20, 'step': 0.005},
+            {'part': 'front_climb', 'label': '前板厚度', 'kind': 'number', 'key': 'front_climb_assist_plate_width_m', 'min': 0.008, 'max': 0.08, 'step': 0.002},
+            {'part': 'front_climb', 'label': '前板高度', 'kind': 'number', 'key': 'front_climb_assist_plate_height_m', 'min': 0.05, 'max': 0.40, 'step': 0.005},
+            {'part': 'front_climb', 'label': '前板前伸', 'kind': 'number', 'key': 'front_climb_assist_forward_offset_m', 'min': 0.00, 'max': 0.20, 'step': 0.005},
+            {'part': 'front_climb', 'label': '前板内缩', 'kind': 'number', 'key': 'front_climb_assist_inner_offset_m', 'min': 0.00, 'max': 0.20, 'step': 0.005},
+            {'part': 'rear_climb', 'label': '上段长度', 'kind': 'number', 'key': 'rear_climb_assist_upper_length_m', 'min': 0.03, 'max': 0.24, 'step': 0.005},
+            {'part': 'rear_climb', 'label': '下段长度', 'kind': 'number', 'key': 'rear_climb_assist_lower_length_m', 'min': 0.03, 'max': 0.24, 'step': 0.005},
+            {'part': 'rear_climb', 'label': '腿杆厚度', 'kind': 'number', 'key': 'rear_climb_assist_bar_width_m', 'min': 0.008, 'max': 0.08, 'step': 0.002},
+            {'part': 'rear_climb', 'label': '上段后伸', 'kind': 'number', 'key': 'rear_climb_assist_upper_offset_m', 'min': 0.00, 'max': 0.20, 'step': 0.005},
+            {'part': 'rear_climb', 'label': '下段前收', 'kind': 'number', 'key': 'rear_climb_assist_lower_offset_m', 'min': 0.00, 'max': 0.20, 'step': 0.005},
+            {'part': 'rear_climb', 'label': '狗腿内缩', 'kind': 'number', 'key': 'rear_climb_assist_inner_offset_m', 'min': 0.00, 'max': 0.20, 'step': 0.005},
         ]
         for color_key, part, label in (
             ('body_color_rgb', 'body', '底盘'),
@@ -640,6 +674,12 @@ class AppearanceEditorApp:
     def _profile_has_barrel(self, profile):
         return self._profile_has_turret(profile) and float(profile.get('barrel_length_m', 0.0)) > 1e-6 and float(profile.get('barrel_radius_m', 0.0)) > 1e-6
 
+    def _profile_has_front_climb(self, profile):
+        return str(profile.get('front_climb_assist_style', 'none')) != 'none'
+
+    def _profile_has_rear_climb(self, profile):
+        return str(profile.get('rear_climb_assist_style', 'none')) != 'none'
+
     def _visible_field_specs(self):
         if self.selected_part is None:
             return []
@@ -649,6 +689,10 @@ class AppearanceEditorApp:
         if self.selected_part == 'mount' and not self._profile_has_mount(profile):
             return []
         if self.selected_part in {'barrel', 'barrel_light'} and not self._profile_has_barrel(profile):
+            return []
+        if self.selected_part == 'front_climb' and not self._profile_has_front_climb(profile):
+            return []
+        if self.selected_part == 'rear_climb' and not self._profile_has_rear_climb(profile):
             return []
         fields = [spec for spec in self.field_specs if spec.get('part') == self.selected_part]
         if self.selected_part == 'wheel':
@@ -781,6 +825,8 @@ class AppearanceEditorApp:
         has_turret = self._profile_has_turret(profile)
         has_mount = self._profile_has_mount(profile)
         has_barrel = self._profile_has_barrel(profile)
+        has_front_climb = self._profile_has_front_climb(profile)
+        has_rear_climb = self._profile_has_rear_climb(profile)
         body_y = float(profile['body_clearance_m']) + float(profile['body_height_m']) * 0.5
         yield ('body', (0.0, body_y, 0.0), (float(profile['body_length_m']) * 0.5, float(profile['body_height_m']) * 0.5, float(profile['body_width_m']) * 0.5 * render_width_scale))
 
@@ -789,9 +835,23 @@ class AppearanceEditorApp:
         for wheel_x, wheel_y in profile['custom_wheel_positions_m']:
             yield ('wheel', (float(wheel_x), wheel_radius, float(wheel_y) * render_width_scale), (wheel_radius, wheel_radius, wheel_half_z))
 
-        armor_gap = float(profile['armor_plate_gap_m'])
         body_half_x = float(profile['body_length_m']) * 0.5
         body_half_z = float(profile['body_width_m']) * 0.5 * render_width_scale
+        wheel_outer_z = max((abs(float(wheel_y)) * render_width_scale for _, wheel_y in profile.get('custom_wheel_positions_m', [])), default=body_half_z + wheel_radius * 0.55)
+        if has_front_climb:
+            plate_length = float(profile.get('front_climb_assist_plate_length_m', 0.05))
+            plate_width = float(profile.get('front_climb_assist_plate_width_m', 0.018))
+            plate_height = float(profile.get('front_climb_assist_plate_height_m', 0.18))
+            plate_forward = float(profile.get('front_climb_assist_forward_offset_m', 0.04))
+            plate_inner = float(profile.get('front_climb_assist_inner_offset_m', 0.06)) * render_width_scale
+            plate_center_x = body_half_x + plate_forward + plate_length * 0.5
+            plate_center_y = wheel_radius + plate_height * 0.5
+            plate_center_z = max(body_half_z * 0.45, wheel_outer_z - plate_inner)
+            for side_sign in (-1.0, 1.0):
+                yield ('front_climb', (plate_center_x, plate_center_y, plate_center_z * side_sign), (plate_length * 0.5, plate_height * 0.5, plate_width * 0.5))
+                yield ('front_climb', (body_half_x * 0.78, body_y + float(profile['body_height_m']) * 0.22, plate_center_z * side_sign), (plate_length * 0.28, max(0.012, plate_height * 0.18), plate_width * 0.6))
+
+        armor_gap = float(profile['armor_plate_gap_m'])
         armor_half_h = float(profile['armor_plate_height_m']) * 0.5
         armor_center_y = float(profile['body_clearance_m']) + float(profile['body_height_m']) * 0.55
         armor_thickness = max(0.012, armor_gap * 0.75)
@@ -820,6 +880,28 @@ class AppearanceEditorApp:
         )
         for center in armor_light_centers:
             yield ('armor_light', center, (armor_light_half_x, armor_light_half_y, armor_light_half_z))
+
+        if has_rear_climb:
+            upper_length = float(profile.get('rear_climb_assist_upper_length_m', 0.09))
+            lower_length = float(profile.get('rear_climb_assist_lower_length_m', 0.08))
+            bar_width = float(profile.get('rear_climb_assist_bar_width_m', 0.016))
+            upper_offset = float(profile.get('rear_climb_assist_upper_offset_m', 0.055))
+            lower_offset = float(profile.get('rear_climb_assist_lower_offset_m', 0.015))
+            rear_inner = float(profile.get('rear_climb_assist_inner_offset_m', 0.03)) * render_width_scale
+            rear_center_z = max(body_half_z * 0.45, wheel_outer_z - rear_inner)
+            upper_center_y = float(profile['body_clearance_m']) + float(profile['body_height_m']) + bar_width * 1.6
+            lower_center_y = max(bar_width * 0.7, float(profile['body_clearance_m']) * 0.58)
+            upper_center_x = -body_half_x - upper_offset + upper_length * 0.12
+            lower_center_x = -body_half_x - lower_offset + lower_length * 0.12
+            connector_center_x = (upper_center_x + lower_center_x) * 0.5
+            connector_center_y = (upper_center_y + lower_center_y) * 0.5
+            connector_height = max(bar_width, abs(upper_center_y - lower_center_y))
+            connector_length = max(bar_width * 1.15, abs(upper_center_x - lower_center_x) + bar_width * 0.5)
+            for side_sign in (-1.0, 1.0):
+                side_z = rear_center_z * side_sign
+                yield ('rear_climb', (upper_center_x, upper_center_y, side_z), (upper_length * 0.5, bar_width * 0.5, bar_width * 0.5))
+                yield ('rear_climb', (lower_center_x, lower_center_y, side_z), (lower_length * 0.5, bar_width * 0.5, bar_width * 0.5))
+                yield ('rear_climb', (connector_center_x, connector_center_y, side_z), (connector_length * 0.5, connector_height * 0.5, bar_width * 0.45))
 
         if has_mount or has_turret:
             turret_offset_x = float(profile['gimbal_offset_x_m'])
@@ -915,6 +997,8 @@ class AppearanceEditorApp:
         self._draw_text('俯视预览', self.font, self.colors['text'], (rect.x + 14, rect.y + 12))
         center = (rect.centerx, rect.centery + 16)
         render_width_scale = float(profile.get('body_render_width_scale', 0.82))
+        has_front_climb = self._profile_has_front_climb(profile)
+        has_rear_climb = self._profile_has_rear_climb(profile)
         has_mount = self._profile_has_mount(profile)
         has_turret = self._profile_has_turret(profile)
         has_barrel = self._profile_has_barrel(profile)
@@ -954,6 +1038,21 @@ class AppearanceEditorApp:
             register_hitbox('wheel', pygame.Rect(wheel_pos[0] - wheel_radius, wheel_pos[1] - wheel_radius, wheel_radius * 2, wheel_radius * 2))
             if self.selected_part == 'wheel':
                 pygame.draw.circle(self.screen, (244, 214, 72), wheel_pos, wheel_radius + 4, 2)
+
+        wheel_outer_y = max((abs(float(wheel_y)) * render_width_scale for _, wheel_y in profile.get('custom_wheel_positions_m', [])), default=profile['body_width_m'] * render_width_scale * 0.5 + profile['wheel_radius_m'] * 0.55)
+        if has_front_climb:
+            plate_length = max(8, int(profile.get('front_climb_assist_plate_length_m', 0.05) * scale))
+            plate_width = max(6, int(profile.get('front_climb_assist_plate_width_m', 0.018) * scale * 2.0))
+            plate_center_x = profile['body_length_m'] * 0.5 + profile.get('front_climb_assist_forward_offset_m', 0.04) + profile.get('front_climb_assist_plate_length_m', 0.05) * 0.5
+            plate_center_y = max(profile['body_width_m'] * render_width_scale * 0.28, wheel_outer_y - profile.get('front_climb_assist_inner_offset_m', 0.06) * render_width_scale)
+            for side_sign in (-1.0, 1.0):
+                front_rect = pygame.Rect(0, 0, plate_length, plate_width)
+                front_rect.center = world_to_screen(plate_center_x, plate_center_y * side_sign)
+                pygame.draw.rect(self.screen, (92, 96, 108), front_rect, border_radius=4)
+                pygame.draw.rect(self.screen, (18, 20, 24), front_rect, 1, border_radius=4)
+                register_hitbox('front_climb', front_rect)
+                if self.selected_part == 'front_climb':
+                    highlight_rect(front_rect, radius=4)
 
         if has_mount:
             mount_rect = pygame.Rect(0, 0, max(10, int(profile['gimbal_mount_length_m'] * scale)), max(10, int(profile['gimbal_mount_width_m'] * render_width_scale * scale)))
@@ -1023,6 +1122,30 @@ class AppearanceEditorApp:
                 if self.selected_part == 'armor_light':
                     highlight_rect(light_rect, radius=4)
 
+        if has_rear_climb:
+            upper_length = max(8, int(profile.get('rear_climb_assist_upper_length_m', 0.09) * scale))
+            lower_length = max(8, int(profile.get('rear_climb_assist_lower_length_m', 0.08) * scale))
+            bar_width = max(6, int(profile.get('rear_climb_assist_bar_width_m', 0.016) * scale * 2.0))
+            rear_center_y = max(profile['body_width_m'] * render_width_scale * 0.30, wheel_outer_y - profile.get('rear_climb_assist_inner_offset_m', 0.03) * render_width_scale)
+            upper_center_x = -profile['body_length_m'] * 0.5 - profile.get('rear_climb_assist_upper_offset_m', 0.055)
+            lower_center_x = -profile['body_length_m'] * 0.5 - profile.get('rear_climb_assist_lower_offset_m', 0.015)
+            for side_sign in (-1.0, 1.0):
+                upper_rect = pygame.Rect(0, 0, upper_length, bar_width)
+                upper_rect.center = world_to_screen(upper_center_x, rear_center_y * side_sign)
+                lower_rect = pygame.Rect(0, 0, lower_length, bar_width)
+                lower_rect.center = world_to_screen(lower_center_x, rear_center_y * side_sign)
+                joint_left = min(upper_rect.centerx, lower_rect.centerx)
+                joint_top = min(upper_rect.centery, lower_rect.centery) - bar_width // 2
+                joint_rect = pygame.Rect(joint_left, joint_top, max(bar_width, abs(upper_rect.centerx - lower_rect.centerx)), bar_width)
+                pygame.draw.rect(self.screen, (106, 110, 120), upper_rect, border_radius=4)
+                pygame.draw.rect(self.screen, (92, 96, 108), lower_rect, border_radius=4)
+                pygame.draw.rect(self.screen, (116, 120, 132), joint_rect, border_radius=4)
+                for climb_rect in (upper_rect, lower_rect, joint_rect):
+                    pygame.draw.rect(self.screen, (18, 20, 24), climb_rect, 1, border_radius=4)
+                    register_hitbox('rear_climb', climb_rect)
+                    if self.selected_part == 'rear_climb':
+                        highlight_rect(climb_rect, radius=4)
+
     def _draw_side_preview(self, rect, profile):
         pygame.draw.rect(self.screen, self.colors['preview_bg'], rect, border_radius=12)
         pygame.draw.rect(self.screen, self.colors['panel_border'], rect, 1, border_radius=12)
@@ -1031,6 +1154,8 @@ class AppearanceEditorApp:
         pygame.draw.line(self.screen, self.colors['grid'], (rect.x + 20, ground_y), (rect.right - 20, ground_y), 2)
         scale = min((rect.width - 80) / max(profile['body_length_m'] + float(profile.get('barrel_length_m', 0.0)) + 0.35, 0.5), (rect.height - 100) / max(profile['gimbal_height_m'] + 0.4, 0.5))
         center_x = rect.centerx
+        has_front_climb = self._profile_has_front_climb(profile)
+        has_rear_climb = self._profile_has_rear_climb(profile)
         has_mount = self._profile_has_mount(profile)
         has_turret = self._profile_has_turret(profile)
         has_barrel = self._profile_has_barrel(profile)
@@ -1059,6 +1184,42 @@ class AppearanceEditorApp:
         register_hitbox('body', body_rect)
         if self.selected_part == 'body':
             pygame.draw.rect(self.screen, (244, 214, 72), body_rect.inflate(6, 6), 3, border_radius=10)
+        if has_front_climb:
+            plate_rect = pygame.Rect(
+                0,
+                0,
+                max(10, int(profile.get('front_climb_assist_plate_length_m', 0.05) * scale)),
+                max(12, int(profile.get('front_climb_assist_plate_height_m', 0.18) * scale)),
+            )
+            plate_rect.midbottom = (
+                center_x + int((profile['body_length_m'] * 0.5 + profile.get('front_climb_assist_forward_offset_m', 0.04) + profile.get('front_climb_assist_plate_length_m', 0.05) * 0.5) * scale),
+                ground_y,
+            )
+            pygame.draw.rect(self.screen, (92, 96, 108), plate_rect, border_radius=4)
+            pygame.draw.rect(self.screen, (18, 20, 24), plate_rect, 1, border_radius=4)
+            register_hitbox('front_climb', plate_rect)
+            if self.selected_part == 'front_climb':
+                pygame.draw.rect(self.screen, (244, 214, 72), plate_rect.inflate(6, 6), 3, border_radius=6)
+        if has_rear_climb:
+            upper_anchor = (
+                center_x - int((profile['body_length_m'] * 0.5 + profile.get('rear_climb_assist_upper_offset_m', 0.055)) * scale),
+                body_rect.top + max(4, int(profile.get('rear_climb_assist_bar_width_m', 0.016) * scale * 3.0)),
+            )
+            joint = (
+                center_x - int((profile['body_length_m'] * 0.5 - profile.get('rear_climb_assist_upper_length_m', 0.09) * 0.45) * scale),
+                body_rect.centery + max(10, int(profile.get('rear_climb_assist_bar_width_m', 0.016) * scale * 5.0)),
+            )
+            lower_tip = (
+                center_x - int((profile['body_length_m'] * 0.5 + profile.get('rear_climb_assist_lower_offset_m', 0.015)) * scale),
+                ground_y - max(4, int(profile.get('rear_climb_assist_bar_width_m', 0.016) * scale * 1.2)),
+            )
+            dog_leg_width = max(4, int(profile.get('rear_climb_assist_bar_width_m', 0.016) * scale * 2.0))
+            pygame.draw.line(self.screen, (106, 110, 120), upper_anchor, joint, dog_leg_width)
+            pygame.draw.line(self.screen, (92, 96, 108), joint, lower_tip, dog_leg_width)
+            dog_leg_rect = pygame.Rect(min(upper_anchor[0], joint[0], lower_tip[0]), min(upper_anchor[1], joint[1], lower_tip[1]), max(10, max(upper_anchor[0], joint[0], lower_tip[0]) - min(upper_anchor[0], joint[0], lower_tip[0])), max(12, max(upper_anchor[1], joint[1], lower_tip[1]) - min(upper_anchor[1], joint[1], lower_tip[1])))
+            register_hitbox('rear_climb', dog_leg_rect)
+            if self.selected_part == 'rear_climb':
+                pygame.draw.rect(self.screen, (244, 214, 72), dog_leg_rect.inflate(8, 8), 3, border_radius=6)
         if has_mount:
             mount_rect = pygame.Rect(0, 0, max(12, int(profile['gimbal_mount_length_m'] * scale)), max(10, int(profile['gimbal_mount_height_m'] * scale)))
             mount_rect.center = (center_x + int(profile['gimbal_offset_x_m'] * scale), body_rect.top - mount_rect.height // 2 + 6)
@@ -1137,7 +1298,7 @@ class AppearanceEditorApp:
         if self.selected_part is None:
             hint_lines = [
                 '右侧预览中点击部件后，这里才会出现对应的长宽高与颜色参数。',
-                '当前可选：底盘、车轮、云台、枪管、连接件、装甲板、装甲灯条、枪管灯条。',
+                '当前可选：底盘、车轮、前爬升板、后狗腿、云台、枪管、连接件、装甲板、装甲灯条、枪管灯条。',
             ]
             for index, line in enumerate(hint_lines):
                 self._draw_text(line, self.small_font, self.colors['muted'], (content_rect.x + 16, content_rect.y + 18 + index * 26))

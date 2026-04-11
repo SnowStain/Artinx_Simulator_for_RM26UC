@@ -81,12 +81,23 @@ class EntityManager:
             'barrel_light_width_m',
             'barrel_light_height_m',
             'body_render_width_scale',
+            'front_climb_assist_plate_length_m',
+            'front_climb_assist_plate_width_m',
+            'front_climb_assist_plate_height_m',
+            'front_climb_assist_forward_offset_m',
+            'front_climb_assist_inner_offset_m',
+            'rear_climb_assist_upper_length_m',
+            'rear_climb_assist_lower_length_m',
+            'rear_climb_assist_bar_width_m',
+            'rear_climb_assist_upper_offset_m',
+            'rear_climb_assist_lower_offset_m',
+            'rear_climb_assist_inner_offset_m',
         )
         for field_name in numeric_fields:
             if field_name in profile:
                 setattr(entity, field_name, float(profile[field_name]))
 
-        for field_name in ('wheel_style', 'suspension_style', 'arm_style'):
+        for field_name in ('front_climb_assist_style', 'rear_climb_assist_style', 'wheel_style', 'suspension_style', 'arm_style'):
             if field_name in profile:
                 setattr(entity, field_name, str(profile[field_name]))
 
@@ -151,7 +162,11 @@ class EntityManager:
 
     def _sync_traversal_constraints(self, entity):
         wheel_radius = max(0.01, float(getattr(entity, 'wheel_radius_m', 0.08)))
-        entity.max_terrain_step_height_m = wheel_radius
+        direct_step_height = max(0.01, float(getattr(entity, 'direct_terrain_step_height_m', 0.06)))
+        climb_step_height = max(direct_step_height, float(getattr(entity, 'max_step_climb_height_m', wheel_radius)))
+        entity.direct_terrain_step_height_m = direct_step_height
+        entity.max_step_climb_height_m = climb_step_height
+        entity.max_terrain_step_height_m = direct_step_height
 
     def _performance_rules(self):
         return self.config.get('rules', {}).get('performance_profiles', {})
@@ -253,6 +268,17 @@ class EntityManager:
         entity.barrel_radius_m = 0.015
         entity.front_climb_assist_style = 'none'
         entity.rear_climb_assist_style = 'none'
+        entity.front_climb_assist_plate_length_m = 0.05
+        entity.front_climb_assist_plate_width_m = 0.018
+        entity.front_climb_assist_plate_height_m = 0.18
+        entity.front_climb_assist_forward_offset_m = 0.04
+        entity.front_climb_assist_inner_offset_m = 0.06
+        entity.rear_climb_assist_upper_length_m = 0.09
+        entity.rear_climb_assist_lower_length_m = 0.08
+        entity.rear_climb_assist_bar_width_m = 0.016
+        entity.rear_climb_assist_upper_offset_m = 0.055
+        entity.rear_climb_assist_lower_offset_m = 0.015
+        entity.rear_climb_assist_inner_offset_m = 0.03
         entity.wheel_style = 'standard'
         entity.suspension_style = 'none'
         entity.arm_style = 'none'
@@ -268,11 +294,13 @@ class EntityManager:
         entity.barrel_light_width_m = 0.02
         entity.barrel_light_height_m = 0.02
         entity.body_render_width_scale = 0.82
-        entity.max_pitch_up_deg = 40.0
-        entity.max_pitch_down_deg = 35.0
+        entity.max_pitch_up_deg = 30.0
+        entity.max_pitch_down_deg = 30.0
+        entity.direct_terrain_step_height_m = 0.06
+        entity.max_step_climb_height_m = 0.06
         if entity_type == 'sentry':
             entity.step_climb_duration_sec = 1.0
-            entity.max_terrain_step_height_m = 0.35
+            entity.max_step_climb_height_m = 0.35
             entity.collision_radius = 24.0
             entity.wheel_count = 4
             entity.body_size_m = 0.55
@@ -310,7 +338,7 @@ class EntityManager:
             return
         if robot_type == '步兵':
             entity.step_climb_duration_sec = 1.0
-            entity.max_terrain_step_height_m = 0.35
+            entity.max_step_climb_height_m = 0.35
             entity.collision_radius = 16.0
             entity.wheel_count = 2
             entity.body_size_m = 0.50
@@ -334,7 +362,7 @@ class EntityManager:
             entity.barrel_radius_m = 0.015
         elif robot_type == '英雄':
             entity.step_climb_duration_sec = 1.0
-            entity.max_terrain_step_height_m = 0.35
+            entity.max_step_climb_height_m = 0.35
             entity.collision_radius = 20.0
             entity.wheel_count = 4
             entity.body_size_m = 0.60
@@ -359,7 +387,7 @@ class EntityManager:
             entity.barrel_radius_m = 0.020
         elif robot_type == '工程':
             entity.step_climb_duration_sec = 1.0
-            entity.max_terrain_step_height_m = 0.35
+            entity.max_step_climb_height_m = 0.35
             entity.collision_radius = 21.0
             entity.wheel_count = 4
             entity.body_size_m = 0.55
@@ -388,7 +416,7 @@ class EntityManager:
             entity.barrel_radius_m = 0.0
         else:
             entity.step_climb_duration_sec = 1.0
-            entity.max_terrain_step_height_m = 0.35
+            entity.max_step_climb_height_m = 0.35
             entity.collision_radius = 18.0
             entity.wheel_count = 4
             entity.body_size_m = 0.50

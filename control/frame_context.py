@@ -22,13 +22,18 @@ class AIFrameContext:
     role_members: dict
     team_health: dict
     half_pressure: dict
+    player_entity_id: str | None
+    player_team: str | None
+    player_position: tuple | None
 
     @classmethod
-    def from_entities(cls, entities, map_center_x=None):
+    def from_entities(cls, entities, map_center_x=None, player_entity_id=None):
         all_entities = tuple(entities or ())
         alive_by_team = {'red': [], 'blue': []}
         structures = {}
         role_members = {}
+        player_team = None
+        player_position = None
         team_health = {
             'red': [0.0, 0.0],
             'blue': [0.0, 0.0],
@@ -50,6 +55,9 @@ class AIFrameContext:
             team = getattr(entity, 'team', None)
             if team not in alive_by_team:
                 continue
+            if player_entity_id is not None and getattr(entity, 'id', None) == player_entity_id and getattr(entity, 'type', None) in {'robot', 'sentry'} and entity.is_alive():
+                player_team = team
+                player_position = (float(entity.position['x']), float(entity.position['y']))
             if getattr(entity, 'type', None) in {'base', 'outpost'} and structures.get((team, entity.type)) is None:
                 structures[(team, entity.type)] = entity
             if getattr(entity, 'type', None) not in {'robot', 'sentry'}:
@@ -112,6 +120,9 @@ class AIFrameContext:
             role_members=frozen_roles,
             team_health=frozen_team_health,
             half_pressure=frozen_half_pressure,
+            player_entity_id=str(player_entity_id) if player_entity_id is not None else None,
+            player_team=player_team,
+            player_position=player_position,
         )
 
     def allies_for(self, team, exclude_id=None):

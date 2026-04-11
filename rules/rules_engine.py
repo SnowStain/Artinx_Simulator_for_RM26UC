@@ -142,8 +142,8 @@ class RulesEngine:
                 'armor_center_height_m': 0.15,
                 'turret_axis_height_m': 0.50,
                 'camera_height_m': 0.50,
-                'max_pitch_up_deg': 40.0,
-                'max_pitch_down_deg': 35.0,
+                'max_pitch_up_deg': 30.0,
+                'max_pitch_down_deg': 30.0,
                 'los_sample_step_m': 0.25,
                 'los_clearance_m': 0.02,
                 'los_pitch_margin_deg': 0.8,
@@ -621,8 +621,8 @@ class RulesEngine:
             'armor_center_height_m': float(armor_height),
             'turret_axis_height_m': float(turret_height),
             'camera_height_m': float(turret_height),
-            'max_pitch_up_deg': float(getattr(entity, 'max_pitch_up_deg', shooting.get('max_pitch_up_deg', 40.0))),
-            'max_pitch_down_deg': float(getattr(entity, 'max_pitch_down_deg', shooting.get('max_pitch_down_deg', 35.0))),
+            'max_pitch_up_deg': float(getattr(entity, 'max_pitch_up_deg', shooting.get('max_pitch_up_deg', 30.0))),
+            'max_pitch_down_deg': float(getattr(entity, 'max_pitch_down_deg', shooting.get('max_pitch_down_deg', 30.0))),
             'auto_aim_max_distance_m': float(shooting['auto_aim_max_distance_m']),
             'auto_aim_max_distance_world': float(self.auto_aim_max_distance),
             'auto_aim_fov_deg': float(shooting['auto_aim_fov_deg']),
@@ -732,8 +732,14 @@ class RulesEngine:
     def _projectile_speed_mps(self, ammo_type):
         shooting_rules = self.rules.get('shooting', {})
         if ammo_type == '42mm':
-            return float(shooting_rules.get('projectile_speed_42mm_mps', 17.0))
-        return float(shooting_rules.get('projectile_speed_17mm_mps', 23.0))
+            return float(shooting_rules.get('projectile_speed_42mm_mps', 16.0))
+        return float(shooting_rules.get('projectile_speed_17mm_mps', 20.0))
+
+    def _projectile_diameter_m(self, ammo_type):
+        shooting_rules = self.rules.get('shooting', {})
+        if ammo_type == '42mm':
+            return float(shooting_rules.get('projectile_diameter_42mm_m', 0.042))
+        return float(shooting_rules.get('projectile_diameter_17mm_m', 0.017))
 
     def _projectile_drag_coefficient(self, ammo_type):
         shooting_rules = self.rules.get('shooting', {})
@@ -758,13 +764,42 @@ class RulesEngine:
             float(point3d[2]),
         )
 
-    def _shooter_muzzle_point(self, shooter):
+    def _shooter_muzzle_point(self, shooter, pitch_deg=None):
+        """Return the world (x,y,z) position of the muzzle (barrel center).
+
+        If pitch_deg is provided, include barrel vertical extension and use
+        barrel horizontal component when computing the muzzle position.
+        If pitch_deg is None, return the baseline view height without barrel
+        vertical offset (used as an initial guess for pitch solving).
+        """
         yaw_rad = math.radians(float(getattr(shooter, 'turret_angle', shooter.angle)))
-        local_forward = self._meters_to_world_units(float(getattr(shooter, 'gimbal_offset_x_m', 0.0)))
-        local_right = self._meters_to_world_units(float(getattr(shooter, 'gimbal_offset_y_m', 0.0)))
+
+        # offsets and dimensions (meters)
+        gimbal_offset_x_m = float(getattr(shooter, 'gimbal_offset_x_m', 0.0))
+        gimbal_offset_y_m = float(getattr(shooter, 'gimbal_offset_y_m', 0.0))
+        gimbal_length_m = float(getattr(shooter, 'gimbal_length_m', 0.0))
+        barrel_length_m = float(getattr(shooter, 'barrel_length_m', 0.0))
+
+        # pitch influences barrel horizontal/vertical components
+        pitch_rad = 0.0 if pitch_deg is None else math.radians(float(pitch_deg))
+        barrel_horizontal_m = barrel_length_m * max(0.0, math.cos(pitch_rad))
+
+        # forward distance from entity origin to muzzle (meters), use half gimbal length as turret center
+        muzzle_forward_m = gimbal_offset_x_m + gimbal_length_m * 0.5 + barrel_horizontal_m
+        local_forward = self._meters_to_world_units(muzzle_forward_m)
+        local_right = self._meters_to_world_units(gimbal_offset_y_m)
+
         world_x = float(shooter.position['x']) + math.cos(yaw_rad) * local_forward - math.sin(yaw_rad) * local_right
         world_y = float(shooter.position['y']) + math.sin(yaw_rad) * local_forward + math.cos(yaw_rad) * local_right
-        return (world_x, world_y, self._shooter_view_height_m(shooter))
+
+        anchor_height = self._shooter_view_height_m(shooter)
+        if pitch_deg is None:
+            return (world_x, world_y, anchor_height)
+
+        # apply barrel vertical offset (meters), scale by entity vertical scale
+        barrel_vertical_m = barrel_length_m * math.sin(pitch_rad) * self._entity_vertical_scale(shooter)
+        muzzle_height = anchor_height + barrel_vertical_m
+        return (world_x, world_y, muzzle_height)
 
     def _shooter_view_height_m(self, shooter):
         shooting_rules = self.rules.get('shooting', {})
@@ -881,8 +916,8 @@ class RulesEngine:
         horizontal_distance = math.hypot(float(target_point[0]) - float(start_point[0]), float(target_point[1]) - float(start_point[1]))
         if horizontal_distance <= 1e-6:
             return self._normalize_angle_diff(float(preferred_pitch_deg))
-        max_up = float(getattr(shooter, 'max_pitch_up_deg', self.rules.get('shooting', {}).get('max_pitch_up_deg', 40.0)))
-        max_down = float(getattr(shooter, 'max_pitch_down_deg', self.rules.get('shooting', {}).get('max_pitch_down_deg', 35.0)))
+        max_up = float(getattr(shooter, 'max_pitch_up_deg', self.rules.get('shooting', {}).get('max_pitch_up_deg', 30.0)))
+        max_down = float(getattr(shooter, 'max_pitch_down_deg', self.rules.get('shooting', {}).get('max_pitch_down_deg', 30.0)))
         low = -max_down
         high = max_up
         best_pitch = max(low, min(high, float(preferred_pitch_deg)))
@@ -908,17 +943,23 @@ class RulesEngine:
         return max(low, min(high, float(best_pitch)))
 
     def get_aim_angles_to_point(self, shooter, point_x, point_y, point_z):
-        dx = float(point_x) - float(shooter.position['x'])
-        dy = float(point_y) - float(shooter.position['y'])
-        yaw_deg = math.degrees(math.atan2(dy, dx))
-        start_point = self._shooter_muzzle_point(shooter)
         target_point = (float(point_x), float(point_y), float(point_z))
-        pitch_deg = self._solve_ballistic_pitch_deg(
-            shooter,
-            start_point,
-            target_point,
-            preferred_pitch_deg=float(getattr(shooter, 'gimbal_pitch_deg', 0.0)),
-        )
+        preferred_pitch = float(getattr(shooter, 'gimbal_pitch_deg', 0.0))
+
+        # Start with a reasonable muzzle point using the preferred pitch,
+        # then iterate a couple times because muzzle position depends on pitch.
+        start_point = self._shooter_muzzle_point(shooter, pitch_deg=preferred_pitch)
+        yaw_deg = math.degrees(math.atan2(target_point[1] - start_point[1], target_point[0] - start_point[0]))
+        pitch_deg = preferred_pitch
+        for _ in range(2):
+            pitch_deg = self._solve_ballistic_pitch_deg(
+                shooter,
+                start_point,
+                target_point,
+                preferred_pitch_deg=preferred_pitch,
+            )
+            start_point = self._shooter_muzzle_point(shooter, pitch_deg=pitch_deg)
+            yaw_deg = math.degrees(math.atan2(target_point[1] - start_point[1], target_point[0] - start_point[0]))
         return yaw_deg, pitch_deg
 
     def get_entity_armor_plate_targets(self, target):
@@ -1024,8 +1065,8 @@ class RulesEngine:
         distance_m = distance / meters_per_world_unit
         target_pitch_rad = math.atan2(target_height - shooter_height, max(distance_m, 1e-6))
         target_pitch_deg = math.degrees(target_pitch_rad)
-        max_pitch_up_deg = float(self.rules['shooting'].get('max_pitch_up_deg', 35.0))
-        max_pitch_down_deg = float(self.rules['shooting'].get('max_pitch_down_deg', 25.0))
+        max_pitch_up_deg = float(self.rules['shooting'].get('max_pitch_up_deg', 30.0))
+        max_pitch_down_deg = float(self.rules['shooting'].get('max_pitch_down_deg', 30.0))
         if target_pitch_deg > max_pitch_up_deg or target_pitch_deg < -max_pitch_down_deg:
             if cache_key is not None:
                 self._line_of_sight_cache[cache_key] = False

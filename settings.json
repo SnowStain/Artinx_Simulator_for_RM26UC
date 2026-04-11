@@ -4,20 +4,32 @@
     "show_aim_fov": false,
     "show_entities": true,
     "enable_entity_movement": true,
-    "player_look_sensitivity_deg": 0.18,
-    "player_pitch_sensitivity_deg": 0.12,
+    "player_look_sensitivity_deg": 0.21,
+    "player_pitch_sensitivity_deg": 0.005,
+    "player_mouse_input": {
+      "yaw_sensitivity_deg": 0.21,
+      "pitch_sensitivity_deg": 0.005,
+      "yaw_sign": 1.0,
+      "pitch_sign": -1.0,
+      "max_pitch_up_deg": 30.0,
+      "max_pitch_down_deg": 30.0
+    },
     "show_perf_overlay": true,
     "enable_perf_logging": true,
     "enable_perf_breakdown": true,
     "enable_perf_file_logging": true,
     "perf_sample_window": 20000,
     "perf_log_interval_sec": 5.0,
-    "debug_feature_toggles": {}
+    "debug_feature_toggles": {},
+    "player_terrain_render_scale": 0.52,
+    "player_motion_terrain_render_scale": 0.36,
+    "player_terrain_scene_max_cells": 12000
   },
   "ai": {
     "behavior_preset": "latest_behavior",
     "controller_worker_threads": 4,
     "controller_shards_per_frame": 1,
+    "standalone_player_control_dispatch_interval_sec": 0.32,
     "controller_dispatch_interval_sec": 0.12,
     "controller_time_budget_ms": 12.0,
     "player_control_dispatch_interval_sec": 0.2,
@@ -30,6 +42,11 @@
   },
   "entities": {
     "initial_positions": {
+    "player_focus_interest_radius_m": 10.0,
+    "player_focus_enemy_update_multiplier": 2.6,
+    "player_focus_enemy_idle_update_multiplier": 3.4,
+    "player_focus_path_replan_multiplier": 2.8,
+    "player_focus_goal_hysteresis_multiplier": 2.4,
       "red": {
         "robot_1": {
           "x": 112,
@@ -217,8 +234,8 @@
       "armor_center_height_m": 0.15,
       "turret_axis_height_m": 0.45,
       "camera_height_m": 0.5,
-      "max_pitch_up_deg": 35.0,
-      "max_pitch_down_deg": 25.0,
+      "max_pitch_up_deg": 30.0,
+      "max_pitch_down_deg": 30.0,
       "los_sample_step_m": 0.25,
       "los_clearance_m": 0.02,
       "los_pitch_margin_deg": 0.8,

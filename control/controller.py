@@ -44,6 +44,10 @@ class Controller:
             self._controller_dispatch_interval,
             float(ai_config.get('player_control_dispatch_interval_sec', max(0.20, self._controller_dispatch_interval * 1.5))),
         )
+        self._standalone_player_control_dispatch_interval = max(
+            self._player_control_dispatch_interval,
+            float(ai_config.get('standalone_player_control_dispatch_interval_sec', max(0.32, self._player_control_dispatch_interval * 1.6))),
+        )
         self._last_ai_dispatch_time = -1e9
         
         # 控制模式：'manual' 或 'ai'
@@ -77,13 +81,9 @@ class Controller:
             '步兵': 'infantry',
         }.get(robot_type, 'infantry')
 
-    def _update_ai_parallel(self, entities, map_manager=None, rules_engine=None, game_time=0.0, game_duration=0.0, controlled_entity_ids=None, excluded_entity_ids=None):
-        controlled_ids = None if controlled_entity_ids is None else set(controlled_entity_ids)
-        excluded_ids = set(excluded_entity_ids or ())
-        map_center_x = None
-        if map_manager is not None:
-            map_center_x = float(getattr(map_manager, 'map_width', 0.0)) * 0.5
-        shared_frame = AIFrameContext.from_entities(entities, map_center_x=map_center_x)
+    def _collect_ai_shard_entities(self, entities, controlled_ids=None, excluded_ids=None):
+        controlled_ids = None if controlled_ids is None else set(controlled_ids)
+        excluded_ids = set(excluded_ids or ())
         shard_entities = [[] for _ in range(self._ai_worker_threads)]
         for entity in entities:
             if entity.id in excluded_ids:
@@ -97,6 +97,16 @@ class Controller:
             if shard_index is None:
                 shard_index = self._assign_entity_to_shard(entity.id)
             shard_entities[shard_index].append(entity)
+        return shard_entities
+
+    def _update_ai_parallel(self, entities, map_manager=None, rules_engine=None, game_time=0.0, game_duration=0.0, controlled_entity_ids=None, excluded_entity_ids=None, player_focus_entity_id=None):
+        controlled_ids = None if controlled_entity_ids is None else set(controlled_entity_ids)
+        excluded_ids = set(excluded_entity_ids or ())
+        map_center_x = None
+        if map_manager is not None:
+            map_center_x = float(getattr(map_manager, 'map_width', 0.0)) * 0.5
+        shared_frame = AIFrameContext.from_entities(entities, map_center_x=map_center_x, player_entity_id=player_focus_entity_id)
+        shard_entities = self._collect_ai_shard_entities(entities, controlled_ids=controlled_ids, excluded_ids=excluded_ids)
 
         active_shards = [index for index, members in enumerate(shard_entities) if members]
         if not active_shards:
@@ -148,26 +158,17 @@ class Controller:
     def _maintain_ai_motion_only(self, entities, controlled_entity_ids=None, excluded_entity_ids=None):
         controlled_ids = None if controlled_entity_ids is None else set(controlled_entity_ids)
         excluded_ids = set(excluded_entity_ids or ())
-        shard_entities = [[] for _ in range(self._ai_worker_threads)]
-        for entity in entities:
-            if entity.id in excluded_ids:
-                continue
-            if controlled_ids is not None and entity.id not in controlled_ids:
-                continue
-            if not self._is_ai_controllable_entity(entity):
-                continue
-            role_key = self._entity_role_key(entity)
-            shard_index = self._role_shard_map.get(role_key)
-            if shard_index is None:
-                shard_index = self._assign_entity_to_shard(entity.id)
-            shard_entities[shard_index].append(entity)
+        shard_entities = self._collect_ai_shard_entities(entities, controlled_ids=controlled_ids, excluded_ids=excluded_ids)
         for shard_index, members in enumerate(shard_entities):
             if not members:
                 continue
             self._ai_controllers[shard_index].maintain_entities_motion(members)
 
-    def _should_dispatch_ai(self, game_time, player_control_active=False):
-        dispatch_interval = self._player_control_dispatch_interval if player_control_active else self._controller_dispatch_interval
+    def _should_dispatch_ai(self, game_time, player_control_active=False, standalone_player_mode=False):
+        if standalone_player_mode:
+            dispatch_interval = self._standalone_player_control_dispatch_interval
+        else:
+            dispatch_interval = self._player_control_dispatch_interval if player_control_active else self._controller_dispatch_interval
         if self._last_ai_dispatch_time <= -1e8:
             self._last_ai_dispatch_time = float(game_time)
             return True
@@ -183,12 +184,27 @@ class Controller:
         controlled_ids = None if controlled_entity_ids is None else set(controlled_entity_ids)
         manual_ids = set(manual_entity_ids or ())
         target_entities = [entity for entity in entities if entity.id in manual_ids]
+        standalone_player_mode = bool(self.config.get('simulator', {}).get('standalone_3d_program', False)) and bool(manual_ids)
+        player_focus_entity_id = next(iter(manual_ids), None)
 
         # 更新 AI 控制（并行分片）；异常时回退到单线程，避免中断对局。
-        dispatch_ai = self._should_dispatch_ai(game_time, player_control_active=bool(manual_ids))
+        dispatch_ai = self._should_dispatch_ai(
+            game_time,
+            player_control_active=bool(manual_ids),
+            standalone_player_mode=standalone_player_mode,
+        )
         try:
             if dispatch_ai:
-                self._update_ai_parallel(entities, map_manager, rules_engine, game_time, game_duration, controlled_entity_ids=controlled_ids, excluded_entity_ids=ai_excluded_entity_ids)
+                self._update_ai_parallel(
+                    entities,
+                    map_manager,
+                    rules_engine,
+                    game_time,
+                    game_duration,
+                    controlled_entity_ids=controlled_ids,
+                    excluded_entity_ids=ai_excluded_entity_ids,
+                    player_focus_entity_id=player_focus_entity_id,
+                )
             else:
                 self._maintain_ai_motion_only(entities, controlled_entity_ids=controlled_ids, excluded_entity_ids=ai_excluded_entity_ids)
         except Exception:

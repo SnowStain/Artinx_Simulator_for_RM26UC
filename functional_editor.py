@@ -1025,9 +1025,8 @@ class FunctionalEditorRenderer(Renderer):
 
 def main():
     config_manager = ConfigManager()
-    config = config_manager.load_config('config.json', 'settings.json')
+    config = config_manager.load_config('config.json')
     config['_config_path'] = 'config.json'
-    config['_settings_path'] = 'settings.json'
 
     game_engine = FunctionalEditorEngine(config, config_manager=config_manager, config_path='config.json')
     renderer = FunctionalEditorRenderer(game_engine, config)

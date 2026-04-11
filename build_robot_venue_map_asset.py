@@ -21,7 +21,7 @@ from core.config_manager import ConfigManager
 ROOT_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = ROOT_DIR / 'robot_venue_map_asset'
 DEFAULT_CONFIG_PATH = ROOT_DIR / 'config.json'
-DEFAULT_SETTINGS_PATH = ROOT_DIR / 'settings.json'
+DEFAULT_SETTINGS_PATH = ROOT_DIR / 'CommonSetting.json'
 DEFAULT_INPUT_CANDIDATES = (
     ROOT_DIR / 'map.json',
     ROOT_DIR / 'maps' / 'basicMap' / 'map.json',
@@ -852,7 +852,7 @@ def build_arg_parser():
     parser.add_argument('--input', help='输入 map.json 路径；可为任务书标准 schema 或当前项目地图 schema')
     parser.add_argument('--output', default=str(OUTPUT_DIR), help='输出目录，默认 robot_venue_map_asset')
     parser.add_argument('--config', default=str(DEFAULT_CONFIG_PATH), help='默认输入回退时使用的 config.json 路径')
-    parser.add_argument('--settings', default=str(DEFAULT_SETTINGS_PATH), help='默认输入回退时使用的 settings.json 路径')
+    parser.add_argument('--settings', default=str(DEFAULT_SETTINGS_PATH), help='默认输入回退时使用的 CommonSetting.json 路径')
     parser.add_argument('--no-zip', action='store_true', help='不生成 zip 归档')
     return parser
 

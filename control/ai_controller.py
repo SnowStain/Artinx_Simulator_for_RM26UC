@@ -131,6 +131,11 @@ class AIController:
         self._path_failure_retry_sec = max(self._ai_update_interval, float(self._ai_config.get('path_failure_retry_sec', max(0.45, self._ai_update_interval * 2.5))))
         self._path_failure_retry_max_sec = max(self._path_failure_retry_sec, float(self._ai_config.get('path_failure_retry_max_sec', 1.6)))
         self._path_goal_hysteresis_world = max(24.0, float(self._ai_config.get('path_goal_hysteresis_world', 56.0)))
+        self._player_focus_interest_radius_m = max(4.0, float(self._ai_config.get('player_focus_interest_radius_m', 10.0)))
+        self._player_focus_enemy_update_multiplier = max(1.0, float(self._ai_config.get('player_focus_enemy_update_multiplier', 2.6)))
+        self._player_focus_enemy_idle_update_multiplier = max(self._player_focus_enemy_update_multiplier, float(self._ai_config.get('player_focus_enemy_idle_update_multiplier', 3.4)))
+        self._player_focus_path_replan_multiplier = max(1.0, float(self._ai_config.get('player_focus_path_replan_multiplier', 2.8)))
+        self._player_focus_goal_hysteresis_multiplier = max(1.0, float(self._ai_config.get('player_focus_goal_hysteresis_multiplier', 2.4)))
         self._direct_segment_check_interval = max(self._ai_update_interval, float(self._ai_config.get('direct_segment_check_interval_sec', max(0.28, self._ai_update_interval * 1.5))))
         self._pathfinder_worker_threads = max(1, int(self._ai_config.get('pathfinder_worker_threads', 1)))
         self._path_replans_remaining = self._path_replans_per_update
@@ -153,6 +158,8 @@ class AIController:
         self._navigation_planner = NavigationPlannerRuntime(self, self._pathfinder_router)
         self._targeting_runtime = TargetingRuntime(self)
         self._frame_target_assessment_cache = {}
+        self._current_frame_view = None
+        self._current_game_time = 0.0
         self._refresh_behavior_runtime_overrides(force=True)
 
     def shutdown(self):
@@ -171,38 +178,90 @@ class AIController:
         phase = abs(hash(str(entity_id))) % 4096
         return (phase / 4096.0) * self._ai_update_interval
 
+    def _player_focus_interest_radius_world(self, map_manager=None):
+        if map_manager is None:
+            return 480.0
+        return self._meters_to_world_units(self._player_focus_interest_radius_m, map_manager)
+
+    def _is_remote_from_player_focus(self, entity, map_manager=None, frame_view=None):
+        if entity is None or frame_view is None:
+            return False
+        player_entity_id = getattr(frame_view, 'player_entity_id', None)
+        player_team = getattr(frame_view, 'player_team', None)
+        player_position = getattr(frame_view, 'player_position', None)
+        if not player_entity_id or player_position is None:
+            return False
+        if getattr(entity, 'id', None) == player_entity_id or getattr(entity, 'team', None) == player_team:
+            return False
+        interest_radius = self._player_focus_interest_radius_world(map_manager)
+        entity_distance = math.hypot(float(entity.position['x']) - float(player_position[0]), float(entity.position['y']) - float(player_position[1]))
+        if entity_distance <= interest_radius:
+            return False
+        target = getattr(entity, 'target', None)
+        if isinstance(target, dict) and target.get('id') == player_entity_id:
+            return False
+        navigation_target = getattr(entity, 'ai_navigation_target', None) or getattr(entity, 'ai_movement_target', None)
+        if isinstance(navigation_target, (list, tuple)) and len(navigation_target) >= 2:
+            navigation_distance = math.hypot(float(navigation_target[0]) - float(player_position[0]), float(navigation_target[1]) - float(player_position[1]))
+            if navigation_distance <= interest_radius * 1.15:
+                return False
+        return True
+
+    def _effective_path_replan_interval(self, entity, map_manager=None, frame_view=None):
+        interval = float(self._path_replan_interval)
+        if self._is_remote_from_player_focus(entity, map_manager=map_manager, frame_view=frame_view):
+            multiplier = self._player_focus_path_replan_multiplier
+            if getattr(entity, 'target', None) is None and getattr(entity, 'ai_navigation_target', None) is None:
+                multiplier *= 1.2
+            return interval * multiplier
+        return interval
+
+    def _effective_path_goal_hysteresis_world(self, entity, map_manager=None, frame_view=None):
+        hysteresis = float(self._path_goal_hysteresis_world)
+        if self._is_remote_from_player_focus(entity, map_manager=map_manager, frame_view=frame_view):
+            return hysteresis * self._player_focus_goal_hysteresis_multiplier
+        return hysteresis
+
     def _effective_update_interval(self, entity, map_manager=None, rules_engine=None, frame_view=None):
         interval = float(self._ai_update_interval)
         if entity is None or frame_view is None:
             return interval
+        remote_from_player_focus = self._is_remote_from_player_focus(entity, map_manager=map_manager, frame_view=frame_view)
         if getattr(entity, 'step_climb_state', None) is not None:
-            return interval
-        if getattr(entity, 'fire_control_state', 'idle') == 'firing' or getattr(entity, 'target', None) is not None:
             return interval
         if getattr(entity, 'hero_deployment_active', False):
             return interval
 
+        if getattr(entity, 'fire_control_state', 'idle') == 'firing' or getattr(entity, 'target', None) is not None:
+            return interval * (self._player_focus_enemy_update_multiplier if remote_from_player_focus else 1.0)
+
         enemy_entities = frame_view.enemies_for(getattr(entity, 'team', None))
         if not enemy_entities:
-            return interval * 2.0
+            base_interval = interval * 2.0
+        else:
+            nearest_distance = float('inf')
+            for enemy in enemy_entities:
+                distance = math.hypot(float(enemy.position['x']) - float(entity.position['x']), float(enemy.position['y']) - float(entity.position['y']))
+                if distance < nearest_distance:
+                    nearest_distance = distance
+            if map_manager is None:
+                base_interval = interval if nearest_distance <= 480.0 else interval * 1.8
+            else:
+                engage_distance = self._meters_to_world_units(7.5, map_manager)
+                remote_distance = self._meters_to_world_units(12.0, map_manager)
+                if nearest_distance <= engage_distance:
+                    base_interval = interval
+                elif rules_engine is not None and hasattr(rules_engine, 'is_out_of_combat') and rules_engine.is_out_of_combat(entity):
+                    base_interval = interval * (2.4 if nearest_distance >= remote_distance else 1.7)
+                elif getattr(entity, 'ai_navigation_target', None) is None and nearest_distance >= remote_distance:
+                    base_interval = interval * 2.0
+                else:
+                    base_interval = interval * 1.35
 
-        nearest_distance = float('inf')
-        for enemy in enemy_entities:
-            distance = math.hypot(float(enemy.position['x']) - float(entity.position['x']), float(enemy.position['y']) - float(entity.position['y']))
-            if distance < nearest_distance:
-                nearest_distance = distance
-        if map_manager is None:
-            return interval if nearest_distance <= 480.0 else interval * 1.8
-
-        engage_distance = self._meters_to_world_units(7.5, map_manager)
-        remote_distance = self._meters_to_world_units(12.0, map_manager)
-        if nearest_distance <= engage_distance:
-            return interval
-        if rules_engine is not None and hasattr(rules_engine, 'is_out_of_combat') and rules_engine.is_out_of_combat(entity):
-            return interval * (2.4 if nearest_distance >= remote_distance else 1.7)
-        if getattr(entity, 'ai_navigation_target', None) is None and nearest_distance >= remote_distance:
-            return interval * 2.0
-        return interval * 1.35
+        if remote_from_player_focus:
+            multiplier = self._player_focus_enemy_idle_update_multiplier if getattr(entity, 'ai_navigation_target', None) is None else self._player_focus_enemy_update_multiplier
+            return base_interval * multiplier
+        return base_interval
 
     def _debug_feature_toggles(self):
         simulator_config = self.config.get('simulator', {}) if isinstance(self.config, dict) else {}
@@ -2877,60 +2936,65 @@ class AIController:
         self._movement_status_cache.clear()
         self._frame_target_assessment_cache.clear()
         self._path_replans_remaining = self._path_replans_per_update
+        self._current_frame_view = frame_view
+        self._current_game_time = float(game_time)
         dispatch_start = time.perf_counter()
         budget_exhausted = False
-        for entity in update_entities:
-            if controlled_ids is not None and entity.id not in controlled_ids:
-                continue
-            if not self._should_control_entity(entity):
-                continue
-            if budget_exhausted:
-                self._maintain_continuous_motion(entity)
-                continue
-            if self._controller_time_budget_sec > 0.0 and time.perf_counter() - dispatch_start >= self._controller_time_budget_sec:
-                budget_exhausted = True
-                self._maintain_continuous_motion(entity)
-                continue
-            if not self._role_state_machine_enabled(entity):
-                self._maintain_continuous_motion(entity)
-                continue
-            last_update = self._last_ai_update_time.get(entity.id)
-            if last_update is None:
-                last_update = game_time - self._entity_update_phase_offset(entity.id)
-                self._last_ai_update_time[entity.id] = last_update
-            effective_interval = self._effective_update_interval(entity, map_manager=map_manager, rules_engine=rules_engine, frame_view=frame_view)
-            if game_time - last_update < effective_interval:
-                self._maintain_continuous_motion(entity)
-                continue
-            self._last_ai_update_time[entity.id] = game_time
-            context = self._build_context(entity, entities, map_manager, rules_engine, game_time, game_duration, shared_frame=frame_view)
-            if self._decision_system_disabled():
-                decision = self._todo_decision_action(context)
-                bt_node = f'_action_{self.TODO_DECISION_ID}'
+        try:
+            for entity in update_entities:
+                if controlled_ids is not None and entity.id not in controlled_ids:
+                    continue
+                if not self._should_control_entity(entity):
+                    continue
+                if budget_exhausted:
+                    self._maintain_continuous_motion(entity)
+                    continue
+                if self._controller_time_budget_sec > 0.0 and time.perf_counter() - dispatch_start >= self._controller_time_budget_sec:
+                    budget_exhausted = True
+                    self._maintain_continuous_motion(entity)
+                    continue
+                if not self._role_state_machine_enabled(entity):
+                    self._maintain_continuous_motion(entity)
+                    continue
+                last_update = self._last_ai_update_time.get(entity.id)
+                if last_update is None:
+                    last_update = game_time - self._entity_update_phase_offset(entity.id)
+                    self._last_ai_update_time[entity.id] = last_update
+                effective_interval = self._effective_update_interval(entity, map_manager=map_manager, rules_engine=rules_engine, frame_view=frame_view)
+                if game_time - last_update < effective_interval:
+                    self._maintain_continuous_motion(entity)
+                    continue
+                self._last_ai_update_time[entity.id] = game_time
+                context = self._build_context(entity, entities, map_manager, rules_engine, game_time, game_duration, shared_frame=frame_view)
+                if self._decision_system_disabled():
+                    decision = self._todo_decision_action(context)
+                    bt_node = f'_action_{self.TODO_DECISION_ID}'
+                    decision['bt_node'] = bt_node
+                    self._store_decision_diagnostics(entity, context, bt_node)
+                    self._apply_decision(entity, decision, rules_engine)
+                    continue
+                tree = self.role_trees.get(context.data['role_key'])
+                if tree is None:
+                    self._apply_idle_decision(entity, '未定义角色行为树')
+                    continue
+                forced_test_decision_id = str(getattr(entity, 'test_forced_decision_id', '') or '').strip()
+                if forced_test_decision_id:
+                    forced_decision, forced_bt_node = self._execute_forced_test_decision(context, forced_test_decision_id)
+                    if forced_decision is not None:
+                        forced_decision['bt_node'] = forced_bt_node
+                        self._store_decision_diagnostics(entity, context, forced_bt_node)
+                        self._apply_decision(entity, forced_decision, rules_engine)
+                        continue
+                result = tree.tick(context)
+                decision = context.data.get('decision')
+                if result == FAILURE or decision is None:
+                    decision = self._idle_navigation_decision(context, '行为树未命中有效分支，保持缓行巡航')
+                bt_node = str(context.data.get('bt_action_node', ''))
                 decision['bt_node'] = bt_node
                 self._store_decision_diagnostics(entity, context, bt_node)
                 self._apply_decision(entity, decision, rules_engine)
-                continue
-            tree = self.role_trees.get(context.data['role_key'])
-            if tree is None:
-                self._apply_idle_decision(entity, '未定义角色行为树')
-                continue
-            forced_test_decision_id = str(getattr(entity, 'test_forced_decision_id', '') or '').strip()
-            if forced_test_decision_id:
-                forced_decision, forced_bt_node = self._execute_forced_test_decision(context, forced_test_decision_id)
-                if forced_decision is not None:
-                    forced_decision['bt_node'] = forced_bt_node
-                    self._store_decision_diagnostics(entity, context, forced_bt_node)
-                    self._apply_decision(entity, forced_decision, rules_engine)
-                    continue
-            result = tree.tick(context)
-            decision = context.data.get('decision')
-            if result == FAILURE or decision is None:
-                decision = self._idle_navigation_decision(context, '行为树未命中有效分支，保持缓行巡航')
-            bt_node = str(context.data.get('bt_action_node', ''))
-            decision['bt_node'] = bt_node
-            self._store_decision_diagnostics(entity, context, bt_node)
-            self._apply_decision(entity, decision, rules_engine)
+        finally:
+            self._current_frame_view = None
 
     def maintain_entities_motion(self, entities):
         for entity in tuple(entities or ()):
@@ -3004,8 +3068,7 @@ class AIController:
             enemy_hero = self._find_entity_by_role(entities, enemy_team, 'hero')
             enemy_engineer = self._find_entity_by_role(entities, enemy_team, 'engineer')
             team_health_current, team_health_max, team_health_ratio = self._team_health_snapshot(entities, entity.team)
-        target = self.select_priority_target(entity, enemies, strategy, rules_engine, require_fov=True)
-        tracking_target = self.select_priority_target(entity, enemies, strategy, rules_engine, require_fov=False)
+        target, tracking_target = self.select_priority_targets(entity, enemies, strategy, rules_engine)
         nearby_allies = [other for other in allies if self._distance(entity, other) <= self._meters_to_world_units(5.0, map_manager)]
         nearby_enemies = [other for other in enemies if self._distance(entity, other) <= self._meters_to_world_units(6.0, map_manager)]
         nearby_visible_enemies = []
@@ -4246,7 +4309,11 @@ class AIController:
     def _basic_movement_segment_status(self, entity, from_point, to_point, map_manager, step_limit=None):
         if map_manager is None or from_point is None or to_point is None:
             return {'passable': False, 'requires_step': False, 'transition': None, 'traversal': None, 'reason': 'no_map', 'detour_points': self.EMPTY_PATH_PREVIEW}
-        resolved_step_limit = float(step_limit if step_limit is not None else getattr(entity, 'max_terrain_step_height_m', 0.05))
+        resolved_step_limit = float(step_limit if step_limit is not None else getattr(entity, 'max_terrain_step_height_m', 0.06))
+        resolved_climb_step_limit = max(
+            resolved_step_limit,
+            float(getattr(entity, 'max_step_climb_height_m', getattr(entity, 'max_terrain_step_height_m', 0.06))),
+        )
         cache_key = (
             'basic',
             getattr(entity, 'id', None),
@@ -4254,6 +4321,7 @@ class AIController:
             round(float(getattr(entity, 'collision_radius', 0.0)), 2),
             bool(getattr(entity, 'can_climb_steps', False)),
             round(resolved_step_limit, 3),
+            round(resolved_climb_step_limit, 3),
             round(float(from_point[0]), 2),
             round(float(from_point[1]), 2),
             round(float(to_point[0]), 2),
@@ -4275,11 +4343,14 @@ class AIController:
             float(from_point[1]),
             float(to_point[0]),
             float(to_point[1]),
-            max_height_delta_m=resolved_step_limit,
+            max_height_delta_m=resolved_climb_step_limit,
         )
         if result.get('ok'):
             traversal_type = str(traversal.get('facility_type', '')) if isinstance(traversal, dict) else ''
-            requires_step = bool(result.get('requires_step_alignment')) or traversal_type in {'first_step', 'second_step', 'terrain_step'}
+            traversal_step_height = float(traversal.get('step_height_m', 0.0)) if isinstance(traversal, dict) else 0.0
+            requires_step = bool(result.get('requires_step_alignment'))
+            if bool(getattr(entity, 'can_climb_steps', False)) and traversal_type in {'first_step', 'second_step', 'terrain_step'} and traversal_step_height > resolved_step_limit + 1e-6:
+                requires_step = True
             status = {
                 'passable': True,
                 'requires_step': requires_step,
@@ -4297,7 +4368,7 @@ class AIController:
                 float(from_point[1]),
                 float(to_point[0]),
                 float(to_point[1]),
-                max_height_delta_m=resolved_step_limit,
+                max_height_delta_m=resolved_climb_step_limit,
             )
         if transition is not None:
             traversal = traversal or transition
@@ -4333,7 +4404,7 @@ class AIController:
         distance = math.hypot(float(to_point[0]) - float(from_point[0]), float(to_point[1]) - float(from_point[1]))
         if distance <= 1e-6:
             return True
-        resolved_step_limit = float(step_limit if step_limit is not None else getattr(entity, 'max_terrain_step_height_m', 0.05))
+        resolved_step_limit = float(step_limit if step_limit is not None else getattr(entity, 'max_terrain_step_height_m', 0.06))
         trace_distance = min(distance, self._front_obstacle_probe_distance(map_manager))
         obstacle = map_manager.trace_movement_obstacle(
             float(from_point[0]),
@@ -4360,7 +4431,7 @@ class AIController:
         if distance <= max(20.0, collision_radius * 1.2):
             return self.EMPTY_PATH_PREVIEW
 
-        resolved_step_limit = float(step_limit if step_limit is not None else getattr(entity, 'max_terrain_step_height_m', 0.05))
+        resolved_step_limit = float(step_limit if step_limit is not None else getattr(entity, 'max_terrain_step_height_m', 0.06))
         front_probe_distance = min(distance, self._front_obstacle_probe_distance(map_manager))
         obstacle = map_manager.trace_movement_obstacle(
             start_x,
@@ -4461,7 +4532,11 @@ class AIController:
         return tuple(best_partial_path)
 
     def _movement_segment_status(self, entity, from_point, to_point, map_manager, step_limit=None):
-        resolved_step_limit = float(step_limit if step_limit is not None else getattr(entity, 'max_terrain_step_height_m', 0.05))
+        resolved_step_limit = float(step_limit if step_limit is not None else getattr(entity, 'max_terrain_step_height_m', 0.06))
+        resolved_climb_step_limit = max(
+            resolved_step_limit,
+            float(getattr(entity, 'max_step_climb_height_m', getattr(entity, 'max_terrain_step_height_m', 0.06))),
+        )
         cache_key = (
             'full',
             getattr(entity, 'id', None),
@@ -4469,6 +4544,7 @@ class AIController:
             round(float(getattr(entity, 'collision_radius', 0.0)), 2),
             bool(getattr(entity, 'can_climb_steps', False)),
             round(resolved_step_limit, 3),
+            round(resolved_climb_step_limit, 3),
             round(float(from_point[0]), 2) if from_point is not None else 0.0,
             round(float(from_point[1]), 2) if from_point is not None else 0.0,
             round(float(to_point[0]), 2) if to_point is not None else 0.0,
@@ -4885,6 +4961,9 @@ class AIController:
 
     def select_priority_target(self, entity, enemies, strategy, rules_engine=None, max_distance=None, require_fov=False):
         return self._targeting_runtime.select_priority_target(entity, enemies, strategy, rules_engine=rules_engine, max_distance=max_distance, require_fov=require_fov)
+
+    def select_priority_targets(self, entity, enemies, strategy, rules_engine=None, max_distance=None):
+        return self._targeting_runtime.select_priority_targets(entity, enemies, strategy, rules_engine=rules_engine, max_distance=max_distance)
 
     def entity_to_target(self, target_entity, source_entity):
         distance = self._distance(source_entity, target_entity)
@@ -5717,8 +5796,38 @@ class AIController:
         normalized_target = (float(target_point[0]), float(target_point[1]))
         target_signature = (round(normalized_target[0], 1), round(normalized_target[1], 1))
         raster_version = getattr(map_manager, 'raster_version', 0)
+        frame_view = getattr(self, '_current_frame_view', None)
+        remote_from_player_focus = self._is_remote_from_player_focus(entity, map_manager=map_manager, frame_view=frame_view)
+        effective_replan_interval = self._effective_path_replan_interval(entity, map_manager=map_manager, frame_view=frame_view)
+        effective_goal_hysteresis = self._effective_path_goal_hysteresis_world(entity, map_manager=map_manager, frame_view=frame_view) if remote_from_player_focus else 0.0
+        current_game_time = float(getattr(self, '_current_game_time', 0.0))
         state = self._entity_path_state.get(entity.id)
-        if state is None or state.get('goal_point') != target_signature or state.get('raster_version') != raster_version:
+        needs_rebuild = state is None or state.get('raster_version') != raster_version
+        if not needs_rebuild and state is not None:
+            path = tuple(state.get('path', self.EMPTY_PATH_PREVIEW))
+            if not path:
+                needs_rebuild = True
+            else:
+                previous_goal = state.get('goal_world')
+                if previous_goal is None:
+                    state['goal_world'] = normalized_target
+                    state['goal_point'] = target_signature
+                else:
+                    goal_shift = math.hypot(float(previous_goal[0]) - normalized_target[0], float(previous_goal[1]) - normalized_target[1])
+                    if goal_shift > 1e-6:
+                        if remote_from_player_focus and goal_shift <= effective_goal_hysteresis:
+                            updated_path = (current_position, normalized_target) if len(path) <= 1 else tuple(path[:-1]) + (normalized_target,)
+                            state['path'] = updated_path
+                            state['goal_world'] = normalized_target
+                            state['goal_point'] = target_signature
+                        else:
+                            state['goal_point'] = target_signature
+                            index = self._path_waypoint_index(path, state.get('index', 1))
+                            path_exhausted = index >= len(path) - 1
+                            last_path_build_time = float(state.get('last_path_build_time', -1e9))
+                            if (not remote_from_player_focus) or path_exhausted or current_game_time - last_path_build_time >= effective_replan_interval:
+                                needs_rebuild = True
+        if needs_rebuild:
             step_limit = float(getattr(entity, 'max_terrain_step_height_m', 0.05))
             traversal_profile = self._traversal_profile(entity)
             raw_path = map_manager.find_path(
@@ -5739,9 +5848,11 @@ class AIController:
                 path = tuple(path) + (normalized_target,)
             state = {
                 'goal_point': target_signature,
+                'goal_world': normalized_target,
                 'raster_version': raster_version,
                 'path': tuple(path),
                 'index': self._path_waypoint_index(path, 1),
+                'last_path_build_time': current_game_time,
             }
             self._entity_path_state[entity.id] = state
 

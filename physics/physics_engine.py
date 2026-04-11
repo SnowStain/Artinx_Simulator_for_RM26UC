@@ -13,6 +13,7 @@ class PhysicsEngine:
         self.collision_damping = config.get('physics', {}).get('collision_damping', 0.8)
         self.step_height = config.get('physics', {}).get('step_height', 15)
         self.slope_limit = config.get('physics', {}).get('slope_limit', 30)
+        self.default_direct_terrain_step_height_m = float(config.get('physics', {}).get('direct_terrain_step_height_m', 0.06))
         self.default_max_terrain_step_height_m = float(config.get('physics', {}).get('normal_max_terrain_step_height_m', 0.35))
         self.default_step_climb_duration_sec = float(config.get('physics', {}).get('default_step_climb_duration_sec', 1.0))
         self.infantry_step_climb_duration_sec = float(config.get('physics', {}).get('infantry_step_climb_duration_sec', 1.0))
@@ -21,6 +22,7 @@ class PhysicsEngine:
         self.fly_slope_dead_zone_clearance_m = float(config.get('physics', {}).get('fly_slope_dead_zone_clearance_m', 0.20))
         self.fly_slope_launch_boost_mps = float(config.get('physics', {}).get('fly_slope_launch_boost_mps', 3.1))
         self.fly_slope_lateral_preserve = float(config.get('physics', {}).get('fly_slope_lateral_preserve', 0.25))
+        self.jump_landing_grace_sec = float(config.get('physics', {}).get('jump_landing_grace_sec', 0.18))
         self.max_collision_separation_m = float(config.get('physics', {}).get('max_collision_separation_m', 0.10))
         self.collision_slop_m = float(config.get('physics', {}).get('collision_slop_m', 0.02))
         self.infantry_jump_launch_velocity_mps = math.sqrt(max(0.0, 2.0 * self.jump_gravity_mps2 * self.infantry_jump_height_m))
@@ -52,6 +54,30 @@ class PhysicsEngine:
         pixels_per_meter_y = map_height / max(field_width_m, 1e-6)
         pixels_per_meter = max((pixels_per_meter_x + pixels_per_meter_y) * 0.5, 1e-6)
         return float(world_units) / pixels_per_meter
+
+    def _resolved_direct_step_height(self, entity):
+        return max(
+            0.0,
+            float(
+                getattr(
+                    entity,
+                    'direct_terrain_step_height_m',
+                    getattr(entity, 'max_terrain_step_height_m', self.default_direct_terrain_step_height_m),
+                )
+            ),
+        )
+
+    def _resolved_step_climb_height(self, entity):
+        return max(
+            self._resolved_direct_step_height(entity),
+            float(
+                getattr(
+                    entity,
+                    'max_step_climb_height_m',
+                    getattr(entity, 'max_terrain_step_height_m', self.default_max_terrain_step_height_m),
+                )
+            ),
+        )
 
     def _fly_slope_ballistic_height_m(self, entity, traversal):
         if not isinstance(traversal, dict) or traversal.get('facility_type') != 'fly_slope' or traversal.get('direction') != 'forward':
@@ -144,6 +170,8 @@ class PhysicsEngine:
         )
 
     def _update_jump_state(self, entity, dt):
+        landing_grace_timer = max(0.0, float(getattr(entity, 'jump_landing_grace_timer', 0.0)) - float(dt))
+        entity.jump_landing_grace_timer = landing_grace_timer
         if bool(getattr(entity, 'jump_requested', False)):
             entity.jump_requested = False
             if self._can_entity_jump(entity):
@@ -151,6 +179,7 @@ class PhysicsEngine:
 
         airborne_height = self._current_jump_airborne_height_m(entity)
         vertical_velocity = float(getattr(entity, 'jump_vertical_velocity_mps', 0.0))
+        was_airborne = airborne_height > 1e-6 or vertical_velocity > 1e-6
         if airborne_height <= 1e-6 and vertical_velocity <= 1e-6:
             entity.jump_airborne_height_m = 0.0
             entity.jump_vertical_velocity_mps = 0.0
@@ -163,9 +192,39 @@ class PhysicsEngine:
         if airborne_height <= 1e-6 and vertical_velocity <= 0.0:
             airborne_height = 0.0
             vertical_velocity = 0.0
+        if was_airborne and airborne_height <= 1e-6 and vertical_velocity <= 1e-6:
+            entity.jump_landing_grace_timer = self.jump_landing_grace_sec
         entity.jump_airborne_height_m = airborne_height
         entity.jump_vertical_velocity_mps = vertical_velocity
         entity.velocity['vz'] = vertical_velocity
+
+    def _try_accept_jump_landing_pose(self, entity, map_manager, previous, current, step_limit, effective_step_limit):
+        if float(getattr(entity, 'jump_landing_grace_timer', 0.0)) <= 1e-6:
+            return False
+        if map_manager is None:
+            return False
+        if not self._is_entity_chassis_pose_valid(map_manager, entity, current['x'], current['y']):
+            return False
+        previous_height = map_manager.get_terrain_height_m(previous['x'], previous['y'])
+        current_height = map_manager.get_terrain_height_m(current['x'], current['y'])
+        height_gain = current_height - previous_height
+        if height_gain <= step_limit + 1e-6 or height_gain > effective_step_limit + 1e-6:
+            return False
+        move_distance = math.hypot(float(current['x']) - float(previous['x']), float(current['y']) - float(previous['y']))
+        max_snap_distance = max(self._meters_to_world_units(0.9), self._entity_chassis_collision_radius(entity) * 1.6)
+        if move_distance > max_snap_distance:
+            return False
+        entity.position['x'] = float(current['x'])
+        entity.position['y'] = float(current['y'])
+        entity.position['z'] = current_height
+        entity.jump_airborne_height_m = 0.0
+        entity.jump_vertical_velocity_mps = 0.0
+        entity.jump_landing_grace_timer = 0.0
+        entity.fly_slope_airborne_height_m = 0.0
+        entity.fly_slope_immunity_armed = False
+        entity.velocity['vz'] = 0.0
+        entity.last_valid_position = dict(entity.position)
+        return True
 
     def _entity_chassis_collision_radius(self, entity):
         body_length_m = float(getattr(entity, 'body_length_m', getattr(entity, 'body_size_m', 0.0)))
@@ -411,10 +470,11 @@ class PhysicsEngine:
 
         previous = dict(getattr(entity, 'previous_position', entity.position))
         current = entity.position
-        step_limit = float(getattr(entity, 'max_terrain_step_height_m', self.default_max_terrain_step_height_m))
+        direct_step_limit = self._resolved_direct_step_height(entity)
+        climb_step_limit = self._resolved_step_climb_height(entity)
         jump_airborne_height = self._current_jump_airborne_height_m(entity)
         jump_traversal_clearance = self._current_jump_clearance_m(entity)
-        effective_step_limit = step_limit + jump_traversal_clearance
+        effective_step_limit = direct_step_limit + jump_traversal_clearance
         effective_body_clearance = float(getattr(entity, 'body_clearance_m', 0.0)) + jump_airborne_height
 
         path_result = map_manager.evaluate_movement_path(
@@ -436,10 +496,20 @@ class PhysicsEngine:
                 previous['y'],
                 current['x'],
                 current['y'],
-                max_height_delta_m=step_limit,
+                max_height_delta_m=climb_step_limit,
             )
-            if path_result.get('requires_step_alignment', False):
-                desired_heading = float(path_result.get('step_heading_deg', getattr(entity, 'angle', 0.0)))
+            traversal_type = str(traversal.get('facility_type', '')) if isinstance(traversal, dict) else ''
+            traversal_step_height = float(traversal.get('step_height_m', 0.0)) if isinstance(traversal, dict) else 0.0
+            requires_step_motion = bool(getattr(entity, 'can_climb_steps', False)) and traversal_type in {'first_step', 'second_step', 'terrain_step'} and traversal_step_height > direct_step_limit + 1e-6
+            if path_result.get('requires_step_alignment', False) or requires_step_motion:
+                desired_heading_value = path_result.get('step_heading_deg')
+                if desired_heading_value is None:
+                    desired_heading_value = getattr(entity, 'angle', 0.0)
+                desired_heading = float(desired_heading_value)
+                if requires_step_motion and isinstance(traversal, dict):
+                    approach_point = traversal.get('approach_point')
+                    top_point = traversal.get('top_point')
+                    desired_heading = self._step_heading_deg(approach_point, top_point, desired_heading)
                 angle_diff = self._normalize_angle_diff(desired_heading - float(getattr(entity, 'angle', 0.0)))
                 if abs(angle_diff) > 10.0:
                     turn_speed = 360.0 * float(dt)
@@ -454,6 +524,18 @@ class PhysicsEngine:
                     entity.velocity['vz'] = float(getattr(entity, 'jump_vertical_velocity_mps', 0.0))
                     entity.last_valid_position = dict(entity.position)
                     return
+                if requires_step_motion:
+                    transition = map_manager.get_step_transition(
+                        previous['x'],
+                        previous['y'],
+                        current['x'],
+                        current['y'],
+                        max_height_delta_m=climb_step_limit,
+                    )
+                    if transition is not None:
+                        entity.fly_slope_airborne_height_m = 0.0
+                        self._begin_step_climb(entity, transition, map_manager, dt)
+                        return
             self._apply_fly_slope_launch_boost(entity, traversal)
             airborne_height_m = 0.0
             if getattr(entity, 'type', None) == 'sentry':
@@ -470,11 +552,14 @@ class PhysicsEngine:
                 previous['y'],
                 current['x'],
                 current['y'],
-                max_height_delta_m=step_limit,
+                max_height_delta_m=climb_step_limit,
             )
         if transition is not None:
             entity.fly_slope_airborne_height_m = 0.0
             self._begin_step_climb(entity, transition, map_manager, dt)
+            return
+
+        if self._try_accept_jump_landing_pose(entity, map_manager, previous, current, direct_step_limit, effective_step_limit):
             return
 
         fallback = dict(getattr(entity, 'last_valid_position', previous))
@@ -649,8 +734,8 @@ class PhysicsEngine:
                 'facility_type': transition.get('facility_type'),
                 'progress': 0.0,
                 'total_duration': total_duration,
-                'step_limit_m': float(getattr(entity, 'max_terrain_step_height_m', self.default_max_terrain_step_height_m)),
-                'phase': 'front_ascent',
+                'step_limit_m': self._resolved_step_climb_height(entity),
+                'phase': 'align',
                 'start_point': start_point,
                 'approach_point': transition.get('approach_point'),
                 'top_point': transition.get('top_point'),

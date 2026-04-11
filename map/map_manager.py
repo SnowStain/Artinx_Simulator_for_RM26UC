@@ -37,6 +37,8 @@ class MapManager:
         self.vertical_height_scale = 1.0
         configured_terrain_grid_cell_size = max(0.2, float(config.get('map', {}).get('terrain_grid', {}).get('cell_size', 8)))
         configured_function_grid_cell_size = max(0.2, float(config.get('map', {}).get('function_grid', {}).get('cell_size', configured_terrain_grid_cell_size)))
+        self.configured_terrain_grid_cell_size = configured_terrain_grid_cell_size
+        self.configured_function_grid_cell_size = configured_function_grid_cell_size
         self.grid_precision_cell_size = max(0.2, float(config.get('map', {}).get('grid_precision_cell_size', 4)))
         self.terrain_grid_cell_size = 1.0 if self.strict_scale_enabled else min(configured_terrain_grid_cell_size, self.grid_precision_cell_size)
         self.function_grid_cell_size = 1.0 if self.strict_scale_enabled else min(configured_function_grid_cell_size, self.grid_precision_cell_size)
@@ -273,6 +275,7 @@ class MapManager:
 
     def _build_raster_state_from_snapshot(self, snapshot):
         worker_state = object.__new__(MapManager)
+        worker_state.config = self.config
         worker_state.map_width = int(snapshot['map_width'])
         worker_state.map_height = int(snapshot['map_height'])
         worker_state.terrain_grid_cell_size = float(snapshot['terrain_grid_cell_size'])
@@ -304,12 +307,14 @@ class MapManager:
             worker_state._apply_terrain_override_to_raster(cell)
         for cell in worker_state.function_grid_overrides.values():
             worker_state._apply_function_override_to_raster(cell)
+        worker_state._ensure_scene_obstacle_map()
         worker_state.move_block_map = worker_state.movement_block_map
         return {
             'generation': int(snapshot['generation']),
             'height_map': worker_state.height_map,
             'terrain_type_map': worker_state.terrain_type_map,
             'movement_block_map': worker_state.movement_block_map,
+            'scene_obstacle_map': worker_state.scene_obstacle_map,
             'vision_block_map': worker_state.vision_block_map,
             'vision_block_height_map': worker_state.vision_block_height_map,
             'function_pass_map': worker_state.function_pass_map,
@@ -324,7 +329,7 @@ class MapManager:
         self.terrain_type_map = raster_state['terrain_type_map']
         self.movement_block_map = raster_state['movement_block_map']
         self.move_block_map = self.movement_block_map
-        self.scene_obstacle_map = None
+        self.scene_obstacle_map = raster_state.get('scene_obstacle_map')
         self.vision_block_map = raster_state['vision_block_map']
         self.vision_block_height_map = raster_state['vision_block_height_map']
         self.function_pass_map = raster_state['function_pass_map']
@@ -333,6 +338,7 @@ class MapManager:
         self.runtime_grid_bundle = dict(raster_state.get('runtime_grid_bundle', {}))
         self.runtime_grid_loaded = bool(raster_state.get('runtime_grid_loaded', False))
         self.raster_dirty = False
+        self._ensure_scene_obstacle_map()
 
     def _schedule_async_raster_rebuild(self):
         if self._raster_rebuild_stop_event.is_set():
@@ -445,6 +451,12 @@ class MapManager:
         if self.strict_scale_enabled:
             return 1.0
         return min(max(0.2, float(configured_cell_size)), float(self.grid_precision_cell_size))
+
+    def terrain_scene_sample_cell_size(self):
+        return max(
+            float(self.terrain_grid_cell_size),
+            float(getattr(self, 'configured_terrain_grid_cell_size', self.terrain_grid_cell_size)),
+        )
 
     def _grid_cell_center(self, grid_x, grid_y):
         x1, y1, x2, y2 = self._grid_cell_bounds(grid_x, grid_y)
@@ -660,6 +672,25 @@ class MapManager:
         end_x = max(start_x, min(grid_width - 1, int(math.ceil(world_x2 / target_cell_size) - 1)))
         end_y = max(start_y, min(grid_height - 1, int(math.ceil(world_y2 / target_cell_size) - 1)))
         return start_x, end_x, start_y, end_y
+
+    def _iter_scaled_grid_cells(self, cell, source_cell_size, target_cell_size, coordinate_space):
+        if coordinate_space == 'source':
+            start_x, end_x, start_y, end_y = self._scaled_grid_cell_ranges_from_source(
+                cell.get('x', 0),
+                cell.get('y', 0),
+                source_cell_size,
+                target_cell_size,
+            )
+        else:
+            start_x, end_x, start_y, end_y = self._grid_cell_ranges_from_world_space(
+                cell.get('x', 0),
+                cell.get('y', 0),
+                source_cell_size,
+                target_cell_size,
+            )
+        for grid_y in range(start_y, end_y + 1):
+            for grid_x in range(start_x, end_x + 1):
+                yield grid_x, grid_y
 
     def _create_blank_map_surface(self, width=None, height=None):
         width = max(1, int(width or self.map_width or 1576))
@@ -972,33 +1003,23 @@ class MapManager:
         coordinate_space = self._configured_coordinate_space()
         self.terrain_grid_overrides = {}
         for cell in terrain_grid.get('cells', []):
-            if coordinate_space == 'source':
-                start_x, end_x, start_y, end_y = self._scaled_grid_cell_ranges_from_source(
-                    cell.get('x', 0),
-                    cell.get('y', 0),
-                    source_cell_size,
-                    self.terrain_grid_cell_size,
-                )
-            else:
-                start_x, end_x, start_y, end_y = self._grid_cell_ranges_from_world_space(
-                    cell.get('x', 0),
-                    cell.get('y', 0),
-                    source_cell_size,
-                    self.terrain_grid_cell_size,
-                )
-            for grid_y in range(start_y, end_y + 1):
-                for grid_x in range(start_x, end_x + 1):
-                    normalized = {
-                        'x': grid_x,
-                        'y': grid_y,
-                        'type': cell.get('type', 'flat'),
-                        'team': cell.get('team', 'neutral'),
-                        'height_m': round(float(cell.get('height_m', 0.0)), 2),
-                        'blocks_movement': bool(cell.get('blocks_movement', False)),
-                        'blocks_vision': bool(cell.get('blocks_vision', False)),
-                    }
-                    self.terrain_grid_overrides[self._terrain_cell_key(grid_x, grid_y)] = normalized
-                self._mark_terrain_overlay_dirty(reset=True)
+            for grid_x, grid_y in self._iter_scaled_grid_cells(
+                cell,
+                source_cell_size,
+                self.terrain_grid_cell_size,
+                coordinate_space,
+            ):
+                normalized = {
+                    'x': grid_x,
+                    'y': grid_y,
+                    'type': cell.get('type', 'flat'),
+                    'team': cell.get('team', 'neutral'),
+                    'height_m': round(float(cell.get('height_m', 0.0)), 2),
+                    'blocks_movement': bool(cell.get('blocks_movement', False)),
+                    'blocks_vision': bool(cell.get('blocks_vision', False)),
+                }
+                self.terrain_grid_overrides[self._terrain_cell_key(grid_x, grid_y)] = normalized
+        self._mark_terrain_overlay_dirty(reset=True)
         self._mark_raster_dirty()
 
     def _load_function_grid_from_config(self):
@@ -1011,28 +1032,18 @@ class MapManager:
             pass_mode = str(cell.get('pass_mode', 'passable') or 'passable')
             if pass_mode not in self.function_pass_mode_by_code or pass_mode == 'passable':
                 continue
-            if coordinate_space == 'source':
-                start_x, end_x, start_y, end_y = self._scaled_grid_cell_ranges_from_source(
-                    cell.get('x', 0),
-                    cell.get('y', 0),
-                    source_cell_size,
-                    self.function_grid_cell_size,
+            for grid_x, grid_y in self._iter_scaled_grid_cells(
+                cell,
+                source_cell_size,
+                self.function_grid_cell_size,
+                coordinate_space,
+            ):
+                self.function_grid_overrides[self._function_cell_key(grid_x, grid_y)] = self._function_override_payload(
+                    grid_x,
+                    grid_y,
+                    pass_mode=pass_mode,
+                    heading_deg=cell.get('heading_deg'),
                 )
-            else:
-                start_x, end_x, start_y, end_y = self._grid_cell_ranges_from_world_space(
-                    cell.get('x', 0),
-                    cell.get('y', 0),
-                    source_cell_size,
-                    self.function_grid_cell_size,
-                )
-            for grid_y in range(start_y, end_y + 1):
-                for grid_x in range(start_x, end_x + 1):
-                    self.function_grid_overrides[self._function_cell_key(grid_x, grid_y)] = self._function_override_payload(
-                        grid_x,
-                        grid_y,
-                        pass_mode=pass_mode,
-                        heading_deg=cell.get('heading_deg'),
-                    )
         self._mark_raster_dirty()
 
     def export_terrain_grid_config(self):
@@ -1440,6 +1451,7 @@ class MapManager:
             key = self._terrain_cell_key(grid_x, grid_y)
             if key in self.terrain_grid_overrides:
                 normalized_cells.append((grid_x, grid_y))
+        normalized_cells = list(dict.fromkeys(normalized_cells))
         if not normalized_cells:
             return {'changed': False, 'cell_count': 0}
 
@@ -1447,16 +1459,13 @@ class MapManager:
         for _ in range(strength):
             source_heights = {}
             for grid_x, grid_y in normalized_cells:
-                for sample_y in range(grid_y - 1, grid_y + 2):
-                    for sample_x in range(grid_x - 1, grid_x + 2):
-                        if (sample_x, sample_y) in source_heights:
-                            continue
-                        if sample_x < 0 or sample_y < 0:
-                            continue
-                        max_x, max_y = self._grid_dimensions()
-                        if sample_x >= max_x or sample_y >= max_y:
-                            continue
-                        source_heights[(sample_x, sample_y)] = self._sample_grid_height(sample_x, sample_y)
+                cell = self.terrain_grid_overrides.get(self._terrain_cell_key(grid_x, grid_y))
+                if cell is None:
+                    continue
+                source_heights[(grid_x, grid_y)] = round(float(cell.get('height_m', 0.0)), 2)
+
+            if not source_heights:
+                break
 
             updated_heights = {}
             for grid_x, grid_y in normalized_cells:
@@ -1631,7 +1640,7 @@ class MapManager:
                 return False
         return True
 
-    def compute_fov_visibility(self, origin_point, heading_deg, fov_deg, max_distance_world, angle_step_deg=1.0, include_mask=False, origin_height_m=None, terrain_height_scale=1.0, max_pitch_up_deg=40.0, max_pitch_down_deg=35.0, terrain_pitch_margin_deg=1.2):
+    def compute_fov_visibility(self, origin_point, heading_deg, fov_deg, max_distance_world, angle_step_deg=1.0, include_mask=False, origin_height_m=None, terrain_height_scale=1.0, max_pitch_up_deg=30.0, max_pitch_down_deg=30.0, terrain_pitch_margin_deg=1.2):
         self._ensure_raster_layers()
         if origin_point is None:
             return {'polygon_world': tuple(), 'visible_mask': None}
@@ -1916,7 +1925,11 @@ class MapManager:
     def _apply_terrain_override_to_raster(self, cell):
         grid_x = int(cell.get('x', 0))
         grid_y = int(cell.get('y', 0))
-        x1, y1, x2, y2 = self._grid_cell_bounds(grid_x, grid_y)
+        cell_size = max(float(self.terrain_grid_cell_size), 1.0)
+        x1 = float(grid_x) * cell_size
+        y1 = float(grid_y) * cell_size
+        x2 = min(float(self.map_width), float(grid_x + 1) * cell_size) - 1e-6
+        y2 = min(float(self.map_height), float(grid_y + 1) * cell_size) - 1e-6
         runtime_x1, runtime_x2, runtime_y1, runtime_y2 = self._runtime_bounds_to_cell_ranges(x1, y1, x2, y2)
         rows = slice(runtime_y1, runtime_y2 + 1)
         cols = slice(runtime_x1, runtime_x2 + 1)
@@ -1944,7 +1957,11 @@ class MapManager:
     def _apply_function_override_to_raster(self, cell):
         grid_x = int(cell.get('x', 0))
         grid_y = int(cell.get('y', 0))
-        x1, y1, x2, y2 = self._grid_cell_bounds(grid_x, grid_y)
+        cell_size = max(float(self.terrain_grid_cell_size), 1.0)
+        x1 = float(grid_x) * cell_size
+        y1 = float(grid_y) * cell_size
+        x2 = min(float(self.map_width), float(grid_x + 1) * cell_size) - 1e-6
+        y2 = min(float(self.map_height), float(grid_y + 1) * cell_size) - 1e-6
         runtime_x1, runtime_x2, runtime_y1, runtime_y2 = self._runtime_bounds_to_cell_ranges(x1, y1, x2, y2)
         rows = slice(runtime_y1, runtime_y2 + 1)
         cols = slice(runtime_x1, runtime_x2 + 1)
@@ -3998,6 +4015,9 @@ class MapManager:
             previous_height = float(sample['height_m'])
             previous_x = sample_x
             previous_y = sample_y
+
+        if requires_step_alignment and step_heading_deg is None:
+            step_heading_deg = self._segment_step_alignment_heading_deg(from_x, from_y, to_x, to_y)
 
         return {
             'ok': True,

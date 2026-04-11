@@ -885,9 +885,16 @@ class RendererSidebarMixin:
         if self.viewport is None:
             return
 
-        overlay = pygame.Surface((self.window_width, self.window_height), pygame.SRCALPHA)
+        overlay_size = (int(self.window_width), int(self.window_height))
+        if self.terrain_brush_overlay_surface is None or self.terrain_brush_overlay_size != overlay_size:
+            self.terrain_brush_overlay_surface = pygame.Surface(overlay_size, pygame.SRCALPHA).convert_alpha()
+            self.terrain_brush_overlay_size = overlay_size
+        overlay = self.terrain_brush_overlay_surface
+        overlay.fill((0, 0, 0, 0))
         grid_width, grid_height = map_manager._grid_dimensions()
-        self._blit_world_surface(self._get_world_terrain_grid_overlay_surface(map_manager), self._map_rect())
+        map_rect = self._map_rect()
+        draw_outlines = self._terrain_overlay_draw_outlines(map_manager, map_rect)
+        self._blit_world_surface(self._get_world_terrain_grid_overlay_surface(map_manager, draw_outlines=draw_outlines), map_rect, smooth=False)
 
         if self.mouse_world is not None:
             brush = self._selected_terrain_brush_def()

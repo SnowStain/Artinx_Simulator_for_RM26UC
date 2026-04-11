@@ -185,6 +185,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.facility_overlay_world_key = None
         self.terrain_grid_overlay_world_surface = None
         self.terrain_grid_overlay_world_key = None
+        self.terrain_brush_overlay_surface = None
+        self.terrain_brush_overlay_size = None
         self.aim_fov_overlay_surface = None
         self.aim_fov_overlay_size = None
         self.aim_fov_overlay_cache_key = None
@@ -209,7 +211,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.terrain_scene_vertical_exaggeration = 1.0
         self.terrain_scene_ground_height_scale = 1.0
         self.terrain_scene_max_cells = int(max(12000, config.get('simulator', {}).get('terrain_scene_max_cells', 64000)))
-        self.player_terrain_scene_max_cells = int(max(6000, config.get('simulator', {}).get('player_terrain_scene_max_cells', 16000)))
+        self.player_terrain_scene_max_cells = int(max(6000, config.get('simulator', {}).get('player_terrain_scene_max_cells', 12000)))
         self.terrain_scene_force_dark_gray = False
         self.player_control_terrain_dark_gray = bool(config.get('simulator', {}).get('player_control_terrain_dark_gray', True))
         self.player_camera_mode = str(config.get('simulator', {}).get('player_camera_mode', 'first_person') or 'first_person')
@@ -218,8 +220,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.player_third_person_distance_m = float(config.get('simulator', {}).get('player_third_person_distance_m', 1.85))
         self.player_third_person_height_m = float(config.get('simulator', {}).get('player_third_person_height_m', 0.58))
         self.player_view_ray_alpha = int(max(32, min(255, config.get('simulator', {}).get('player_view_ray_alpha', 176))))
-        self.player_terrain_render_scale = float(max(0.35, min(1.0, config.get('simulator', {}).get('player_terrain_render_scale', 0.6))))
-        self.player_motion_terrain_render_scale = float(max(0.35, min(self.player_terrain_render_scale, config.get('simulator', {}).get('player_motion_terrain_render_scale', 0.42))))
+        self.player_terrain_render_scale = float(max(0.35, min(1.0, config.get('simulator', {}).get('player_terrain_render_scale', 0.52))))
+        self.player_motion_terrain_render_scale = float(max(0.35, min(self.player_terrain_render_scale, config.get('simulator', {}).get('player_motion_terrain_render_scale', 0.36))))
         self.player_camera_motion_threshold_m = float(max(0.005, config.get('simulator', {}).get('player_camera_motion_threshold_m', 0.035)))
         self._active_player_terrain_render_scale = self.player_terrain_render_scale
         self._last_player_camera_sample = None
@@ -335,6 +337,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.aim_fov_overlay_surface = None
         self.aim_fov_overlay_size = None
         self.aim_fov_overlay_cache_key = None
+        self.terrain_brush_overlay_surface = None
+        self.terrain_brush_overlay_size = None
         self.terrain_3d_texture = None
         self.terrain_3d_render_key = None
         self.player_terrain_surface_cache = None
@@ -631,8 +635,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         return None
 
     def _world_to_scene_point(self, map_manager, sample_data, world_x, world_y, height_m):
-        scene_step = max(1, int(sample_data.get('scene_step', 1)))
-        sampled_cell_size = max(float(map_manager.terrain_grid_cell_size) * scene_step, 1e-6)
+        sampled_cell_size = max(float(sample_data.get('cell_size', 0.0) or 0.0), 1e-6)
         effective_height = self._meters_to_world_units(map_manager, float(height_m)) / sampled_cell_size
         return np.array([
             float(world_x) / sampled_cell_size - float(sample_data['grid_width']) * 0.5,
@@ -660,6 +663,11 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             return float(meters)
         return float(map_manager.meters_to_world_units(float(meters)))
 
+    def _world_units_to_meters(self, map_manager, world_units):
+        if map_manager is None:
+            return float(world_units)
+        return float(world_units) / max(float(map_manager.meters_to_world_units(1.0)), 1e-6)
+
     def _build_player_camera_override(self, game_engine, rect):
         entity = game_engine.get_player_controlled_entity()
         if entity is None:
@@ -677,8 +685,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         anchor_height_m = base_height_m + float(getattr(entity, 'gimbal_height_m', 0.50)) * self._entity_vertical_scale(entity)
         direction = np.array([
             math.cos(pitch_rad) * math.cos(yaw_rad),
-            math.sin(pitch_rad),
             math.cos(pitch_rad) * math.sin(yaw_rad),
+            math.sin(pitch_rad),
         ], dtype='f4')
         world_target = np.array([
             float(entity.position['x']),
@@ -686,7 +694,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             anchor_height_m,
         ], dtype='f4') + direction * max(6.0, float(sample_data['grid_width']) * 0.12)
         if self.player_camera_mode == 'third_person':
-            backward = np.array([math.cos(yaw_rad), 0.0, math.sin(yaw_rad)], dtype='f4')
+            backward = np.array([math.cos(yaw_rad), math.sin(yaw_rad), 0.0], dtype='f4')
             world_eye = self._resolve_third_person_camera_eye(
                 map_manager,
                 float(entity.position['x']),
@@ -791,6 +799,90 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             (center_x - heading_x * half_length - right_x * half_width, center_y - heading_y * half_length - right_y * half_width),
         ]
 
+    def _entity_wheel_layout_world(self, entity, map_manager):
+        render_width_scale = max(0.45, min(1.0, float(getattr(entity, 'body_render_width_scale', 0.82))))
+        body_length_half = self._meters_to_world_units(map_manager, float(getattr(entity, 'body_length_m', getattr(entity, 'body_size_m', 0.42))) * 0.5)
+        body_width_half = self._meters_to_world_units(map_manager, float(getattr(entity, 'body_width_m', getattr(entity, 'body_size_m', 0.42))) * 0.5 * render_width_scale)
+        wheel_radius_world = self._meters_to_world_units(map_manager, float(getattr(entity, 'wheel_radius_m', 0.08)))
+        wheel_style = str(getattr(entity, 'wheel_style', 'standard'))
+        wheel_offset_x = max(0.10, body_length_half * (0.72 if wheel_style == 'legged' else 0.78))
+        wheel_offset_y = max(1.0, body_width_half + wheel_radius_world * 0.55)
+        custom_wheel_positions_raw = getattr(entity, 'custom_wheel_positions_m', None)
+        if isinstance(custom_wheel_positions_raw, (list, tuple)) and custom_wheel_positions_raw:
+            wheel_positions = tuple(
+                (
+                    self._meters_to_world_units(map_manager, float(position[0])),
+                    self._meters_to_world_units(map_manager, float(position[1]) * render_width_scale),
+                )
+                for position in custom_wheel_positions_raw
+                if isinstance(position, (list, tuple)) and len(position) >= 2
+            )
+        elif int(getattr(entity, 'wheel_count', 4)) <= 2:
+            wheel_positions = ((0.0, -wheel_offset_y), (0.0, wheel_offset_y))
+        else:
+            wheel_positions = ((-wheel_offset_x, -wheel_offset_y), (wheel_offset_x, -wheel_offset_y), (-wheel_offset_x, wheel_offset_y), (wheel_offset_x, wheel_offset_y))
+
+        yaw_rad = math.radians(float(getattr(entity, 'angle', 0.0)))
+        forward_x = math.cos(yaw_rad)
+        forward_y = math.sin(yaw_rad)
+        right_x = -forward_y
+        right_y = forward_x
+        world_positions = []
+        for local_x, local_y in wheel_positions:
+            world_positions.append((
+                float(entity.position['x']) + forward_x * float(local_x) + right_x * float(local_y),
+                float(entity.position['y']) + forward_y * float(local_x) + right_y * float(local_y),
+                float(local_x),
+                float(local_y),
+            ))
+        return tuple(world_positions)
+
+    def _player_debug_lines(self, entity, map_manager):
+        if entity is None or map_manager is None:
+            return ()
+        center_x_world = float(entity.position['x'])
+        center_y_world = float(entity.position['y'])
+        center_z_m = float(getattr(entity, 'position', {}).get('z', map_manager.get_terrain_height_m(center_x_world, center_y_world)))
+        wheel_samples = []
+        for world_x, world_y, local_x, local_y in self._entity_wheel_layout_world(entity, map_manager):
+            if abs(local_x) <= 1e-6:
+                label = '左轮' if local_y < 0.0 else '右轮'
+            else:
+                label = f'{"前" if local_x > 0.0 else "后"}{"左" if local_y < 0.0 else "右"}'
+            wheel_samples.append((label, float(map_manager.get_terrain_height_m(world_x, world_y))))
+        if wheel_samples:
+            wheel_height_values = [height for _, height in wheel_samples]
+            wheel_summary = f'轮底模型高度 {center_z_m:.3f}m   轮地接触 {min(wheel_height_values):.3f}-{max(wheel_height_values):.3f}m'
+        else:
+            wheel_summary = f'轮底模型高度 {center_z_m:.3f}m'
+        lines = [
+            'F3 调试',
+            f'底盘中心 坐标m ({self._world_units_to_meters(map_manager, center_x_world):.2f}, {self._world_units_to_meters(map_manager, center_y_world):.2f}, {center_z_m:.3f})',
+            f'底盘中心 坐标图 ({center_x_world:.1f}, {center_y_world:.1f})',
+            wheel_summary,
+        ]
+        for index in range(0, len(wheel_samples), 2):
+            chunk = wheel_samples[index:index + 2]
+            lines.append('   '.join(f'{label} {height:.3f}m' for label, height in chunk))
+        return tuple(lines)
+
+    def _render_player_debug_hud(self, game_engine, rect):
+        controlled_getter = getattr(game_engine, 'get_player_controlled_entity', None)
+        entity = controlled_getter() if callable(controlled_getter) else None
+        lines = self._player_debug_lines(entity, getattr(game_engine, 'map_manager', None))
+        if not lines:
+            return
+        panel_height = 16 + len(lines) * 18
+        panel_rect = pygame.Rect(rect.right - 494, rect.y + 18, 476, panel_height)
+        pygame.draw.rect(self.screen, (18, 24, 30), panel_rect, border_radius=10)
+        pygame.draw.rect(self.screen, self.colors['panel_border'], panel_rect, 1, border_radius=10)
+        draw_y = panel_rect.y + 10
+        for line_index, line in enumerate(lines):
+            font = self.font if line_index == 0 else self.small_font
+            text = font.render(line, True, self.colors['white'])
+            self.screen.blit(text, (panel_rect.x + 12, draw_y))
+            draw_y += 18
+
     def render_collision_boxes(self, entities):
         if self.viewport is None:
             return
@@ -888,7 +980,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         while distance >= 0.0:
             candidate = np.array([
                 anchor_point[0] - direction[0] * distance,
-                anchor_point[1] - direction[2] * distance,
+                anchor_point[1] - direction[1] * distance,
                 anchor_point[2] + extra_height,
             ], dtype='f4')
             sample = map_manager.sample_raster_layers(float(candidate[0]), float(candidate[1]))
@@ -1104,8 +1196,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         return projected_points, max_depth
 
     def _entity_scene_axes(self, entity, map_manager, sample_data, base_height):
-        scene_step = max(1, int(sample_data.get('scene_step', 1)))
-        sampled_cell_size = max(float(map_manager.terrain_grid_cell_size) * scene_step, 1e-6)
+        sampled_cell_size = max(float(sample_data.get('cell_size', 0.0) or 0.0), 1e-6)
         terrain_height = float(map_manager.get_terrain_height_m(entity.position['x'], entity.position['y']))
         body_length_half = self._meters_to_world_units(map_manager, float(getattr(entity, 'body_length_m', getattr(entity, 'body_size_m', 0.42))) * 0.5)
         body_width_half = self._meters_to_world_units(map_manager, float(getattr(entity, 'body_width_m', getattr(entity, 'body_size_m', 0.42))) * 0.5)
@@ -1275,8 +1366,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
 
         wheel_offset_x = max(0.10, body_length_half * (0.72 if wheel_style == 'legged' else 0.78))
         wheel_offset_y = max(1.0, body_width_half + wheel_radius_world * 0.55)
-        wheel_bottom = terrain_height
-        wheel_top = base_height + wheel_radius_height * 2.0
+        wheel_bottom = base_height
+        wheel_top = wheel_bottom + wheel_radius_height * 2.0
         custom_wheel_positions_raw = getattr(entity, 'custom_wheel_positions_m', None)
         if isinstance(custom_wheel_positions_raw, (list, tuple)) and custom_wheel_positions_raw:
             wheel_positions = tuple(
@@ -1322,51 +1413,63 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         climb_assist = self._climb_assist_animation_state(entity)
         assist_side_offset = max(1.0, body_width_half + wheel_half_width * 0.45)
         if front_climb_style != 'none':
-            pulley_half_x = self._meters_to_world_units(map_manager, 0.028)
-            pulley_half_y = self._meters_to_world_units(map_manager, 0.018)
-            belt_half_x = self._meters_to_world_units(map_manager, 0.020)
-            belt_half_y = self._meters_to_world_units(map_manager, 0.015)
-            belt_center_x = body_length_half * 0.82 + self._meters_to_world_units(map_manager, 0.040)
-            pulley_center_x = body_length_half * 0.62
-            belt_low = max(terrain_height, body_bottom - float(climb_assist['front_drop_m']) * vertical_scale)
-            belt_high = body_top + float(climb_assist['front_raise_m']) * vertical_scale
-            pulley_low = body_top - 0.015 * vertical_scale
-            pulley_high = body_top + 0.055 * vertical_scale
+            plate_half_x = self._meters_to_world_units(map_manager, float(getattr(entity, 'front_climb_assist_plate_length_m', 0.05)) * 0.5)
+            plate_half_y = self._meters_to_world_units(map_manager, float(getattr(entity, 'front_climb_assist_plate_width_m', 0.018)) * 0.5)
+            plate_height = float(getattr(entity, 'front_climb_assist_plate_height_m', 0.18)) * vertical_scale
+            plate_center_x = body_length_half + self._meters_to_world_units(map_manager, float(getattr(entity, 'front_climb_assist_forward_offset_m', 0.04))) + plate_half_x
+            plate_inner_offset = self._meters_to_world_units(map_manager, float(getattr(entity, 'front_climb_assist_inner_offset_m', 0.06)) * render_width_scale)
+            mount_half_x = max(self._meters_to_world_units(map_manager, 0.012), plate_half_x * 0.55)
+            mount_half_y = max(self._meters_to_world_units(map_manager, 0.010), plate_half_y * 1.15)
+            plate_low = max(terrain_height, body_bottom - float(climb_assist['front_drop_m']) * vertical_scale)
+            plate_high = max(plate_low + 0.03, plate_low + plate_height + float(climb_assist['front_raise_m']) * vertical_scale * 0.45)
+            mount_low = body_top - 0.010 * vertical_scale
+            mount_high = body_top + 0.040 * vertical_scale
             for side_sign in (-1.0, 1.0):
-                side_y = assist_side_offset * side_sign
+                side_y = max(body_width_half * 0.45, assist_side_offset - plate_inner_offset) * side_sign
                 self._append_box_faces(
                     faces,
-                    box_corners(pulley_center_x, side_y, pulley_half_x, pulley_half_y, pulley_low, pulley_high, yaw_rad),
+                    box_corners(body_length_half * 0.78, side_y, mount_half_x, mount_half_y, mount_low, mount_high, yaw_rad),
                     (118, 122, 132),
                 )
                 self._append_box_faces(
                     faces,
-                    box_corners(belt_center_x, side_y, belt_half_x, belt_half_y, belt_low, belt_high, yaw_rad),
+                    box_corners(plate_center_x, side_y, plate_half_x, plate_half_y, plate_low, plate_high, yaw_rad),
                     (82, 86, 96),
                 )
         if rear_climb_style != 'none':
-            upper_half_x = self._meters_to_world_units(map_manager, 0.070)
-            upper_half_y = self._meters_to_world_units(map_manager, 0.014)
-            lower_half_x = self._meters_to_world_units(map_manager, 0.060)
-            lower_half_y = self._meters_to_world_units(map_manager, 0.014)
-            rear_reach_world = self._meters_to_world_units(map_manager, float(climb_assist['rear_reach_m']))
-            upper_center_x = -body_length_half * 0.46 - rear_reach_world * 0.25
-            lower_center_x = -body_length_half * 0.78 - rear_reach_world * 0.75
-            upper_low = body_top + 0.01 * vertical_scale
-            upper_high = body_top + (0.05 + float(climb_assist['rear_drop_m']) * 0.35) * vertical_scale
+            upper_half_x = self._meters_to_world_units(map_manager, float(getattr(entity, 'rear_climb_assist_upper_length_m', 0.09)) * 0.5)
+            lower_half_x = self._meters_to_world_units(map_manager, float(getattr(entity, 'rear_climb_assist_lower_length_m', 0.08)) * 0.5)
+            bar_half_y = self._meters_to_world_units(map_manager, float(getattr(entity, 'rear_climb_assist_bar_width_m', 0.016)) * 0.5)
+            upper_offset = self._meters_to_world_units(map_manager, float(getattr(entity, 'rear_climb_assist_upper_offset_m', 0.055)))
+            lower_offset = self._meters_to_world_units(map_manager, float(getattr(entity, 'rear_climb_assist_lower_offset_m', 0.015)))
+            rear_inner_offset = self._meters_to_world_units(map_manager, float(getattr(entity, 'rear_climb_assist_inner_offset_m', 0.03)) * render_width_scale)
+            upper_center_x = -body_length_half - upper_offset + upper_half_x * 0.25
+            lower_center_x = -body_length_half - lower_offset + lower_half_x * 0.25 + self._meters_to_world_units(map_manager, float(climb_assist['rear_reach_m']) * 0.25)
+            upper_low = body_top + 0.008 * vertical_scale
+            upper_high = upper_low + max(0.012, float(getattr(entity, 'rear_climb_assist_bar_width_m', 0.016)) * vertical_scale)
             lower_low = max(terrain_height, body_bottom - float(climb_assist['rear_drop_m']) * vertical_scale)
-            lower_high = body_bottom + 0.030 * vertical_scale
+            lower_high = lower_low + max(0.012, float(getattr(entity, 'rear_climb_assist_bar_width_m', 0.016)) * vertical_scale)
+            connector_center_x = (upper_center_x + lower_center_x) * 0.5
+            connector_half_x = max(self._meters_to_world_units(map_manager, 0.010), abs(upper_center_x - lower_center_x) * 0.5 + bar_half_y)
+            connector_half_y = max(self._meters_to_world_units(map_manager, 0.008), bar_half_y * 0.9)
+            connector_low = min(lower_high, upper_low)
+            connector_high = max(lower_high, upper_low + max(0.018, float(getattr(entity, 'rear_climb_assist_bar_width_m', 0.016)) * vertical_scale * 1.2))
             for side_sign in (-1.0, 1.0):
-                side_y = assist_side_offset * side_sign
+                side_y = max(body_width_half * 0.45, assist_side_offset - rear_inner_offset) * side_sign
                 self._append_box_faces(
                     faces,
-                    box_corners(upper_center_x, side_y, upper_half_x, upper_half_y, upper_low, upper_high, yaw_rad),
+                    box_corners(upper_center_x, side_y, upper_half_x, bar_half_y, upper_low, upper_high, yaw_rad),
                     (106, 110, 120),
                 )
                 self._append_box_faces(
                     faces,
-                    box_corners(lower_center_x, side_y, lower_half_x, lower_half_y, lower_low, lower_high, yaw_rad),
+                    box_corners(lower_center_x, side_y, lower_half_x, bar_half_y, lower_low, lower_high, yaw_rad),
                     (92, 96, 108),
+                )
+                self._append_box_faces(
+                    faces,
+                    box_corners(connector_center_x, side_y, connector_half_x, connector_half_y, connector_low, connector_high, yaw_rad),
+                    (116, 120, 132),
                 )
 
         if arm_style == 'fixed_7':
@@ -1468,8 +1571,6 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             return []
         wheel_style = str(getattr(entity, 'wheel_style', 'standard'))
         center_scene, forward_basis, right_basis, up_basis = self._entity_scene_axes(entity, map_manager, sample_data, base_height)
-        terrain_height = float(map_manager.get_terrain_height_m(entity.position['x'], entity.position['y']))
-
         def local_to_scene(local_x, local_y, height_m):
             scene_xyz = center_scene + forward_basis * local_x + right_basis * local_y + up_basis * (float(height_m) - base_height)
             return np.array([scene_xyz[0], scene_xyz[1], scene_xyz[2], 1.0], dtype='f4')
@@ -1480,7 +1581,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         side_offset = max(0.4, self._meters_to_world_units(map_manager, float(getattr(entity, 'wheel_radius_m', 0.08)) * 0.35))
         overlays = []
         for local_x, local_y in wheel_positions:
-            wheel_center_h = terrain_height + wheel_radius_height
+            wheel_center_h = base_height + wheel_radius_height
             center = self._project_scene_point(local_to_scene(local_x, local_y, wheel_center_h), camera_state, rect)
             axis_a = self._project_scene_point(local_to_scene(local_x, local_y + side_offset, wheel_center_h), camera_state, rect)
             axis_b = self._project_scene_point(local_to_scene(local_x, local_y, wheel_center_h + wheel_radius_height), camera_state, rect)
@@ -1609,7 +1710,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             f'发弹量 {hud["ammo"]}   底盘功率 {hud["power"]:.1f}/{hud["max_power"]:.1f}',
             f'枪口热量 {hud["heat"]:.1f}/{hud["max_heat"]:.1f}   俯仰 {hud["pitch_deg"]:.1f}°',
             f'右键自瞄 {"锁定" if hud["auto_aim_locked"] else "待机"}   左键射击 {hud["fire_control_state"]}',
-            f'视角 {"第三人称" if self.player_camera_mode == "third_person" else "第一人称"}   V 切换   F3 碰撞箱',
+            f'视角 {"第三人称" if self.player_camera_mode == "third_person" else "第一人称"}   V 切换   F3 碰撞箱/坐标/轮高',
         ]
         if hud['supply_zone']:
             lines.append(f'补给区内 按 B 打开购买面板 当前数量 {self.player_purchase_amount} 发')
@@ -1861,6 +1962,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         if draw_match_hud:
             self.render_match_hud(game_engine, top_offset=hud_offset)
         self._render_player_status_hud(game_engine, rect)
+        if self._collision_overlay_active():
+            self._render_player_debug_hud(game_engine, rect)
         self._render_player_purchase_menu(game_engine, rect)
         self._render_pre_match_prompt(game_engine, rect)
         self._render_pre_match_config_menu(game_engine, rect)
@@ -2089,6 +2192,21 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         )
         return rect.colliderect(clip_rect)
 
+    def _terrain_overlay_display_cell_size(self, map_manager, map_rect, view_width=None, view_height=None):
+        if map_rect is None or map_rect.width <= 0 or map_rect.height <= 0:
+            return 0.0
+        if view_width is None:
+            view_width = float(map_manager.map_width)
+        if view_height is None:
+            view_height = float(map_manager.map_height)
+        cell_size = float(getattr(map_manager, 'terrain_grid_cell_size', 1.0))
+        cell_width_px = map_rect.width * cell_size / max(float(view_width), 1e-6)
+        cell_height_px = map_rect.height * cell_size / max(float(view_height), 1e-6)
+        return min(cell_width_px, cell_height_px)
+
+    def _terrain_overlay_draw_outlines(self, map_manager, map_rect, view_width=None, view_height=None):
+        return self._terrain_overlay_display_cell_size(map_manager, map_rect, view_width=view_width, view_height=view_height) >= 6.0
+
     def _zoom_terrain_view(self, map_manager, zoom_steps, focus_world=None):
         if not zoom_steps:
             return False
@@ -2175,7 +2293,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             ])
             x = height_plus_rect.right + 10
 
-            if self.terrain_workflow_mode == 'shape' and self.terrain_shape_mode == 'smooth':
+            if self.terrain_workflow_mode == 'shape' and self.terrain_shape_mode in {'smooth', 'smooth_polygon'}:
                 smooth_text = self.small_font.render('Smooth', True, self.colors['toolbar_text'])
                 self.screen.blit(smooth_text, (x + 4, 18))
                 x += smooth_text.get_width() + 12
@@ -2192,6 +2310,11 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                     self.screen.blit(text, text.get_rect(center=rect.center))
                     self.toolbar_actions.append((rect, f'terrain_smooth_strength:set:{value}'))
                     x = rect.right + 6
+                confirm_rect = pygame.Rect(x + 4, 10, 56, self.toolbar_height - 20)
+                pygame.draw.rect(self.screen, self.colors['toolbar_button_active'], confirm_rect, border_radius=6)
+                confirm_text = self.small_font.render('确定', True, self.colors['toolbar_text'])
+                self.screen.blit(confirm_text, confirm_text.get_rect(center=confirm_rect.center))
+                self.toolbar_actions.append((confirm_rect, 'terrain_smooth_confirm'))
 
         if not getattr(game_engine, 'match_started', False):
             state_label = '未开始'
@@ -2495,7 +2618,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             return None, None
         return visible_rect, source_rect
 
-    def _blit_world_surface(self, source, map_rect, map_cache=False):
+    def _blit_world_surface(self, source, map_rect, map_cache=False, smooth=True):
         if source is None:
             return
         visible_rect, source_rect = self._compute_visible_source_rect(map_rect, source)
@@ -2504,7 +2627,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         if map_cache:
             surface = self._get_scaled_map_surface(self.game_engine.map_manager, visible_rect.size, source_rect=source_rect)
         else:
-            surface = pygame.transform.smoothscale(source.subsurface(source_rect), visible_rect.size)
+            scaler = pygame.transform.smoothscale if smooth else pygame.transform.scale
+            surface = scaler(source.subsurface(source_rect), visible_rect.size)
         if surface is not None:
             self.screen.blit(surface, visible_rect.topleft)
 
@@ -2606,7 +2730,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             self.facility_overlay_world_key = overlay_key
         return self.facility_overlay_world_surface
 
-    def _draw_world_terrain_overlay_cell(self, surface, map_manager, cell_lookup, grid_x, grid_y, base_fill_alpha):
+    def _draw_world_terrain_overlay_cell(self, surface, map_manager, cell_lookup, grid_x, grid_y, base_fill_alpha, draw_outlines=True):
         cell = cell_lookup.get(map_manager._terrain_cell_key(grid_x, grid_y))
         x1, y1, x2, y2 = map_manager._grid_cell_bounds(grid_x, grid_y)
         rect = pygame.Rect(x1, y1, max(1, x2 - x1 + 1), max(1, y2 - y1 + 1))
@@ -2617,6 +2741,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         terrain_type = str(cell.get('type', 'flat'))
         fill_alpha = base_fill_alpha if terrain_type != 'custom_terrain' else max(8, int(base_fill_alpha * 0.45))
         pygame.draw.rect(surface, (*color, fill_alpha), rect)
+        if not draw_outlines:
+            return
         signature = self._terrain_cell_border_signature(cell)
         outline_color = self._terrain_outline_color(cell.get('type', 'flat'))
         neighbors = {
@@ -2634,11 +2760,12 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         if self._terrain_cell_border_signature(neighbors['left']) != signature:
             pygame.draw.line(surface, outline_color, (x1, y1), (x1, y2), 2)
 
-    def _get_world_terrain_grid_overlay_surface(self, map_manager):
+    def _get_world_terrain_grid_overlay_surface(self, map_manager, draw_outlines=True):
         overlay_key = (
             int(map_manager.map_width),
             int(map_manager.map_height),
             int(self.terrain_overlay_alpha),
+            bool(draw_outlines),
         )
         dirty_state = map_manager.consume_terrain_overlay_dirty_state()
         base_fill_alpha = max(12, min(72, int(self.terrain_overlay_alpha * 0.32)))
@@ -2647,7 +2774,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             with map_manager._edit_state_lock:
                 cell_lookup = {key: dict(cell) for key, cell in map_manager.terrain_grid_overrides.items()}
             for cell in cell_lookup.values():
-                self._draw_world_terrain_overlay_cell(surface, map_manager, cell_lookup, int(cell['x']), int(cell['y']), base_fill_alpha)
+                self._draw_world_terrain_overlay_cell(surface, map_manager, cell_lookup, int(cell['x']), int(cell['y']), base_fill_alpha, draw_outlines=draw_outlines)
             self.terrain_grid_overlay_world_surface = surface
             self.terrain_grid_overlay_world_key = overlay_key
         elif dirty_state.get('keys'):
@@ -2675,7 +2802,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 max_x, max_y = map_manager._grid_dimensions()
                 if grid_x >= max_x or grid_y >= max_y:
                     continue
-                self._draw_world_terrain_overlay_cell(self.terrain_grid_overlay_world_surface, map_manager, cell_lookup, grid_x, grid_y, base_fill_alpha)
+                self._draw_world_terrain_overlay_cell(self.terrain_grid_overlay_world_surface, map_manager, cell_lookup, grid_x, grid_y, base_fill_alpha, draw_outlines=draw_outlines)
         return self.terrain_grid_overlay_world_surface
 
     def render_facility_overlay(self, map_manager):
@@ -2760,7 +2887,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 end = self.world_to_screen(direction_end[0], direction_end[1])
                 pygame.draw.line(self.screen, self.colors['blue'], start, end, 3)
             return
-        if self._terrain_shape_tool_active() and self.terrain_shape_mode == 'polygon' and self.polygon_points:
+        if self._terrain_shape_tool_active() and self.terrain_shape_mode in {'polygon', 'smooth_polygon'} and self.polygon_points:
             preview_points = [self.world_to_screen(point[0], point[1]) for point in self.polygon_points]
             if self.mouse_world is not None:
                 preview_target = self._current_terrain_target(self.mouse_world)
@@ -3494,17 +3621,19 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 self.drag_current = slope_target
                 self._commit_terrain_slope_polygon(game_engine)
             return
-        if self.terrain_shape_mode in {'polygon', 'slope'}:
+        if self.terrain_shape_mode in {'polygon', 'slope', 'smooth_polygon'}:
             world_pos = self._current_terrain_target(world_pos)
             if self.polygon_points and len(self.polygon_points) >= 3 and math.hypot(world_pos[0] - self.polygon_points[0][0], world_pos[1] - self.polygon_points[0][1]) <= 18:
                 if self.terrain_shape_mode == 'slope':
                     self._begin_terrain_slope_direction(game_engine)
+                elif self.terrain_shape_mode == 'smooth_polygon':
+                    self._commit_terrain_smooth_polygon(game_engine)
                 else:
                     self._commit_terrain_polygon(game_engine)
             else:
                 self.polygon_points.append(world_pos)
                 self.drag_current = world_pos
-                log_prefix = '斜坡区域' if self.terrain_shape_mode == 'slope' else '地形多边形'
+                log_prefix = '斜坡区域' if self.terrain_shape_mode == 'slope' else ('平滑多边形' if self.terrain_shape_mode == 'smooth_polygon' else '地形多边形')
                 game_engine.add_log(f'{log_prefix}已添加顶点 ({world_pos[0]}, {world_pos[1]})', 'system')
             return
         terrain_target = self._current_terrain_target(world_pos)
@@ -3523,10 +3652,12 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             self.drag_current = None
             game_engine.add_log('已取消当前斜坡绘制', 'system')
             return
-        if self.terrain_shape_mode in {'polygon', 'slope'} and self.polygon_points:
+        if self.terrain_shape_mode in {'polygon', 'slope', 'smooth_polygon'} and self.polygon_points:
             if len(self.polygon_points) >= 3:
                 if self.terrain_shape_mode == 'slope':
                     self._begin_terrain_slope_direction(game_engine)
+                elif self.terrain_shape_mode == 'smooth_polygon':
+                    self._commit_terrain_smooth_polygon(game_engine)
                 else:
                     self._commit_terrain_polygon(game_engine)
             else:
@@ -3661,7 +3792,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         mods = pygame.key.get_mods()
         if self.terrain_shape_mode == 'line' and self.drag_start is not None and mods & pygame.KMOD_SHIFT:
             return self._snap_wall_target(self.drag_start, world_pos)
-        if self.terrain_shape_mode in {'polygon', 'slope'} and self.polygon_points:
+        if self.terrain_shape_mode in {'polygon', 'slope', 'smooth_polygon'} and self.polygon_points:
             return self._current_polygon_target(self.polygon_points, world_pos)
         return world_pos
 
@@ -3719,6 +3850,20 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                     selection.add(key)
         return selection
 
+    def _apply_terrain_selection(self, game_engine, selection, source_label='框选'):
+        selection = set(selection or ())
+        self._set_terrain_selection(selection)
+        if selection:
+            if len(selection) == 1:
+                grid_x, grid_y = game_engine.map_manager._decode_terrain_cell_key(next(iter(selection)))
+                game_engine.add_log(f'已选中格栅 ({grid_x}, {grid_y})', 'system')
+            else:
+                suffix = '，可点确定执行平滑' if source_label.startswith('平滑') else ''
+                game_engine.add_log(f'{source_label}已选中 {len(selection)} 个地形格栅{suffix}', 'system')
+        else:
+            empty_message = '当前多边形区域没有可 Smooth 的已编辑地形格栅' if source_label.startswith('平滑') else '当前框选区域没有已编辑地形格栅'
+            game_engine.add_log(empty_message, 'system')
+
     def _apply_box_terrain_selection(self, game_engine, start, end):
         if start is None or end is None:
             self._clear_terrain_selection()
@@ -3729,15 +3874,22 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             cell = map_manager.get_terrain_grid_cell(end[0], end[1])
             if cell is not None:
                 selection.add(map_manager._terrain_cell_key(cell['x'], cell['y']))
-        self._set_terrain_selection(selection)
-        if selection:
-            if len(selection) == 1:
-                grid_x, grid_y = map_manager._decode_terrain_cell_key(next(iter(selection)))
-                game_engine.add_log(f'已选中格栅 ({grid_x}, {grid_y})', 'system')
-            else:
-                game_engine.add_log(f'已框选 {len(selection)} 个地形格栅', 'system')
-        else:
-            game_engine.add_log('当前框选区域没有已编辑地形格栅', 'system')
+        self._apply_terrain_selection(game_engine, selection, source_label='框选')
+
+    def _commit_terrain_smooth_polygon(self, game_engine):
+        if len(self.polygon_points) < 3:
+            return
+        map_manager = game_engine.map_manager
+        normalized_points = map_manager._normalize_points(self.polygon_points)
+        selection = {
+            map_manager._terrain_cell_key(grid_x, grid_y)
+            for grid_x, grid_y in map_manager._polygon_selected_cells(normalized_points)
+            if map_manager._terrain_cell_key(grid_x, grid_y) in map_manager.terrain_grid_overrides
+        }
+        self._apply_terrain_selection(game_engine, selection, source_label='平滑多边形')
+        self.polygon_points = []
+        self.drag_current = None
+        self.drag_start = None
 
     def _delete_selected_terrain_cells(self, game_engine):
         selection = sorted(self._terrain_selection_keys())
@@ -3880,8 +4032,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         if not selection:
             game_engine.add_log('当前框选区域没有可 Smooth 的已编辑地形格栅', 'system')
             return
-        self._set_terrain_selection(selection)
-        self._smooth_selected_terrain_cells(game_engine)
+        self._apply_terrain_selection(game_engine, selection, source_label='平滑框选')
 
     def _commit_terrain_circle(self, game_engine, center, edge):
         brush = self._selected_terrain_brush_def()
@@ -3936,7 +4087,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             if self.terrain_paint_dirty:
                 self._sync_terrain_grid_config(game_engine)
             return
-        if self.terrain_shape_mode in {'polygon', 'slope'}:
+        if self.terrain_shape_mode in {'polygon', 'slope', 'smooth_polygon'}:
             return
         if world_pos is None or self.drag_start is None:
             self.drag_start = None
@@ -4031,11 +4182,18 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                     if len(self.polygon_points) >= 3:
                         self._commit_terrain_polygon(game_engine)
                     return True
+                if self._terrain_brush_active() and self.terrain_shape_mode == 'smooth_polygon':
+                    if len(self.polygon_points) >= 3:
+                        self._commit_terrain_smooth_polygon(game_engine)
+                    return True
                 if self._terrain_brush_active() and self.terrain_shape_mode == 'slope':
                     if self._slope_direction_mode_active():
                         self._commit_terrain_slope_polygon(game_engine)
                     elif len(self.polygon_points) >= 3:
                         self._begin_terrain_slope_direction(game_engine)
+                    return True
+                if self._terrain_brush_active() and self.terrain_shape_mode == 'smooth':
+                    self._smooth_selected_terrain_cells(game_engine)
                     return True
             if event.key == pygame.K_TAB:
                 self._cycle_mode()
@@ -4311,7 +4469,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             if game_engine.paused:
                 return True
             rel = getattr(event, 'rel', (0, 0))
-            game_engine.accumulate_player_look_delta(rel[0], -rel[1])
+            game_engine.accumulate_player_look_delta(rel[0], rel[1])
             return True
         if event.type == pygame.MOUSEBUTTONDOWN:
             action = self._resolve_click_action(event.pos)
@@ -4477,6 +4635,9 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             self._delete_selected_terrain_cells(game_engine)
             return
         if action == 'terrain_smooth_selected':
+            self._smooth_selected_terrain_cells(game_engine)
+            return
+        if action == 'terrain_smooth_confirm':
             self._smooth_selected_terrain_cells(game_engine)
             return
         if action.startswith('terrain_smooth_apply:'):

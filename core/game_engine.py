@@ -18,6 +18,7 @@ from entities.entity_manager import EntityManager
 from physics.physics_engine import PhysicsEngine
 from rules.rules_engine import RulesEngine
 from control.controller import Controller
+from control.player_look import clamp_entity_pitch, get_player_mouse_input_settings, scale_player_mouse_motion, set_player_mouse_input_settings
 # Try relative import if the file exists in the same project
 try:
     from state_machine.sentry_state_machine import SentryStateMachine
@@ -63,7 +64,12 @@ class GameEngine:
         self.config = config
         self.config_manager = config_manager
         self.config_path = config_path
-        self.settings_path = config.get('_settings_path', 'settings.json')
+        if config.get('_settings_path'):
+            self.settings_path = config.get('_settings_path')
+        elif self.config_manager is not None:
+            self.settings_path = self.config_manager.default_settings_path(config_path)
+        else:
+            self.settings_path = 'CommonSetting.json'
         self.running = False
         self.fps = config.get('simulator', {}).get('fps', 50)
         self.target_dt = 1.0 / max(float(self.fps), 1.0)
@@ -282,23 +288,23 @@ class GameEngine:
         self.player_camera_mode = normalized
 
     def get_player_sensitivity_settings(self):
-        simulator_config = self.config.setdefault('simulator', {})
+        settings = get_player_mouse_input_settings(self.config)
         return {
-            'yaw': float(simulator_config.get('player_look_sensitivity_deg', 0.18)),
-            'pitch': float(simulator_config.get('player_pitch_sensitivity_deg', 0.12)),
+            'yaw': float(settings['yaw_sensitivity_deg']),
+            'pitch': float(settings['pitch_sensitivity_deg']),
         }
 
     def set_player_sensitivity_settings(self, yaw_sensitivity_deg=None, pitch_sensitivity_deg=None):
-        simulator_config = self.config.setdefault('simulator', {})
-        if yaw_sensitivity_deg is not None:
-            simulator_config['player_look_sensitivity_deg'] = max(0.01, float(yaw_sensitivity_deg))
-        if pitch_sensitivity_deg is not None:
-            simulator_config['player_pitch_sensitivity_deg'] = max(0.01, float(pitch_sensitivity_deg))
+        settings = set_player_mouse_input_settings(
+            self.config,
+            yaw_sensitivity_deg=yaw_sensitivity_deg,
+            pitch_sensitivity_deg=pitch_sensitivity_deg,
+        )
         controller = getattr(self, 'controller', None)
         if controller is not None and hasattr(controller, 'set_player_look_sensitivity'):
             controller.set_player_look_sensitivity(
-                simulator_config.get('player_look_sensitivity_deg'),
-                simulator_config.get('player_pitch_sensitivity_deg'),
+                settings.get('yaw_sensitivity_deg'),
+                settings.get('pitch_sensitivity_deg'),
             )
 
     def begin_pre_match_setup(self):
@@ -323,8 +329,9 @@ class GameEngine:
         return True
 
     def accumulate_player_look_delta(self, delta_x, delta_y):
-        self.player_look_delta[0] += float(delta_x)
-        self.player_look_delta[1] += float(delta_y)
+        yaw_delta_deg, pitch_delta_deg = scale_player_mouse_motion(self.config, delta_x, delta_y)
+        self.player_look_delta[0] += float(yaw_delta_deg)
+        self.player_look_delta[1] += float(pitch_delta_deg)
 
     def consume_player_input_state(self):
         state = {
@@ -947,10 +954,7 @@ class GameEngine:
                         deployment_target.position['y'],
                         self.rules_engine._target_armor_height_m(deployment_target),
                     )
-                    entity.gimbal_pitch_deg = max(
-                        -float(getattr(entity, 'max_pitch_down_deg', 35.0)),
-                        min(float(getattr(entity, 'max_pitch_up_deg', 40.0)), float(desired_pitch)),
-                    )
+                    entity.gimbal_pitch_deg = clamp_entity_pitch(entity, desired_pitch, config=self.config)
                     hit_probability = self.rules_engine.calculate_hit_probability(entity, deployment_target, distance)
                     entity.hero_deployment_hit_probability = hit_probability
                     entity.auto_aim_locked = False
@@ -1005,10 +1009,7 @@ class GameEngine:
                 target.position['y'],
                 self.rules_engine._target_armor_height_m(target),
             )
-            entity.gimbal_pitch_deg = max(
-                -float(getattr(entity, 'max_pitch_down_deg', 35.0)),
-                min(float(getattr(entity, 'max_pitch_up_deg', 40.0)), float(desired_pitch)),
-            )
+            entity.gimbal_pitch_deg = clamp_entity_pitch(entity, desired_pitch, config=self.config)
 
             assessment = self.rules_engine.evaluate_auto_aim_target(entity, target, distance=distance, require_fov=True)
             entity.auto_aim_hit_probability = self.rules_engine.calculate_hit_probability(entity, target, distance)
@@ -1179,7 +1180,7 @@ class GameEngine:
                 (entity.position['x'], entity.position['y']),
                 collision_radius=collision_radius,
                 search_radius=max(96, int(collision_radius * 8.0)),
-                step=max(4, self.map_manager.terrain_grid_cell_size),
+                step=max(4, int(round(self.map_manager.terrain_grid_cell_size))),
             )
             if fallback is None:
                 continue
