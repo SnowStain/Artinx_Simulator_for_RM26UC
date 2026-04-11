@@ -2,24 +2,31 @@
   "simulator": {
     "show_facilities": false,
     "show_aim_fov": false,
+    "show_entities": true,
     "enable_entity_movement": true,
+    "player_look_sensitivity_deg": 0.18,
+    "player_pitch_sensitivity_deg": 0.12,
     "show_perf_overlay": true,
     "enable_perf_logging": true,
     "enable_perf_breakdown": true,
     "enable_perf_file_logging": true,
     "perf_sample_window": 20000,
-    "perf_log_interval_sec": 5.0
+    "perf_log_interval_sec": 5.0,
+    "debug_feature_toggles": {}
   },
   "ai": {
     "behavior_preset": "latest_behavior",
     "controller_worker_threads": 4,
-    "controller_shards_per_frame": 2,
+    "controller_shards_per_frame": 1,
+    "controller_dispatch_interval_sec": 0.12,
+    "controller_time_budget_ms": 12.0,
+    "player_control_dispatch_interval_sec": 0.2,
     "auto_aim_worker_threads": 2,
     "path_replans_per_update": 1,
     "pathfinder_max_candidates": 1
   },
   "map": {
-    "preset": "basicMap"
+    "preset": "blankCanvas"
   },
   "entities": {
     "initial_positions": {

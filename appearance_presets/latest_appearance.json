@@ -1,0 +1,280 @@
+{
+  "profiles": {
+    "hero": {
+      "body_length_m": 0.65,
+      "body_width_m": 0.55,
+      "body_height_m": 0.19,
+      "body_clearance_m": 0.07,
+      "wheel_radius_m": 0.085,
+      "gimbal_length_m": 0.34,
+      "gimbal_width_m": 0.2,
+      "gimbal_body_height_m": 0.14,
+      "gimbal_mount_gap_m": 0.1,
+      "gimbal_mount_length_m": 0.14,
+      "gimbal_mount_width_m": 0.15,
+      "gimbal_mount_height_m": 0.14,
+      "barrel_length_m": 0.14,
+      "barrel_radius_m": 0.026,
+      "gimbal_height_m": 0.435,
+      "gimbal_offset_x_m": 0.0,
+      "gimbal_offset_y_m": 0.0,
+      "armor_plate_width_m": 0.29,
+      "armor_plate_length_m": 0.29,
+      "armor_plate_height_m": 0.16,
+      "armor_plate_gap_m": 0.005,
+      "armor_light_length_m": 0.04,
+      "armor_light_width_m": 0.005,
+      "armor_light_height_m": 0.08,
+      "barrel_light_length_m": 0.13,
+      "barrel_light_width_m": 0.015,
+      "barrel_light_height_m": 0.05,
+      "body_render_width_scale": 0.82,
+      "wheel_style": "mecanum",
+      "suspension_style": "none",
+      "arm_style": "none",
+      "custom_wheel_positions_m": [
+        [
+          -0.2535,
+          -0.319
+        ],
+        [
+          0.2535,
+          -0.319
+        ],
+        [
+          -0.2535,
+          0.319
+        ],
+        [
+          0.2535,
+          0.319
+        ]
+      ],
+      "body_color_rgb": [
+        166,
+        174,
+        186
+      ],
+      "turret_color_rgb": [
+        232,
+        232,
+        236
+      ],
+      "armor_color_rgb": [
+        224,
+        229,
+        234
+      ],
+      "wheel_color_rgb": [
+        44,
+        44,
+        44
+      ]
+    },
+    "engineer": {
+      "body_length_m": 0.55,
+      "body_width_m": 0.5,
+      "body_height_m": 0.16,
+      "body_clearance_m": 0.11,
+      "wheel_radius_m": 0.08,
+      "gimbal_length_m": 0.0,
+      "gimbal_width_m": 0.0,
+      "gimbal_body_height_m": 0.0,
+      "gimbal_mount_gap_m": 0.0,
+      "gimbal_mount_length_m": 0.0,
+      "gimbal_mount_width_m": 0.0,
+      "gimbal_mount_height_m": 0.0,
+      "barrel_length_m": 0.0,
+      "barrel_radius_m": 0.0,
+      "gimbal_height_m": 0.42,
+      "gimbal_offset_x_m": 0.0,
+      "gimbal_offset_y_m": 0.0,
+      "armor_plate_width_m": 0.17,
+      "armor_plate_length_m": 0.17,
+      "armor_plate_height_m": 0.15,
+      "armor_plate_gap_m": 0.005,
+      "armor_light_length_m": 0.04,
+      "armor_light_width_m": 0.005,
+      "armor_light_height_m": 0.08,
+      "barrel_light_length_m": 0.1,
+      "barrel_light_width_m": 0.02,
+      "barrel_light_height_m": 0.02,
+      "body_render_width_scale": 0.82,
+      "wheel_style": "mecanum",
+      "suspension_style": "none",
+      "arm_style": "fixed_7",
+      "custom_wheel_positions_m": [
+        [
+          -0.21450000000000002,
+          -0.294
+        ],
+        [
+          0.21450000000000002,
+          -0.294
+        ],
+        [
+          -0.21450000000000002,
+          0.294
+        ],
+        [
+          0.21450000000000002,
+          0.294
+        ]
+      ],
+      "body_color_rgb": [
+        166,
+        174,
+        186
+      ],
+      "turret_color_rgb": [
+        232,
+        232,
+        236
+      ],
+      "armor_color_rgb": [
+        224,
+        229,
+        234
+      ],
+      "wheel_color_rgb": [
+        44,
+        44,
+        44
+      ]
+    },
+    "infantry": {
+      "body_length_m": 0.49,
+      "body_width_m": 0.42,
+      "body_height_m": 0.16,
+      "body_clearance_m": 0.16,
+      "wheel_radius_m": 0.06,
+      "gimbal_length_m": 0.3,
+      "gimbal_width_m": 0.15,
+      "gimbal_body_height_m": 0.11,
+      "gimbal_mount_gap_m": 0.1,
+      "gimbal_mount_length_m": 0.09,
+      "gimbal_mount_width_m": 0.07,
+      "gimbal_mount_height_m": 0.11,
+      "barrel_length_m": 0.12,
+      "barrel_radius_m": 0.015,
+      "gimbal_height_m": 0.47,
+      "gimbal_offset_x_m": 0.0,
+      "gimbal_offset_y_m": 0.0,
+      "armor_plate_width_m": 0.16,
+      "armor_plate_length_m": 0.16,
+      "armor_plate_height_m": 0.16,
+      "armor_plate_gap_m": 0.005,
+      "armor_light_length_m": 0.04,
+      "armor_light_width_m": 0.005,
+      "armor_light_height_m": 0.08,
+      "barrel_light_length_m": 0.095,
+      "barrel_light_width_m": 0.005,
+      "barrel_light_height_m": 0.03,
+      "body_render_width_scale": 0.73,
+      "wheel_style": "legged",
+      "suspension_style": "five_link",
+      "arm_style": "none",
+      "custom_wheel_positions_m": [
+        [
+          0.0,
+          -0.258
+        ],
+        [
+          0.0,
+          0.258
+        ]
+      ],
+      "body_color_rgb": [
+        166,
+        174,
+        186
+      ],
+      "turret_color_rgb": [
+        232,
+        232,
+        236
+      ],
+      "armor_color_rgb": [
+        224,
+        229,
+        234
+      ],
+      "wheel_color_rgb": [
+        44,
+        44,
+        44
+      ]
+    },
+    "sentry": {
+      "body_length_m": 0.55,
+      "body_width_m": 0.5,
+      "body_height_m": 0.18,
+      "body_clearance_m": 0.07,
+      "wheel_radius_m": 0.08,
+      "gimbal_length_m": 0.3,
+      "gimbal_width_m": 0.15,
+      "gimbal_body_height_m": 0.11,
+      "gimbal_mount_gap_m": 0.1,
+      "gimbal_mount_length_m": 0.1,
+      "gimbal_mount_width_m": 0.1,
+      "gimbal_mount_height_m": 0.1,
+      "barrel_length_m": 0.12,
+      "barrel_radius_m": 0.015,
+      "gimbal_height_m": 0.39,
+      "gimbal_offset_x_m": 0.0,
+      "gimbal_offset_y_m": 0.0,
+      "armor_plate_width_m": 0.16,
+      "armor_plate_length_m": 0.16,
+      "armor_plate_height_m": 0.16,
+      "armor_plate_gap_m": 0.005,
+      "armor_light_length_m": 0.04,
+      "armor_light_width_m": 0.005,
+      "armor_light_height_m": 0.08,
+      "barrel_light_length_m": 0.095,
+      "barrel_light_width_m": 0.005,
+      "barrel_light_height_m": 0.03,
+      "body_render_width_scale": 0.76,
+      "wheel_style": "mecanum",
+      "suspension_style": "none",
+      "arm_style": "none",
+      "custom_wheel_positions_m": [
+        [
+          -0.21450000000000002,
+          -0.294
+        ],
+        [
+          0.21450000000000002,
+          -0.294
+        ],
+        [
+          -0.21450000000000002,
+          0.294
+        ],
+        [
+          0.21450000000000002,
+          0.294
+        ]
+      ],
+      "body_color_rgb": [
+        166,
+        174,
+        186
+      ],
+      "turret_color_rgb": [
+        232,
+        232,
+        236
+      ],
+      "armor_color_rgb": [
+        224,
+        229,
+        234
+      ],
+      "wheel_color_rgb": [
+        44,
+        44,
+        44
+      ]
+    }
+  }
+}

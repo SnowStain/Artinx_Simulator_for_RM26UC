@@ -66,7 +66,8 @@ class GameEngine:
         self.settings_path = config.get('_settings_path', 'settings.json')
         self.running = False
         self.fps = config.get('simulator', {}).get('fps', 50)
-        self.dt = 1.0 / self.fps
+        self.target_dt = 1.0 / max(float(self.fps), 1.0)
+        self.dt = self.target_dt
         self.config['rules'] = RulesEngine.build_rule_config(self.config.get('rules', {}))
         self._auto_aim_worker_threads = max(1, int(self.config.get('ai', {}).get('auto_aim_worker_threads', 1) or 1))
         self._auto_aim_executor = None
@@ -114,6 +115,18 @@ class GameEngine:
         self.match_mode = str(simulator_config.get('match_mode', 'full') or 'full')
         self.single_unit_test_team = str(simulator_config.get('single_unit_test_team', 'red') or 'red')
         self.single_unit_test_entity_key = str(simulator_config.get('single_unit_test_entity_key', 'robot_1') or 'robot_1')
+        self.player_controlled_entity_id = None
+        self.player_control_enabled = False
+        self.player_fire_pressed = False
+        self.player_autoaim_pressed = False
+        self.player_look_delta = [0.0, 0.0]
+        self.player_view_aim_state = None
+        self.player_camera_mode = str(simulator_config.get('player_camera_mode', 'first_person') or 'first_person')
+        if self.player_camera_mode not in {'first_person', 'third_person'}:
+            self.player_camera_mode = 'first_person'
+        self.pre_match_setup_required = False
+        self.pre_match_countdown_remaining = 0.0
+        self.pre_match_config_applied = False
         self._normalize_match_mode_settings()
 
     def _load_debug_feature_toggles(self):
@@ -214,6 +227,129 @@ class GameEngine:
         if not self.is_single_unit_test_mode() or not focus_entity_id:
             return None
         return {focus_entity_id}
+
+    def get_player_controlled_entity(self):
+        if not self.player_control_enabled or not self.player_controlled_entity_id:
+            return None
+        entity = self.entity_manager.get_entity(self.player_controlled_entity_id)
+        if entity is None or not entity.is_alive():
+            self.clear_player_controlled_entity()
+            return None
+        return entity
+
+    def get_player_controlled_entity_ids(self):
+        entity = self.get_player_controlled_entity()
+        if entity is None:
+            return set()
+        return {entity.id}
+
+    def set_player_controlled_entity(self, entity_id=None):
+        entity = self.entity_manager.get_entity(entity_id) if entity_id else None
+        for candidate in getattr(self.entity_manager, 'entities', ()):
+            candidate.player_controlled = False
+        if entity is None or not entity.is_alive() or getattr(entity, 'type', None) not in {'robot', 'sentry'}:
+            self.player_control_enabled = False
+            self.player_controlled_entity_id = None
+            return False
+        entity.player_controlled = True
+        self.player_controlled_entity_id = entity.id
+        self.player_control_enabled = True
+        return True
+
+    def clear_player_controlled_entity(self):
+        for candidate in getattr(self.entity_manager, 'entities', ()):
+            candidate.player_controlled = False
+        self.player_control_enabled = False
+        self.player_controlled_entity_id = None
+        self.player_fire_pressed = False
+        self.player_autoaim_pressed = False
+        self.player_look_delta = [0.0, 0.0]
+        self.player_view_aim_state = None
+
+    def set_player_action_state(self, fire_pressed=None, autoaim_pressed=None):
+        if fire_pressed is not None:
+            self.player_fire_pressed = bool(fire_pressed)
+        if autoaim_pressed is not None:
+            self.player_autoaim_pressed = bool(autoaim_pressed)
+
+    def set_player_view_aim_state(self, aim_state=None):
+        self.player_view_aim_state = deepcopy(aim_state) if isinstance(aim_state, dict) else None
+
+    def set_player_camera_mode(self, mode):
+        normalized = str(mode or 'first_person')
+        if normalized not in {'first_person', 'third_person'}:
+            normalized = 'first_person'
+        self.player_camera_mode = normalized
+
+    def get_player_sensitivity_settings(self):
+        simulator_config = self.config.setdefault('simulator', {})
+        return {
+            'yaw': float(simulator_config.get('player_look_sensitivity_deg', 0.18)),
+            'pitch': float(simulator_config.get('player_pitch_sensitivity_deg', 0.12)),
+        }
+
+    def set_player_sensitivity_settings(self, yaw_sensitivity_deg=None, pitch_sensitivity_deg=None):
+        simulator_config = self.config.setdefault('simulator', {})
+        if yaw_sensitivity_deg is not None:
+            simulator_config['player_look_sensitivity_deg'] = max(0.01, float(yaw_sensitivity_deg))
+        if pitch_sensitivity_deg is not None:
+            simulator_config['player_pitch_sensitivity_deg'] = max(0.01, float(pitch_sensitivity_deg))
+        controller = getattr(self, 'controller', None)
+        if controller is not None and hasattr(controller, 'set_player_look_sensitivity'):
+            controller.set_player_look_sensitivity(
+                simulator_config.get('player_look_sensitivity_deg'),
+                simulator_config.get('player_pitch_sensitivity_deg'),
+            )
+
+    def begin_pre_match_setup(self):
+        if not self.match_started:
+            return False
+        self.pre_match_setup_required = True
+        self.pre_match_countdown_remaining = 0.0
+        self.pre_match_config_applied = False
+        self.paused = True
+        return True
+
+    def begin_pre_match_countdown(self, seconds=5.0):
+        if not self.match_started:
+            return False
+        if self.get_player_controlled_entity() is None:
+            return False
+        self.pre_match_setup_required = False
+        self.pre_match_config_applied = True
+        self.pre_match_countdown_remaining = max(0.0, float(seconds))
+        self.paused = True
+        self.add_log(f'赛前参数已锁定，{int(round(self.pre_match_countdown_remaining))} 秒后开始比赛。', 'system')
+        return True
+
+    def accumulate_player_look_delta(self, delta_x, delta_y):
+        self.player_look_delta[0] += float(delta_x)
+        self.player_look_delta[1] += float(delta_y)
+
+    def consume_player_input_state(self):
+        state = {
+            'look_dx': float(self.player_look_delta[0]),
+            'look_dy': float(self.player_look_delta[1]),
+            'fire_pressed': bool(self.player_fire_pressed),
+            'autoaim_pressed': bool(self.player_autoaim_pressed),
+            'view_aim_state': deepcopy(self.player_view_aim_state) if isinstance(self.player_view_aim_state, dict) else None,
+            'camera_mode': str(getattr(self, 'player_camera_mode', 'first_person')),
+        }
+        self.player_look_delta[0] = 0.0
+        self.player_look_delta[1] = 0.0
+        return state
+
+    def is_player_in_supply_zone(self):
+        entity = self.get_player_controlled_entity()
+        if entity is None:
+            return False
+        return bool(self.rules_engine.is_in_team_supply_zone(entity, map_manager=self.map_manager))
+
+    def purchase_player_ammo(self, amount):
+        entity = self.get_player_controlled_entity()
+        if entity is None:
+            return {'ok': False, 'code': 'ENTITY_MISSING'}
+        return self.rules_engine.purchase_manual_role_ammo(entity, amount, map_manager=self.map_manager)
 
     def _clear_single_unit_test_inactive_entity_state(self):
         if not self.is_single_unit_test_mode():
@@ -334,6 +470,9 @@ class GameEngine:
         old_controller = getattr(self, 'controller', None)
         if old_controller is not None and hasattr(old_controller, 'shutdown'):
             old_controller.shutdown()
+        old_map_manager = getattr(self, 'map_manager', None)
+        if old_map_manager is not None and hasattr(old_map_manager, 'shutdown'):
+            old_map_manager.shutdown()
         self._restart_auto_aim_executor(wait=True)
         self.map_manager = MapManager(self.config)
         self.entity_manager = EntityManager(self.config)
@@ -365,6 +504,9 @@ class GameEngine:
         controller = getattr(self, 'controller', None)
         if controller is not None and hasattr(controller, 'shutdown'):
             controller.shutdown()
+        map_manager = getattr(self, 'map_manager', None)
+        if map_manager is not None and hasattr(map_manager, 'shutdown'):
+            map_manager.shutdown()
 
     def _reset_runtime_state(self):
         self.game_time = 0
@@ -381,6 +523,10 @@ class GameEngine:
         self._last_update_breakdown = None
         self._last_event_ms = 0.0
         self._perf_log_session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.pre_match_setup_required = False
+        self.pre_match_countdown_remaining = 0.0
+        self.pre_match_config_applied = False
+        self.clear_player_controlled_entity()
     
     def initialize(self):
         """初始化游戏引擎"""
@@ -405,7 +551,11 @@ class GameEngine:
         self.game_duration = self.config.get('rules', {}).get('game_duration', 420)
         self.match_started = True
         self.paused = False
-        self.add_log('对局开始', 'system')
+        if bool(self.config.get('simulator', {}).get('standalone_3d_program', False)):
+            self.begin_pre_match_setup()
+            self.add_log('需要配置机器人参数，请按 P 打开赛前面板。', 'system')
+        else:
+            self.add_log('对局开始', 'system')
 
     def end_match(self):
         """结束当前对局，但不关闭程序。"""
@@ -590,6 +740,12 @@ class GameEngine:
     
     def update(self):
         """更新游戏状态"""
+        if self.match_started and self.pre_match_countdown_remaining > 0.0:
+            self.pre_match_countdown_remaining = max(0.0, self.pre_match_countdown_remaining - self.dt)
+            if self.pre_match_countdown_remaining <= 1e-6:
+                self.pre_match_countdown_remaining = 0.0
+                self.paused = False
+                self.add_log('比赛开始', 'system')
         if self.paused or not self.match_started:
             self._last_update_breakdown = None
             return
@@ -618,6 +774,7 @@ class GameEngine:
         # 控制处理
         controller_start = time.perf_counter() if measure_perf else 0.0
         if self.feature_enabled('controller'):
+            player_ids = self.get_player_controlled_entity_ids()
             self.controller.update(
                 self.entity_manager.entities,
                 self.map_manager,
@@ -625,6 +782,9 @@ class GameEngine:
                 self.game_time,
                 self.game_duration,
                 controlled_entity_ids=self.get_single_unit_test_controlled_entity_ids(),
+                ai_excluded_entity_ids=player_ids,
+                manual_entity_ids=player_ids,
+                manual_state=self.consume_player_input_state(),
             )
             self._freeze_non_focus_single_unit_entities()
             self._clear_single_unit_test_inactive_entity_state()
@@ -713,11 +873,16 @@ class GameEngine:
 
         track_speed = float(self.rules_engine.rules.get('shooting', {}).get('auto_aim_track_speed_deg_per_sec', 180.0))
         controlled_ids = self.get_single_unit_test_controlled_entity_ids()
+        player_ids = self.get_player_controlled_entity_ids()
 
         for entity in self.entity_manager.entities:
             if not entity.is_alive():
                 continue
             if entity.type not in {'robot', 'sentry'}:
+                continue
+            if entity.id in player_ids:
+                entity.auto_aim_locked = False
+                entity.auto_aim_hit_probability = 0.0
                 continue
             if controlled_ids is not None and entity.id not in controlled_ids:
                 entity.target = None
@@ -776,6 +941,16 @@ class GameEngine:
                         entity.turret_angle = desired_angle
                     else:
                         entity.turret_angle = (current_angle + max_step * (1 if angle_diff > 0 else -1)) % 360
+                    _, desired_pitch = self.rules_engine.get_aim_angles_to_point(
+                        entity,
+                        deployment_target.position['x'],
+                        deployment_target.position['y'],
+                        self.rules_engine._target_armor_height_m(deployment_target),
+                    )
+                    entity.gimbal_pitch_deg = max(
+                        -float(getattr(entity, 'max_pitch_down_deg', 35.0)),
+                        min(float(getattr(entity, 'max_pitch_up_deg', 40.0)), float(desired_pitch)),
+                    )
                     hit_probability = self.rules_engine.calculate_hit_probability(entity, deployment_target, distance)
                     entity.hero_deployment_hit_probability = hit_probability
                     entity.auto_aim_locked = False
@@ -824,6 +999,16 @@ class GameEngine:
                 entity.turret_angle = desired_angle
             else:
                 entity.turret_angle = (current_angle + max_step * (1 if angle_diff > 0 else -1)) % 360
+            _, desired_pitch = self.rules_engine.get_aim_angles_to_point(
+                entity,
+                target.position['x'],
+                target.position['y'],
+                self.rules_engine._target_armor_height_m(target),
+            )
+            entity.gimbal_pitch_deg = max(
+                -float(getattr(entity, 'max_pitch_down_deg', 35.0)),
+                min(float(getattr(entity, 'max_pitch_up_deg', 40.0)), float(desired_pitch)),
+            )
 
             assessment = self.rules_engine.evaluate_auto_aim_target(entity, target, distance=distance, require_fov=True)
             entity.auto_aim_hit_probability = self.rules_engine.calculate_hit_probability(entity, target, distance)
@@ -972,7 +1157,18 @@ class GameEngine:
             if not getattr(entity, 'collidable', False):
                 continue
             collision_radius = float(getattr(entity, 'collision_radius', 0.0))
-            if self.map_manager.is_position_valid_for_radius(entity.position['x'], entity.position['y'], collision_radius=collision_radius):
+            if getattr(entity, 'type', None) in {'robot', 'sentry'}:
+                pose_valid = self.map_manager.is_position_valid_for_chassis(
+                    entity.position['x'],
+                    entity.position['y'],
+                    float(getattr(entity, 'angle', 0.0)),
+                    float(getattr(entity, 'body_length_m', getattr(entity, 'body_size_m', 0.0))),
+                    float(getattr(entity, 'body_width_m', getattr(entity, 'body_size_m', 0.0))),
+                    body_clearance_m=float(getattr(entity, 'body_clearance_m', 0.0)),
+                )
+            else:
+                pose_valid = self.map_manager.is_position_valid_for_radius(entity.position['x'], entity.position['y'], collision_radius=collision_radius)
+            if pose_valid:
                 entity.position['z'] = self.map_manager.get_terrain_height_m(entity.position['x'], entity.position['y'])
                 entity.previous_position = dict(entity.position)
                 entity.last_valid_position = dict(entity.position)
@@ -1024,6 +1220,11 @@ class GameEngine:
         clock = pygame.time.Clock()
         
         while self.running:
+            elapsed_ms = clock.tick(self.fps)
+            if elapsed_ms <= 0:
+                self.dt = self.target_dt
+            else:
+                self.dt = max(0.001, min(0.10, float(elapsed_ms) / 1000.0))
             frame_start = time.perf_counter()
             # 处理事件
             event_start = time.perf_counter()
@@ -1035,7 +1236,7 @@ class GameEngine:
                     self.running = False
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
-                        self.running = False
+                        self.toggle_pause()
             event_end = time.perf_counter()
             self._last_event_ms = (event_end - event_start) * 1000.0
             
@@ -1064,9 +1265,6 @@ class GameEngine:
             if self.match_started and not self.paused:
                 self._record_perf_sample(update_ms, render_ms, frame_ms, breakdown=breakdown, game_time=self.game_time)
             self._maybe_log_perf()
-            
-            # 控制帧率
-            clock.tick(self.fps)
         
         # 清理资源
         self._flush_perf_samples_to_file('quit')
@@ -1117,6 +1315,8 @@ class GameEngine:
     def toggle_pause(self):
         if not self.match_started:
             self.add_log('对局尚未开始，点击开始/重开后才能暂停。', 'system')
+            return
+        if self.pre_match_setup_required or self.pre_match_countdown_remaining > 0.0:
             return
         self.paused = not self.paused
         self.add_log('已暂停' if self.paused else '已继续', 'system')
@@ -1213,6 +1413,29 @@ class GameEngine:
             'scale_text': f'比例尺 1m≈{avg_pixels_per_meter:.2f}单位 | 8m≈{self.rules_engine.auto_aim_max_distance:.1f}',
             'red': teams['red'],
             'blue': teams['blue'],
+        }
+
+    def get_player_hud_data(self):
+        entity = self.get_player_controlled_entity()
+        if entity is None:
+            return None
+        detail = self.get_entity_detail_data(entity.id)
+        if detail is None:
+            return None
+        return {
+            'entity_id': entity.id,
+            'label': detail['label'],
+            'robot_type': detail['robot_type'],
+            'ammo': int(detail['ammo']),
+            'power': float(detail['power']),
+            'max_power': float(detail['max_power']),
+            'heat': float(detail['heat']),
+            'max_heat': float(detail['max_heat']),
+            'gold': float(getattr(entity, 'gold', 0.0)),
+            'fire_control_state': detail['fire_control_state'],
+            'auto_aim_locked': bool(getattr(entity, 'auto_aim_locked', False)),
+            'supply_zone': self.is_player_in_supply_zone(),
+            'pitch_deg': float(getattr(entity, 'gimbal_pitch_deg', 0.0)),
         }
 
     def get_entity_detail_data(self, entity_id):

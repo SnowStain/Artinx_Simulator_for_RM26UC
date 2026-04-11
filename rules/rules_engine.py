@@ -127,6 +127,12 @@ class RulesEngine:
                 'ammo_per_shot': 1,
                 'power_per_shot': 6.0,
                 'heat_per_shot': 12.0,
+                'projectile_speed_17mm_mps': 23.0,
+                'projectile_speed_42mm_mps': 17.0,
+                'projectile_gravity_mps2': 9.81,
+                'projectile_drag_17mm': 0.018,
+                'projectile_drag_42mm': 0.026,
+                'projectile_simulation_dt_sec': 0.01,
                 'heat_gain_17mm': 10.0,
                 'heat_gain_42mm': 100.0,
                 'heat_detection_hz': 10.0,
@@ -134,17 +140,17 @@ class RulesEngine:
                 'heat_soft_lock_margin_42mm': 200.0,
                 'overheat_lock_duration': 5.0,
                 'armor_center_height_m': 0.15,
-                'turret_axis_height_m': 0.45,
-                'camera_height_m': 0.45,
-                'max_pitch_up_deg': 35.0,
-                'max_pitch_down_deg': 25.0,
+                'turret_axis_height_m': 0.50,
+                'camera_height_m': 0.50,
+                'max_pitch_up_deg': 40.0,
+                'max_pitch_down_deg': 35.0,
                 'los_sample_step_m': 0.25,
                 'los_clearance_m': 0.02,
                 'los_pitch_margin_deg': 0.8,
                 'los_pitch_probe_distance_m': 0.45,
                 'los_terrain_pitch_margin_deg': 1.2,
                 'auto_aim_max_distance_m': 8.0,
-                'auto_aim_fov_deg': 50.0,
+                'auto_aim_fov_deg': 60.0,
                 'auto_aim_track_speed_deg_per_sec': 180.0,
                 'motion_thresholds': {
                     'spinning_angular_velocity_deg': 45.0,
@@ -512,12 +518,14 @@ class RulesEngine:
         self.terrain_cross_types = {'fly_slope', 'undulating_road', 'first_step', 'second_step', 'dog_hole'}
         self.auto_aim_max_distance = self._meters_to_world_units(self.rules['shooting']['auto_aim_max_distance_m'])
         self.projectile_traces = []
+        self.projectile_trace_limit = int(max(32, self.rules.get('shooting', {}).get('projectile_trace_limit', 192)))
         self.collision_damage_cooldowns = {}
         self.game_time = 0.0
         self.game_duration = float(self.rules.get('game_duration', 420.0))
         self._frame_cache_token = None
         self._auto_aim_eval_cache = {}
         self._line_of_sight_cache = {}
+        self._armor_target_cache = {}
         self._facility_update_accumulator = 0.0
         self._facility_update_interval = 0.04
 
@@ -527,6 +535,7 @@ class RulesEngine:
         self._frame_cache_token = frame_token
         self._auto_aim_eval_cache.clear()
         self._line_of_sight_cache.clear()
+        self._armor_target_cache.clear()
 
     def _entity_pose_cache_key(self, entity, include_turret=False):
         key = (
@@ -600,6 +609,8 @@ class RulesEngine:
         control_modes = self.rules['control_modes']
         chassis_mode = getattr(entity, 'chassis_mode', 'health_priority')
         gimbal_mode = getattr(entity, 'gimbal_mode', 'cooling_priority')
+        armor_height = self._target_armor_height_m(entity) - self._entity_ground_height_m(entity)
+        turret_height = self._shooter_view_height_m(entity) - self._entity_ground_height_m(entity)
         return {
             'fire_rate_hz': float(getattr(entity, 'fire_rate_hz', shooting['fire_rate_hz'])),
             'effective_fire_rate_hz': float(self.get_effective_fire_rate_hz(entity)),
@@ -607,11 +618,11 @@ class RulesEngine:
             'power_per_shot': float(self.get_effective_power_per_shot(entity)),
             'heat_per_shot': float(self._heat_gain_per_shot(entity)),
             'overheat_lock_duration': float(shooting['overheat_lock_duration']),
-            'armor_center_height_m': float(shooting['armor_center_height_m']),
-            'turret_axis_height_m': float(shooting.get('turret_axis_height_m', shooting.get('camera_height_m', 0.45))),
-            'camera_height_m': float(shooting['camera_height_m']),
-            'max_pitch_up_deg': float(shooting.get('max_pitch_up_deg', 35.0)),
-            'max_pitch_down_deg': float(shooting.get('max_pitch_down_deg', 25.0)),
+            'armor_center_height_m': float(armor_height),
+            'turret_axis_height_m': float(turret_height),
+            'camera_height_m': float(turret_height),
+            'max_pitch_up_deg': float(getattr(entity, 'max_pitch_up_deg', shooting.get('max_pitch_up_deg', 40.0))),
+            'max_pitch_down_deg': float(getattr(entity, 'max_pitch_down_deg', shooting.get('max_pitch_down_deg', 35.0))),
             'auto_aim_max_distance_m': float(shooting['auto_aim_max_distance_m']),
             'auto_aim_max_distance_world': float(self.auto_aim_max_distance),
             'auto_aim_fov_deg': float(shooting['auto_aim_fov_deg']),
@@ -638,13 +649,15 @@ class RulesEngine:
         chassis_profile = self._chassis_mode_profile(entity)
         return base_cost * float(chassis_profile.get('power_cost_mult', 1.0))
 
+    def _next_shot_would_overheat(self, entity):
+        next_shot_heat = float(self._heat_gain_per_shot(entity))
+        return float(getattr(entity, 'heat', 0.0)) + next_shot_heat > float(getattr(entity, 'max_heat', 0.0)) + 1e-6
+
     def get_effective_fire_rate_hz(self, entity):
         if getattr(entity, 'heat_lock_state', 'normal') != 'normal':
             return 0.0
-        if getattr(entity, 'robot_type', '') == '英雄' and getattr(entity, 'ammo_type', None) == '42mm':
-            next_shot_heat = self._heat_gain_per_shot(entity)
-            if float(getattr(entity, 'heat', 0.0)) + float(next_shot_heat) > float(getattr(entity, 'max_heat', 0.0)) + 1e-6:
-                return 0.0
+        if self._next_shot_would_overheat(entity):
+            return 0.0
         base_rate = float(getattr(entity, 'fire_rate_hz', self.rules['shooting']['fire_rate_hz']))
         chassis_profile = self._chassis_mode_profile(entity)
         gimbal_profile = self._gimbal_mode_profile(entity)
@@ -683,18 +696,90 @@ class RulesEngine:
             return 0.0
         return float(map_manager.get_terrain_height_m(entity.position['x'], entity.position['y']))
 
+    def _entity_base_height_m(self, entity):
+        ground_height = self._entity_ground_height_m(entity)
+        return max(ground_height, float(getattr(entity, 'position', {}).get('z', ground_height)))
+
+    def _entity_vertical_scale(self, entity):
+        return max(1.0, float(getattr(entity, 'vertical_scale_m', 1.0)))
+
+    def _meters_to_world_units(self, meters):
+        map_manager = self._map_manager()
+        if map_manager is None:
+            field_length_m = float(self.config.get('map', {}).get('field_length_m', 28.0))
+            field_width_m = float(self.config.get('map', {}).get('field_width_m', 15.0))
+            map_width = float(self.config.get('map', {}).get('width', 1576))
+            map_height = float(self.config.get('map', {}).get('height', 873))
+            pixels_per_meter_x = map_width / max(field_length_m, 1e-6)
+            pixels_per_meter_y = map_height / max(field_width_m, 1e-6)
+            return float(meters) * ((pixels_per_meter_x + pixels_per_meter_y) * 0.5)
+        return float(map_manager.meters_to_world_units(float(meters)))
+
+    def _world_units_to_meters(self, world_units):
+        map_manager = self._map_manager()
+        if map_manager is None:
+            field_length_m = float(self.config.get('map', {}).get('field_length_m', 28.0))
+            field_width_m = float(self.config.get('map', {}).get('field_width_m', 15.0))
+            map_width = float(self.config.get('map', {}).get('width', 1576))
+            map_height = float(self.config.get('map', {}).get('height', 873))
+            pixels_per_meter_x = map_width / max(field_length_m, 1e-6)
+            pixels_per_meter_y = map_height / max(field_width_m, 1e-6)
+            world_units_per_meter = max((pixels_per_meter_x + pixels_per_meter_y) * 0.5, 1e-6)
+            return float(world_units) / world_units_per_meter
+        world_units_per_meter = max(float(map_manager.meters_to_world_units(1.0)), 1e-6)
+        return float(world_units) / world_units_per_meter
+
+    def _projectile_speed_mps(self, ammo_type):
+        shooting_rules = self.rules.get('shooting', {})
+        if ammo_type == '42mm':
+            return float(shooting_rules.get('projectile_speed_42mm_mps', 17.0))
+        return float(shooting_rules.get('projectile_speed_17mm_mps', 23.0))
+
+    def _projectile_drag_coefficient(self, ammo_type):
+        shooting_rules = self.rules.get('shooting', {})
+        if ammo_type == '42mm':
+            return float(shooting_rules.get('projectile_drag_42mm', 0.026))
+        return float(shooting_rules.get('projectile_drag_17mm', 0.018))
+
+    def _projectile_gravity_mps2(self):
+        return float(self.rules.get('shooting', {}).get('projectile_gravity_mps2', 9.81))
+
+    def _metric_point_from_world(self, point3d):
+        return (
+            self._world_units_to_meters(float(point3d[0])),
+            self._world_units_to_meters(float(point3d[1])),
+            float(point3d[2]),
+        )
+
+    def _world_point_from_metric(self, point3d):
+        return (
+            self._meters_to_world_units(float(point3d[0])),
+            self._meters_to_world_units(float(point3d[1])),
+            float(point3d[2]),
+        )
+
+    def _shooter_muzzle_point(self, shooter):
+        yaw_rad = math.radians(float(getattr(shooter, 'turret_angle', shooter.angle)))
+        local_forward = self._meters_to_world_units(float(getattr(shooter, 'gimbal_offset_x_m', 0.0)))
+        local_right = self._meters_to_world_units(float(getattr(shooter, 'gimbal_offset_y_m', 0.0)))
+        world_x = float(shooter.position['x']) + math.cos(yaw_rad) * local_forward - math.sin(yaw_rad) * local_right
+        world_y = float(shooter.position['y']) + math.sin(yaw_rad) * local_forward + math.cos(yaw_rad) * local_right
+        return (world_x, world_y, self._shooter_view_height_m(shooter))
+
     def _shooter_view_height_m(self, shooter):
         shooting_rules = self.rules.get('shooting', {})
-        view_height = float(shooting_rules.get('turret_axis_height_m', shooting_rules.get('camera_height_m', 0.45)))
-        return self._entity_ground_height_m(shooter) + view_height
+        view_height = float(getattr(shooter, 'gimbal_height_m', shooting_rules.get('turret_axis_height_m', shooting_rules.get('camera_height_m', 0.45))))
+        view_height *= self._entity_vertical_scale(shooter)
+        return self._entity_base_height_m(shooter) + view_height
 
     def _target_armor_height_m(self, target):
-        armor_height = float(self.rules.get('shooting', {}).get('armor_center_height_m', 0.15))
+        vertical_scale = self._entity_vertical_scale(target)
+        armor_height = (float(getattr(target, 'body_clearance_m', 0.10)) + float(getattr(target, 'body_height_m', 0.18)) * 0.55) * vertical_scale
         if getattr(target, 'type', None) == 'outpost':
             armor_height = max(armor_height, 0.45)
         elif getattr(target, 'type', None) == 'base':
             armor_height = max(armor_height, 0.60)
-        return self._entity_ground_height_m(target) + armor_height
+        return self._entity_base_height_m(target) + armor_height
 
     def _estimate_local_terrain_pitch_rad(self, map_manager, start_x, start_y, end_x, end_y):
         distance = math.hypot(end_x - start_x, end_y - start_y)
@@ -753,6 +838,128 @@ class RulesEngine:
         dy = target.position['y'] - shooter.position['y']
         return math.degrees(math.atan2(dy, dx))
 
+    def _simulate_pitch_error_m(self, shooter, start_point, target_point, pitch_deg):
+        horizontal_distance_m = self._world_units_to_meters(
+            math.hypot(float(target_point[0]) - float(start_point[0]), float(target_point[1]) - float(start_point[1]))
+        )
+        if horizontal_distance_m <= 1e-6:
+            return float(target_point[2]) - float(start_point[2])
+        ammo_type = getattr(shooter, 'ammo_type', '17mm')
+        speed_mps = max(1e-6, self._projectile_speed_mps(ammo_type))
+        drag = max(0.0, self._projectile_drag_coefficient(ammo_type))
+        gravity = self._projectile_gravity_mps2()
+        dt = max(0.002, min(0.02, float(self.rules.get('shooting', {}).get('projectile_simulation_dt_sec', 0.01))))
+        pitch_rad = math.radians(float(pitch_deg))
+        horizontal_speed = math.cos(pitch_rad) * speed_mps
+        vertical_speed = math.sin(pitch_rad) * speed_mps
+        horizontal_pos = 0.0
+        vertical_pos = float(start_point[2])
+        target_height = float(target_point[2])
+        max_time = max(1.0, horizontal_distance_m / max(horizontal_speed, 1e-6) * 2.5)
+        elapsed = 0.0
+        while elapsed < max_time:
+            total_speed = math.hypot(horizontal_speed, vertical_speed)
+            drag_accel_x = -drag * total_speed * horizontal_speed
+            drag_accel_z = -gravity - drag * total_speed * vertical_speed
+            next_horizontal = horizontal_pos + horizontal_speed * dt + 0.5 * drag_accel_x * dt * dt
+            next_vertical = vertical_pos + vertical_speed * dt + 0.5 * drag_accel_z * dt * dt
+            if next_horizontal >= horizontal_distance_m:
+                denom = max(next_horizontal - horizontal_pos, 1e-6)
+                ratio = (horizontal_distance_m - horizontal_pos) / denom
+                intercept_height = vertical_pos + (next_vertical - vertical_pos) * ratio
+                return intercept_height - target_height
+            horizontal_speed += drag_accel_x * dt
+            vertical_speed += drag_accel_z * dt
+            horizontal_pos = next_horizontal
+            vertical_pos = next_vertical
+            if horizontal_speed <= 1e-6 and horizontal_pos < horizontal_distance_m:
+                break
+            elapsed += dt
+        return vertical_pos - target_height
+
+    def _solve_ballistic_pitch_deg(self, shooter, start_point, target_point, preferred_pitch_deg=0.0):
+        horizontal_distance = math.hypot(float(target_point[0]) - float(start_point[0]), float(target_point[1]) - float(start_point[1]))
+        if horizontal_distance <= 1e-6:
+            return self._normalize_angle_diff(float(preferred_pitch_deg))
+        max_up = float(getattr(shooter, 'max_pitch_up_deg', self.rules.get('shooting', {}).get('max_pitch_up_deg', 40.0)))
+        max_down = float(getattr(shooter, 'max_pitch_down_deg', self.rules.get('shooting', {}).get('max_pitch_down_deg', 35.0)))
+        low = -max_down
+        high = max_up
+        best_pitch = max(low, min(high, float(preferred_pitch_deg)))
+        best_error = abs(self._simulate_pitch_error_m(shooter, start_point, target_point, best_pitch))
+        coarse_steps = 48
+        for index in range(coarse_steps + 1):
+            candidate = low + (high - low) * (index / max(coarse_steps, 1))
+            error = self._simulate_pitch_error_m(shooter, start_point, target_point, candidate)
+            if abs(error) < best_error:
+                best_pitch = candidate
+                best_error = abs(error)
+        window = max(2.0, (high - low) / max(coarse_steps, 1))
+        for _ in range(3):
+            sample_low = max(low, best_pitch - window)
+            sample_high = min(high, best_pitch + window)
+            for index in range(8):
+                candidate = sample_low + (sample_high - sample_low) * (index / 7.0)
+                error = self._simulate_pitch_error_m(shooter, start_point, target_point, candidate)
+                if abs(error) < best_error:
+                    best_pitch = candidate
+                    best_error = abs(error)
+            window *= 0.45
+        return max(low, min(high, float(best_pitch)))
+
+    def get_aim_angles_to_point(self, shooter, point_x, point_y, point_z):
+        dx = float(point_x) - float(shooter.position['x'])
+        dy = float(point_y) - float(shooter.position['y'])
+        yaw_deg = math.degrees(math.atan2(dy, dx))
+        start_point = self._shooter_muzzle_point(shooter)
+        target_point = (float(point_x), float(point_y), float(point_z))
+        pitch_deg = self._solve_ballistic_pitch_deg(
+            shooter,
+            start_point,
+            target_point,
+            preferred_pitch_deg=float(getattr(shooter, 'gimbal_pitch_deg', 0.0)),
+        )
+        return yaw_deg, pitch_deg
+
+    def get_entity_armor_plate_targets(self, target):
+        cache_key = self._entity_pose_cache_key(target)
+        cached_targets = self._armor_target_cache.get(cache_key)
+        if cached_targets is not None:
+            return [dict(item) for item in cached_targets]
+        base_height = self._entity_base_height_m(target)
+        vertical_scale = self._entity_vertical_scale(target)
+        half_length = self._meters_to_world_units(float(getattr(target, 'body_length_m', getattr(target, 'body_size_m', 0.42))) * 0.5)
+        half_width = self._meters_to_world_units(float(getattr(target, 'body_width_m', getattr(target, 'body_size_m', 0.42))) * 0.5)
+        plate_gap = self._meters_to_world_units(float(getattr(target, 'armor_plate_gap_m', 0.02)))
+        plate_center_height = base_height + (float(getattr(target, 'body_clearance_m', 0.10)) + float(getattr(target, 'body_height_m', 0.18)) * 0.55) * vertical_scale
+        yaw_rad = math.radians(float(getattr(target, 'angle', 0.0)))
+        heading_x = math.cos(yaw_rad)
+        heading_y = math.sin(yaw_rad)
+        side_x = -heading_y
+        side_y = heading_x
+        specs = (
+            ('front', heading_x * (half_length + plate_gap), heading_y * (half_length + plate_gap)),
+            ('rear', -heading_x * (half_length + plate_gap), -heading_y * (half_length + plate_gap)),
+            ('left', side_x * (half_width + plate_gap), side_y * (half_width + plate_gap)),
+            ('right', -side_x * (half_width + plate_gap), -side_y * (half_width + plate_gap)),
+        )
+        plates = []
+        for plate_id, offset_x, offset_y in specs:
+            plates.append({
+                'id': plate_id,
+                'x': float(target.position['x']) + offset_x,
+                'y': float(target.position['y']) + offset_y,
+                'z': plate_center_height,
+            })
+        self._armor_target_cache[cache_key] = tuple(dict(item) for item in plates)
+        return [dict(item) for item in plates]
+
+    def _projectile_target_broad_radius_world(self, target, hit_radius):
+        half_length = self._meters_to_world_units(float(getattr(target, 'body_length_m', getattr(target, 'body_size_m', 0.42))) * 0.5)
+        half_width = self._meters_to_world_units(float(getattr(target, 'body_width_m', getattr(target, 'body_size_m', 0.42))) * 0.5)
+        plate_gap = self._meters_to_world_units(float(getattr(target, 'armor_plate_gap_m', 0.02)))
+        return math.hypot(half_length + plate_gap + hit_radius, half_width + plate_gap + hit_radius)
+
     def _stabilize_hit_probability(self, shooter, target, raw_probability, *, field_name, target_field_name, time_field_name):
         now = float(getattr(self, 'game_time', 0.0))
         target_id = getattr(target, 'id', None) if target is not None else None
@@ -784,26 +991,34 @@ class RulesEngine:
         return stabilized
 
     def has_line_of_sight(self, shooter, target):
+        return self.has_line_of_sight_to_point(
+            shooter,
+            float(target.position['x']),
+            float(target.position['y']),
+            self._target_armor_height_m(target),
+            cache_key=self._line_of_sight_cache_key(shooter, target),
+        )
+
+    def has_line_of_sight_to_point(self, shooter, end_x, end_y, target_height_m, cache_key=None):
         map_manager = self._map_manager()
         if map_manager is None:
             return True
 
-        cache_key = self._line_of_sight_cache_key(shooter, target)
-        cached_result = self._line_of_sight_cache.get(cache_key)
-        if cached_result is not None:
-            return cached_result
+        if cache_key is not None:
+            cached_result = self._line_of_sight_cache.get(cache_key)
+            if cached_result is not None:
+                return cached_result
 
         start_x = float(shooter.position['x'])
         start_y = float(shooter.position['y'])
-        end_x = float(target.position['x'])
-        end_y = float(target.position['y'])
         distance = math.hypot(end_x - start_x, end_y - start_y)
         if distance <= 1e-6:
-            self._line_of_sight_cache[cache_key] = True
+            if cache_key is not None:
+                self._line_of_sight_cache[cache_key] = True
             return True
 
         shooter_height = self._shooter_view_height_m(shooter)
-        target_height = self._target_armor_height_m(target)
+        target_height = float(target_height_m)
 
         meters_per_world_unit = max(float(map_manager.meters_to_world_units(1.0)), 1e-6)
         distance_m = distance / meters_per_world_unit
@@ -812,7 +1027,8 @@ class RulesEngine:
         max_pitch_up_deg = float(self.rules['shooting'].get('max_pitch_up_deg', 35.0))
         max_pitch_down_deg = float(self.rules['shooting'].get('max_pitch_down_deg', 25.0))
         if target_pitch_deg > max_pitch_up_deg or target_pitch_deg < -max_pitch_down_deg:
-            self._line_of_sight_cache[cache_key] = False
+            if cache_key is not None:
+                self._line_of_sight_cache[cache_key] = False
             return False
 
         pitch_margin_deg = float(self.rules['shooting'].get('los_pitch_margin_deg', 0.8))
@@ -823,14 +1039,17 @@ class RulesEngine:
         terrain_pitch_margin_rad = math.radians(max(0.0, terrain_pitch_margin_deg))
 
         if target_pitch_rad + terrain_pitch_margin_rad < terrain_pitch_rad:
-            self._line_of_sight_cache[cache_key] = False
+            if cache_key is not None:
+                self._line_of_sight_cache[cache_key] = False
             return False
         if target_pitch_rad + terrain_pitch_margin_rad < reverse_pitch_rad:
-            self._line_of_sight_cache[cache_key] = False
+            if cache_key is not None:
+                self._line_of_sight_cache[cache_key] = False
             return False
 
         line_clear = map_manager.is_vision_line_clear((start_x, start_y), (end_x, end_y), include_start=False, include_end=False)
-        self._line_of_sight_cache[cache_key] = bool(line_clear)
+        if cache_key is not None:
+            self._line_of_sight_cache[cache_key] = bool(line_clear)
         return bool(line_clear)
 
     def evaluate_auto_aim_target(self, shooter, target, distance=None, require_fov=True):
@@ -932,26 +1151,6 @@ class RulesEngine:
             self.stage = 'ended'
             self.game_over = True
             self.winner = self._winner_by_base_health(entities)
-
-    def _meters_to_world_units(self, meters):
-        field_length_m = float(self.config.get('map', {}).get('field_length_m', 0.0) or 0.0)
-        field_width_m = float(self.config.get('map', {}).get('field_width_m', 0.0) or 0.0)
-        map_width = float(self.config.get('map', {}).get('width', 0.0) or 0.0)
-        map_height = float(self.config.get('map', {}).get('height', 0.0) or 0.0)
-        if field_length_m > 0 and field_width_m > 0 and map_width > 0 and map_height > 0:
-            pixels_per_meter_x = map_width / field_length_m
-            pixels_per_meter_y = map_height / field_width_m
-            return meters * ((pixels_per_meter_x + pixels_per_meter_y) / 2.0)
-
-        unit = str(self.config.get('map', {}).get('unit', 'cm')).lower()
-        if unit in {'px', 'pixel', 'pixels'}:
-            return meters
-        if unit == 'mm':
-            return meters * 1000.0
-        if unit == 'm':
-            return meters
-        return meters * 100.0
-
     def _winner_by_base_health(self, entities):
         red_base = self._find_entity(entities, 'red', 'base')
         blue_base = self._find_entity(entities, 'blue', 'base')
@@ -1149,31 +1348,329 @@ class RulesEngine:
         target.recent_attackers = retained[-6:]
 
     def _projectile_speed_world_units(self, ammo_type):
-        if ammo_type == '42mm':
-            return self._meters_to_world_units(17.0)
-        return self._meters_to_world_units(23.0)
+        return self._meters_to_world_units(self._projectile_speed_mps(ammo_type))
 
-    def _spawn_projectile_trace(self, shooter, target):
-        if shooter is None or target is None:
+    def _spawn_projectile_trace(self, shooter, target, trace_payload=None):
+        if shooter is None:
+            return
+        if trace_payload is not None:
+            trace = dict(trace_payload)
+            trace.setdefault('team', getattr(shooter, 'team', None))
+            trace.setdefault('ammo_type', getattr(shooter, 'ammo_type', '17mm'))
+            self.projectile_traces.append(trace)
+            if len(self.projectile_traces) > self.projectile_trace_limit:
+                self.projectile_traces = self.projectile_traces[-self.projectile_trace_limit:]
+            return
+        if target is None:
             return
         ammo_type = getattr(shooter, 'ammo_type', '17mm')
         start_x = float(shooter.position['x'])
         start_y = float(shooter.position['y'])
         end_x = float(target.position['x'])
         end_y = float(target.position['y'])
+        start_height_m = self._shooter_view_height_m(shooter)
+        end_height_m = self._target_armor_height_m(target)
         distance = math.hypot(end_x - start_x, end_y - start_y)
         speed = max(1.0, self._projectile_speed_world_units(ammo_type))
-        lifetime = min(0.45, max(0.05, distance / speed))
+        lifetime = min(0.75, max(0.10, distance / speed * 1.25))
         self.projectile_traces.append({
             'team': getattr(shooter, 'team', None),
             'ammo_type': ammo_type,
             'start': (start_x, start_y),
             'end': (end_x, end_y),
+            'start_height_m': start_height_m,
+            'end_height_m': end_height_m,
             'elapsed': 0.0,
             'lifetime': lifetime,
         })
-        if len(self.projectile_traces) > 96:
-            self.projectile_traces = self.projectile_traces[-96:]
+        if len(self.projectile_traces) > self.projectile_trace_limit:
+            self.projectile_traces = self.projectile_traces[-self.projectile_trace_limit:]
+
+    def _point_to_segment_distance_3d(self, point, start, end):
+        px, py, pz = point
+        x1, y1, z1 = start
+        x2, y2, z2 = end
+        dx = x2 - x1
+        dy = y2 - y1
+        dz = z2 - z1
+        length_sq = dx * dx + dy * dy + dz * dz
+        if length_sq <= 1e-6:
+            return math.sqrt((px - x1) ** 2 + (py - y1) ** 2 + (pz - z1) ** 2), start
+        ratio = ((px - x1) * dx + (py - y1) * dy + (pz - z1) * dz) / length_sq
+        ratio = max(0.0, min(1.0, ratio))
+        closest = (x1 + dx * ratio, y1 + dy * ratio, z1 + dz * ratio)
+        distance = math.sqrt((px - closest[0]) ** 2 + (py - closest[1]) ** 2 + (pz - closest[2]) ** 2)
+        return distance, closest
+
+    def _projectile_collision_height_m(self, sample):
+        terrain_height = float(sample.get('height_m', 0.0))
+        if bool(sample.get('vision_blocked', False)):
+            return terrain_height + max(float(sample.get('vision_block_height_m', 0.0)), 0.05)
+        if bool(sample.get('move_blocked', False)):
+            return terrain_height + 0.35
+        return terrain_height
+
+    def _projectile_hits_obstacle(self, point3d):
+        map_manager = self._map_manager()
+        if map_manager is None:
+            return False
+        sample = map_manager.sample_raster_layers(point3d[0], point3d[1])
+        if not bool(sample.get('move_blocked', False)) and not bool(sample.get('vision_blocked', False)):
+            return False
+        return float(point3d[2]) <= self._projectile_collision_height_m(sample) + 0.02
+
+    def _reflect_projectile_direction(self, previous_point, direction, step_length):
+        map_manager = self._map_manager()
+        if map_manager is None:
+            return (-direction[0], -direction[1], direction[2] * 0.72)
+
+        def probe(candidate_direction):
+            probe_point = (
+                previous_point[0] + candidate_direction[0] * max(step_length, 1.0),
+                previous_point[1] + candidate_direction[1] * max(step_length, 1.0),
+                previous_point[2] + candidate_direction[2] * max(step_length, 1.0),
+            )
+            return not self._projectile_hits_obstacle(probe_point)
+
+        candidates = [
+            (-direction[0], direction[1], direction[2] * 0.72),
+            (direction[0], -direction[1], direction[2] * 0.72),
+            (-direction[0], -direction[1], direction[2] * 0.65),
+        ]
+        reflected = next((candidate for candidate in candidates if probe(candidate)), candidates[-1])
+        length = math.sqrt(reflected[0] ** 2 + reflected[1] ** 2 + reflected[2] ** 2)
+        if length <= 1e-6:
+            return (-direction[0], -direction[1], 0.0)
+        return (reflected[0] / length, reflected[1] / length, reflected[2] / length)
+
+    def _find_projectile_hit_target(self, shooter, start_point, end_point, entities, preferred_target=None):
+        map_manager = self._map_manager()
+        if map_manager is None:
+            return None, None
+        hit_radius = max(1.0, self._meters_to_world_units(float(getattr(shooter, 'armor_plate_size_m', 0.12)) * 0.45))
+        best_hit = None
+        best_distance = float('inf')
+        candidate_entities = []
+        if preferred_target is not None:
+            candidate_entities.append(preferred_target)
+        candidate_entities.extend(entity for entity in entities if entity is not preferred_target)
+        for target in candidate_entities:
+            if target is None or not target.is_alive() or target.team == shooter.team or target.id == shooter.id:
+                continue
+            target_center_height = self._target_armor_height_m(target)
+            broad_radius = self._projectile_target_broad_radius_world(target, hit_radius)
+            distance_to_center, _ = self._point_to_segment_distance_3d(
+                (float(target.position['x']), float(target.position['y']), target_center_height),
+                start_point,
+                end_point,
+            )
+            if distance_to_center > broad_radius:
+                continue
+            for plate in self.get_entity_armor_plate_targets(target):
+                distance, hit_point = self._point_to_segment_distance_3d((plate['x'], plate['y'], plate['z']), start_point, end_point)
+                if distance > hit_radius:
+                    continue
+                travel_distance = math.sqrt((hit_point[0] - start_point[0]) ** 2 + (hit_point[1] - start_point[1]) ** 2 + (hit_point[2] - start_point[2]) ** 2)
+                if travel_distance < best_distance:
+                    best_distance = travel_distance
+                    best_hit = (target, hit_point)
+        return best_hit if best_hit is not None else (None, None)
+
+    def _build_projectile_trace_payload(self, shooter, path_points, speed_scale=1.0):
+        points = [(float(point[0]), float(point[1]), float(point[2])) for point in path_points if point is not None]
+        if len(points) < 2:
+            return None
+        total_length = 0.0
+        for start, end in zip(points, points[1:]):
+            total_length += math.sqrt(
+                (self._world_units_to_meters(end[0] - start[0])) ** 2
+                + (self._world_units_to_meters(end[1] - start[1])) ** 2
+                + (end[2] - start[2]) ** 2
+            )
+        ammo_type = getattr(shooter, 'ammo_type', '17mm')
+        speed = max(1.0, self._projectile_speed_mps(ammo_type) * max(0.35, float(speed_scale)))
+        return {
+            'team': getattr(shooter, 'team', None),
+            'ammo_type': ammo_type,
+            'start': (points[0][0], points[0][1]),
+            'end': (points[-1][0], points[-1][1]),
+            'start_height_m': points[0][2],
+            'end_height_m': points[-1][2],
+            'path_points': points,
+            'elapsed': 0.0,
+            'lifetime': min(1.05, max(0.12, total_length / speed * 1.35)),
+        }
+
+    def _resolve_projectile_aim_point(self, shooter, target):
+        if shooter is None or target is None:
+            return None
+        best_plate = None
+        best_distance = None
+        for plate in self.get_entity_armor_plate_targets(target):
+            distance = math.hypot(float(plate['x']) - float(shooter.position['x']), float(plate['y']) - float(shooter.position['y']))
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_plate = plate
+        if best_plate is None:
+            return {
+                'x': float(target.position['x']),
+                'y': float(target.position['y']),
+                'z': self._target_armor_height_m(target),
+                'target_id': target.id,
+            }
+        return {
+            'x': float(best_plate['x']),
+            'y': float(best_plate['y']),
+            'z': float(best_plate['z']),
+            'target_id': target.id,
+            'plate_id': best_plate.get('id'),
+        }
+
+    def _find_projectile_hit_target_metric_segment(self, shooter, start_point_m, end_point_m, entities, preferred_target=None):
+        hit_radius_m = max(0.015, float(getattr(shooter, 'armor_plate_size_m', 0.12)) * 0.45)
+        best_hit = None
+        best_distance = float('inf')
+        candidate_entities = []
+        if preferred_target is not None:
+            candidate_entities.append(preferred_target)
+        candidate_entities.extend(entity for entity in entities if entity is not preferred_target)
+        for target in candidate_entities:
+            if target is None or not target.is_alive() or target.team == shooter.team or target.id == shooter.id:
+                continue
+            target_center = (
+                self._world_units_to_meters(float(target.position['x'])),
+                self._world_units_to_meters(float(target.position['y'])),
+                self._target_armor_height_m(target),
+            )
+            broad_radius_m = math.hypot(
+                float(getattr(target, 'body_length_m', getattr(target, 'body_size_m', 0.42))) * 0.5 + float(getattr(target, 'armor_plate_gap_m', 0.02)) + hit_radius_m,
+                float(getattr(target, 'body_width_m', getattr(target, 'body_size_m', 0.42))) * 0.5 + float(getattr(target, 'armor_plate_gap_m', 0.02)) + hit_radius_m,
+            )
+            distance_to_center, _ = self._point_to_segment_distance_3d(target_center, start_point_m, end_point_m)
+            if distance_to_center > broad_radius_m:
+                continue
+            for plate in self.get_entity_armor_plate_targets(target):
+                plate_point_m = (
+                    self._world_units_to_meters(float(plate['x'])),
+                    self._world_units_to_meters(float(plate['y'])),
+                    float(plate['z']),
+                )
+                distance, hit_point_m = self._point_to_segment_distance_3d(plate_point_m, start_point_m, end_point_m)
+                if distance > hit_radius_m:
+                    continue
+                travel_distance = math.sqrt(
+                    (hit_point_m[0] - start_point_m[0]) ** 2
+                    + (hit_point_m[1] - start_point_m[1]) ** 2
+                    + (hit_point_m[2] - start_point_m[2]) ** 2
+                )
+                if travel_distance < best_distance:
+                    best_distance = travel_distance
+                    best_hit = (target, self._world_point_from_metric(hit_point_m))
+        return best_hit if best_hit is not None else (None, None)
+
+    def _simulate_ballistic_projectile(self, shooter, entities, target=None, aim_point=None, allow_ricochet=False):
+        map_manager = self._map_manager()
+        start_point = self._shooter_muzzle_point(shooter)
+        if aim_point is not None:
+            target_point = (
+                float(aim_point.get('x', shooter.position['x'])),
+                float(aim_point.get('y', shooter.position['y'])),
+                float(aim_point.get('z', start_point[2])),
+            )
+            yaw_deg = math.degrees(math.atan2(target_point[1] - start_point[1], target_point[0] - start_point[0]))
+            pitch_deg = self._solve_ballistic_pitch_deg(
+                shooter,
+                start_point,
+                target_point,
+                preferred_pitch_deg=float(getattr(shooter, 'gimbal_pitch_deg', 0.0)),
+            )
+        else:
+            yaw_deg = float(getattr(shooter, 'turret_angle', shooter.angle))
+            pitch_deg = float(getattr(shooter, 'gimbal_pitch_deg', 0.0))
+        yaw_rad = math.radians(yaw_deg)
+        pitch_rad = math.radians(pitch_deg)
+        speed_mps = max(1e-6, self._projectile_speed_mps(getattr(shooter, 'ammo_type', '17mm')))
+        velocity_m = [
+            math.cos(pitch_rad) * math.cos(yaw_rad) * speed_mps,
+            math.cos(pitch_rad) * math.sin(yaw_rad) * speed_mps,
+            math.sin(pitch_rad) * speed_mps,
+        ]
+        current_point_m = list(self._metric_point_from_world(start_point))
+        path_points = [start_point]
+        max_range_m = self._world_units_to_meters(float(self.get_range(getattr(shooter, 'type', 'robot'))))
+        simulation_dt = max(0.002, min(0.02, float(self.rules.get('shooting', {}).get('projectile_simulation_dt_sec', 0.01))))
+        gravity = self._projectile_gravity_mps2()
+        drag = max(0.0, self._projectile_drag_coefficient(getattr(shooter, 'ammo_type', '17mm')))
+        hit_target = None
+        hit_point = None
+        traveled_m = 0.0
+        bounce_count = 0
+        speed_scale = 1.0
+        while traveled_m < max_range_m:
+            speed = math.sqrt(velocity_m[0] ** 2 + velocity_m[1] ** 2 + velocity_m[2] ** 2)
+            if speed <= 1e-6:
+                break
+            dt = min(simulation_dt, max(0.002, 0.08 / max(speed, 1e-6)))
+            accel_x = -drag * speed * velocity_m[0]
+            accel_y = -drag * speed * velocity_m[1]
+            accel_z = -gravity - drag * speed * velocity_m[2]
+            next_point_m = (
+                current_point_m[0] + velocity_m[0] * dt + 0.5 * accel_x * dt * dt,
+                current_point_m[1] + velocity_m[1] * dt + 0.5 * accel_y * dt * dt,
+                current_point_m[2] + velocity_m[2] * dt + 0.5 * accel_z * dt * dt,
+            )
+            next_velocity = (
+                velocity_m[0] + accel_x * dt,
+                velocity_m[1] + accel_y * dt,
+                velocity_m[2] + accel_z * dt,
+            )
+            next_point_world = self._world_point_from_metric(next_point_m)
+            candidate_target, candidate_hit_point = self._find_projectile_hit_target_metric_segment(
+                shooter,
+                tuple(current_point_m),
+                next_point_m,
+                entities,
+                preferred_target=target,
+            )
+            if candidate_target is not None and candidate_hit_point is not None:
+                hit_target = candidate_target
+                hit_point = candidate_hit_point
+                path_points.append(hit_point)
+                break
+            if map_manager is not None and self._projectile_hits_obstacle(next_point_world):
+                path_points.append(next_point_world)
+                if allow_ricochet and bounce_count == 0:
+                    segment_distance_m = math.sqrt(
+                        (next_point_m[0] - current_point_m[0]) ** 2
+                        + (next_point_m[1] - current_point_m[1]) ** 2
+                        + (next_point_m[2] - current_point_m[2]) ** 2
+                    )
+                    reflected = self._reflect_projectile_direction(path_points[-2], (velocity_m[0], velocity_m[1], velocity_m[2]), self._meters_to_world_units(speed * dt))
+                    reflected_speed = max(0.1, math.sqrt(reflected[0] ** 2 + reflected[1] ** 2 + reflected[2] ** 2))
+                    velocity_m = [
+                        reflected[0] / reflected_speed * speed * 0.62,
+                        reflected[1] / reflected_speed * speed * 0.62,
+                        reflected[2] / reflected_speed * speed * 0.52,
+                    ]
+                    current_point_m = list(self._metric_point_from_world(next_point_world))
+                    traveled_m += segment_distance_m
+                    speed_scale *= 0.62
+                    bounce_count += 1
+                    continue
+                break
+            path_points.append(next_point_world)
+            traveled_m += math.sqrt(
+                (next_point_m[0] - current_point_m[0]) ** 2
+                + (next_point_m[1] - current_point_m[1]) ** 2
+                + (next_point_m[2] - current_point_m[2]) ** 2
+            )
+            current_point_m = [float(next_point_m[0]), float(next_point_m[1]), float(next_point_m[2])]
+            velocity_m = [float(next_velocity[0]), float(next_velocity[1]), float(next_velocity[2])]
+        trace_payload = self._build_projectile_trace_payload(shooter, path_points, speed_scale=speed_scale)
+        return {'trace': trace_payload, 'hit_target': hit_target, 'hit_point': hit_point}
+
+    def _simulate_player_projectile(self, shooter, entities, target=None, aim_point=None, allow_ricochet=False):
+        return self._simulate_ballistic_projectile(shooter, entities, target=target, aim_point=aim_point, allow_ricochet=allow_ricochet)
 
     def _update_projectile_traces(self, dt):
         active_traces = []
@@ -1768,6 +2265,8 @@ class RulesEngine:
         return max(1, min(3, amount))
 
     def _try_purchase_role_ammo(self, entity):
+        if bool(getattr(entity, 'player_controlled', False)):
+            return 0
         if entity.type != 'robot' or getattr(entity, 'robot_type', '') not in {'英雄', '步兵'}:
             return 0
         if getattr(entity, 'role_purchase_cooldown', 0.0) > 0:
@@ -1802,6 +2301,70 @@ class RulesEngine:
         self._add_allowed_ammo(entity, purchase_amount, ammo_type)
         entity.role_purchase_cooldown = float(purchase_rules.get('purchase_interval_sec', 2.0))
         return purchase_amount
+
+    def is_in_team_supply_zone(self, entity, map_manager=None):
+        if entity is None or map_manager is None:
+            return False
+        for region in map_manager.get_regions_at(entity.position['x'], entity.position['y'], region_types={'supply', 'buff_supply'}):
+            region_team = region.get('team')
+            if region.get('type') == 'buff_supply' and region_team in {None, entity.team}:
+                return True
+            if region.get('type') == 'supply' and region_team == entity.team:
+                return True
+        return False
+
+    def purchase_manual_role_ammo(self, entity, amount, map_manager=None):
+        if entity is None:
+            return {'ok': False, 'code': 'ENTITY_MISSING'}
+        if entity.type != 'robot' or getattr(entity, 'robot_type', '') not in {'英雄', '步兵'}:
+            return {'ok': False, 'code': 'ROLE_UNSUPPORTED'}
+        if not self.is_in_team_supply_zone(entity, map_manager=map_manager):
+            return {'ok': False, 'code': 'NOT_IN_SUPPLY'}
+        if getattr(entity, 'role_purchase_cooldown', 0.0) > 0.0:
+            return {'ok': False, 'code': 'PURCHASE_COOLDOWN', 'cooldown': float(entity.role_purchase_cooldown)}
+
+        try:
+            requested_amount = int(amount)
+        except (TypeError, ValueError):
+            return {'ok': False, 'code': 'INVALID_AMOUNT'}
+        if requested_amount <= 0:
+            return {'ok': False, 'code': 'INVALID_AMOUNT'}
+
+        purchase_rules = self.rules.get('ammo_purchase', {})
+        ammo_type = getattr(entity, 'ammo_type', '17mm')
+        if ammo_type == '42mm':
+            batch = int(purchase_rules.get('42mm_batch', 10))
+            batch_cost = float(purchase_rules.get('42mm_cost', 20.0))
+            max_allowed = int(purchase_rules.get('max_allowed_42mm', batch))
+            opening_cap = int(purchase_rules.get('opening_targets', {}).get('hero_42mm', max_allowed))
+        else:
+            batch = int(purchase_rules.get('17mm_batch', 200))
+            batch_cost = float(purchase_rules.get('17mm_cost', 12.0))
+            max_allowed = int(purchase_rules.get('max_allowed_17mm', batch))
+            opening_cap = int(purchase_rules.get('opening_targets', {}).get('infantry_17mm', max_allowed))
+
+        stock_cap = opening_cap if self.game_time <= 45.0 else max_allowed
+        current_stock = self._available_ammo(entity)
+        purchase_amount = min(requested_amount, max(0, stock_cap - current_stock))
+        if purchase_amount <= 0:
+            return {'ok': False, 'code': 'STOCK_FULL', 'current_stock': current_stock, 'stock_cap': stock_cap}
+
+        unit_cost = batch_cost / max(batch, 1)
+        total_cost = unit_cost * purchase_amount
+        team_gold = float(self.team_gold.get(entity.team, 0.0))
+        if team_gold + 1e-6 < total_cost:
+            return {'ok': False, 'code': 'INSUFFICIENT_GOLD', 'need': total_cost, 'have': team_gold}
+
+        self.team_gold[entity.team] = team_gold - total_cost
+        entity.gold = self.team_gold[entity.team]
+        self._add_allowed_ammo(entity, purchase_amount, ammo_type)
+        entity.role_purchase_cooldown = float(purchase_rules.get('purchase_interval_sec', 2.0))
+        return {
+            'ok': True,
+            'amount': int(purchase_amount),
+            'cost': float(total_cost),
+            'team_gold': float(self.team_gold.get(entity.team, 0.0)),
+        }
 
     def _apply_buff_region(self, entity, region, dt, active_regions=None):
         buff_rules = self.rules.get('buff_zones', {}).get(region.get('type'), {})
@@ -2158,7 +2721,35 @@ class RulesEngine:
                 continue
             if getattr(shooter, 'heat_lock_state', 'normal') != 'normal':
                 continue
+            if self._next_shot_would_overheat(shooter):
+                continue
             if self.get_effective_fire_rate_hz(shooter) <= 0.0:
+                continue
+
+            if bool(getattr(shooter, 'player_controlled', False)):
+                target = None
+                if isinstance(getattr(shooter, 'target', None), dict):
+                    target_id = shooter.target.get('id')
+                    target = next((entity for entity in entities if entity.id == target_id and entity.team != shooter.team and entity.is_alive()), None)
+                self._consume_shot(shooter)
+                simulation = self._simulate_player_projectile(
+                    shooter,
+                    entities,
+                    target=target,
+                    aim_point=getattr(shooter, 'manual_aim_point', None),
+                    allow_ricochet=bool(self.config.get('simulator', {}).get('player_projectile_ricochet_enabled', True)),
+                )
+                if simulation.get('trace') is not None:
+                    self._spawn_projectile_trace(shooter, target, trace_payload=simulation['trace'])
+                hit_target = simulation.get('hit_target')
+                if hit_target is not None:
+                    damage = self.calculate_damage(shooter, hit_target)
+                    if damage > 0:
+                        self._mark_in_combat(shooter)
+                        self._mark_in_combat(hit_target)
+                        hit_target.take_damage(damage)
+                        self._track_recent_attack(hit_target, shooter, damage)
+                        self._trigger_evasive_spin(hit_target, shooter)
                 continue
 
             target = self._resolve_autoaim_target(shooter, entities)
@@ -2166,17 +2757,25 @@ class RulesEngine:
                 continue
 
             self._consume_shot(shooter)
-            distance = math.hypot(target.position['x'] - shooter.position['x'], target.position['y'] - shooter.position['y'])
-            hit_probability = self.calculate_hit_probability(shooter, target, distance)
-            self._spawn_projectile_trace(shooter, target)
-            if random.random() <= hit_probability:
-                damage = self.calculate_damage(shooter, target)
+            aim_point = self._resolve_projectile_aim_point(shooter, target)
+            simulation = self._simulate_ballistic_projectile(
+                shooter,
+                entities,
+                target=target,
+                aim_point=aim_point,
+                allow_ricochet=False,
+            )
+            if simulation.get('trace') is not None:
+                self._spawn_projectile_trace(shooter, target, trace_payload=simulation['trace'])
+            hit_target = simulation.get('hit_target')
+            if hit_target is not None:
+                damage = self.calculate_damage(shooter, hit_target)
                 if damage > 0:
                     self._mark_in_combat(shooter)
-                    self._mark_in_combat(target)
-                    target.take_damage(damage)
-                    self._track_recent_attack(target, shooter, damage)
-                    self._trigger_evasive_spin(target, shooter)
+                    self._mark_in_combat(hit_target)
+                    hit_target.take_damage(damage)
+                    self._track_recent_attack(hit_target, shooter, damage)
+                    self._trigger_evasive_spin(hit_target, shooter)
 
     def _resolve_autoaim_target(self, shooter, entities):
         if self._can_use_hero_structure_lob_fire(shooter):

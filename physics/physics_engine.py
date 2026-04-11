@@ -16,11 +16,14 @@ class PhysicsEngine:
         self.default_max_terrain_step_height_m = float(config.get('physics', {}).get('normal_max_terrain_step_height_m', 0.35))
         self.default_step_climb_duration_sec = float(config.get('physics', {}).get('default_step_climb_duration_sec', 1.0))
         self.infantry_step_climb_duration_sec = float(config.get('physics', {}).get('infantry_step_climb_duration_sec', 1.0))
+        self.infantry_jump_height_m = float(config.get('physics', {}).get('infantry_jump_height_m', 0.40))
+        self.jump_gravity_mps2 = float(config.get('physics', {}).get('jump_gravity_mps2', 9.8))
         self.fly_slope_dead_zone_clearance_m = float(config.get('physics', {}).get('fly_slope_dead_zone_clearance_m', 0.20))
         self.fly_slope_launch_boost_mps = float(config.get('physics', {}).get('fly_slope_launch_boost_mps', 3.1))
         self.fly_slope_lateral_preserve = float(config.get('physics', {}).get('fly_slope_lateral_preserve', 0.25))
         self.max_collision_separation_m = float(config.get('physics', {}).get('max_collision_separation_m', 0.10))
         self.collision_slop_m = float(config.get('physics', {}).get('collision_slop_m', 0.02))
+        self.infantry_jump_launch_velocity_mps = math.sqrt(max(0.0, 2.0 * self.jump_gravity_mps2 * self.infantry_jump_height_m))
 
     def _max_speed_world_units(self):
         field_length_m = float(self.config.get('map', {}).get('field_length_m', 28.0))
@@ -115,6 +118,77 @@ class PhysicsEngine:
             entity.fly_slope_airborne_timer = max(float(getattr(entity, 'fly_slope_airborne_timer', 0.0)), 2.0)
             entity.fly_slope_immunity_armed = True
         return True
+
+    def _current_jump_airborne_height_m(self, entity):
+        return max(0.0, float(getattr(entity, 'jump_airborne_height_m', 0.0)))
+
+    def _current_jump_clearance_m(self, entity):
+        airborne_height = self._current_jump_airborne_height_m(entity)
+        vertical_velocity = float(getattr(entity, 'jump_vertical_velocity_mps', 0.0))
+        if vertical_velocity <= 1e-6:
+            return airborne_height
+        remaining_rise = (vertical_velocity * vertical_velocity) / max(2.0 * self.jump_gravity_mps2, 1e-6)
+        return min(self.infantry_jump_height_m, airborne_height + remaining_rise)
+
+    def _current_airborne_body_clearance_m(self, entity):
+        return self._current_jump_airborne_height_m(entity) + max(0.0, float(getattr(entity, 'fly_slope_airborne_height_m', 0.0)))
+
+    def _can_entity_jump(self, entity):
+        return (
+            getattr(entity, 'type', None) == 'robot'
+            and getattr(entity, 'robot_type', '') == '步兵'
+            and not getattr(entity, 'step_climb_state', None)
+            and float(getattr(entity, 'fly_slope_airborne_height_m', 0.0)) <= 1e-6
+            and self._current_jump_airborne_height_m(entity) <= 1e-6
+            and float(getattr(entity, 'jump_vertical_velocity_mps', 0.0)) <= 1e-6
+        )
+
+    def _update_jump_state(self, entity, dt):
+        if bool(getattr(entity, 'jump_requested', False)):
+            entity.jump_requested = False
+            if self._can_entity_jump(entity):
+                entity.jump_vertical_velocity_mps = self.infantry_jump_launch_velocity_mps
+
+        airborne_height = self._current_jump_airborne_height_m(entity)
+        vertical_velocity = float(getattr(entity, 'jump_vertical_velocity_mps', 0.0))
+        if airborne_height <= 1e-6 and vertical_velocity <= 1e-6:
+            entity.jump_airborne_height_m = 0.0
+            entity.jump_vertical_velocity_mps = 0.0
+            entity.velocity['vz'] = 0.0
+            return
+
+        airborne_height = airborne_height + vertical_velocity * float(dt) - 0.5 * self.jump_gravity_mps2 * float(dt) * float(dt)
+        vertical_velocity -= self.jump_gravity_mps2 * float(dt)
+        airborne_height = max(0.0, airborne_height)
+        if airborne_height <= 1e-6 and vertical_velocity <= 0.0:
+            airborne_height = 0.0
+            vertical_velocity = 0.0
+        entity.jump_airborne_height_m = airborne_height
+        entity.jump_vertical_velocity_mps = vertical_velocity
+        entity.velocity['vz'] = vertical_velocity
+
+    def _entity_chassis_collision_radius(self, entity):
+        body_length_m = float(getattr(entity, 'body_length_m', getattr(entity, 'body_size_m', 0.0)))
+        body_width_m = float(getattr(entity, 'body_width_m', getattr(entity, 'body_size_m', 0.0)))
+        if body_length_m <= 1e-6 or body_width_m <= 1e-6:
+            return float(getattr(entity, 'collision_radius', 0.0))
+        half_length = self._meters_to_world_units(body_length_m * 0.5)
+        half_width = self._meters_to_world_units(body_width_m * 0.5)
+        return max(float(getattr(entity, 'collision_radius', 0.0)), math.hypot(half_length, half_width))
+
+    def _is_entity_chassis_pose_valid(self, map_manager, entity, x, y):
+        if map_manager is None:
+            return True
+        if getattr(entity, 'type', None) not in {'robot', 'sentry'}:
+            return map_manager.is_position_valid_for_radius(x, y, collision_radius=float(getattr(entity, 'collision_radius', 0.0)))
+        return map_manager.is_position_valid_for_chassis(
+            x,
+            y,
+            float(getattr(entity, 'angle', 0.0)),
+            float(getattr(entity, 'body_length_m', getattr(entity, 'body_size_m', 0.0))),
+            float(getattr(entity, 'body_width_m', getattr(entity, 'body_size_m', 0.0))),
+            body_clearance_m=float(getattr(entity, 'body_clearance_m', 0.0)) + self._current_airborne_body_clearance_m(entity),
+        )
     
     def update(self, entities, map_manager, rules_engine=None, dt=None):
         """更新物理状态"""
@@ -125,6 +199,7 @@ class PhysicsEngine:
             
             # 应用摩擦力
             self.apply_friction(entity)
+            self._update_jump_state(entity, sim_dt)
 
             # 按地形高度差限制位移
             self.enforce_terrain_movement(entity, map_manager, sim_dt)
@@ -157,37 +232,29 @@ class PhysicsEngine:
             return
         step_climb_active = bool(getattr(entity, 'step_climb_state', None))
         # 检查与地图的碰撞
-        if not step_climb_active and not map_manager.is_position_valid_for_radius(
-            entity.position['x'],
-            entity.position['y'],
-            collision_radius=float(getattr(entity, 'collision_radius', 0.0)),
-        ):
+        if not step_climb_active and not self._is_entity_chassis_pose_valid(map_manager, entity, entity.position['x'], entity.position['y']):
             # 碰撞处理
             last_valid = dict(getattr(entity, 'last_valid_position', entity.position))
-            if not map_manager.is_position_valid_for_radius(
-                last_valid['x'],
-                last_valid['y'],
-                collision_radius=float(getattr(entity, 'collision_radius', 0.0)),
-            ):
+            if not self._is_entity_chassis_pose_valid(map_manager, entity, last_valid['x'], last_valid['y']):
                 recovered = map_manager.find_nearest_passable_point(
                     (entity.position['x'], entity.position['y']),
-                    collision_radius=float(getattr(entity, 'collision_radius', 0.0)),
-                    search_radius=max(96, int(float(getattr(entity, 'collision_radius', 16.0)) * 8.0)),
+                    collision_radius=self._entity_chassis_collision_radius(entity),
+                    search_radius=max(96, int(self._entity_chassis_collision_radius(entity) * 8.0)),
                     step=max(4, map_manager.terrain_grid_cell_size),
                 )
                 if recovered is not None:
                     last_valid = {
                         'x': float(recovered[0]),
                         'y': float(recovered[1]),
-                        'z': map_manager.get_terrain_height_m(recovered[0], recovered[1]),
+                        'z': map_manager.get_terrain_height_m(recovered[0], recovered[1]) + self._current_jump_airborne_height_m(entity),
                     }
                     entity.last_valid_position = dict(last_valid)
             entity.position['x'] = last_valid['x']
             entity.position['y'] = last_valid['y']
-            entity.position['z'] = map_manager.get_terrain_height_m(last_valid['x'], last_valid['y'])
+            entity.position['z'] = map_manager.get_terrain_height_m(last_valid['x'], last_valid['y']) + self._current_jump_airborne_height_m(entity)
             entity.velocity['vx'] = 0.0
             entity.velocity['vy'] = 0.0
-            entity.velocity['vz'] = 0.0
+            entity.velocity['vz'] = float(getattr(entity, 'jump_vertical_velocity_mps', 0.0))
         
         # 检查与其他实体的碰撞
         for other_entity in entities:
@@ -345,14 +412,22 @@ class PhysicsEngine:
         previous = dict(getattr(entity, 'previous_position', entity.position))
         current = entity.position
         step_limit = float(getattr(entity, 'max_terrain_step_height_m', self.default_max_terrain_step_height_m))
+        jump_airborne_height = self._current_jump_airborne_height_m(entity)
+        jump_traversal_clearance = self._current_jump_clearance_m(entity)
+        effective_step_limit = step_limit + jump_traversal_clearance
+        effective_body_clearance = float(getattr(entity, 'body_clearance_m', 0.0)) + jump_airborne_height
 
         path_result = map_manager.evaluate_movement_path(
             previous['x'],
             previous['y'],
             current['x'],
             current['y'],
-            max_height_delta_m=step_limit,
-            collision_radius=float(getattr(entity, 'collision_radius', 0.0)),
+            max_height_delta_m=effective_step_limit,
+            collision_radius=self._entity_chassis_collision_radius(entity),
+            angle_deg=float(getattr(entity, 'angle', 0.0)),
+            body_length_m=float(getattr(entity, 'body_length_m', getattr(entity, 'body_size_m', 0.0))),
+            body_width_m=float(getattr(entity, 'body_width_m', getattr(entity, 'body_size_m', 0.0))),
+            body_clearance_m=effective_body_clearance,
         )
 
         if path_result.get('ok'):
@@ -373,10 +448,10 @@ class PhysicsEngine:
                     entity.turret_angle = entity.angle
                     entity.position['x'] = previous['x']
                     entity.position['y'] = previous['y']
-                    entity.position['z'] = float(path_result.get('start_height_m', previous.get('z', 0.0)))
+                    entity.position['z'] = float(path_result.get('start_height_m', previous.get('z', 0.0))) + jump_airborne_height
                     entity.velocity['vx'] = 0.0
                     entity.velocity['vy'] = 0.0
-                    entity.velocity['vz'] = 0.0
+                    entity.velocity['vz'] = float(getattr(entity, 'jump_vertical_velocity_mps', 0.0))
                     entity.last_valid_position = dict(entity.position)
                     return
             self._apply_fly_slope_launch_boost(entity, traversal)
@@ -384,7 +459,7 @@ class PhysicsEngine:
             if getattr(entity, 'type', None) == 'sentry':
                 airborne_height_m = self._fly_slope_ballistic_height_m(entity, traversal)
             entity.fly_slope_airborne_height_m = airborne_height_m
-            entity.position['z'] = float(path_result.get('end_height_m', current.get('z', 0.0))) + airborne_height_m
+            entity.position['z'] = float(path_result.get('end_height_m', current.get('z', 0.0))) + airborne_height_m + jump_airborne_height
             entity.last_valid_position = dict(entity.position)
             return
 
@@ -405,12 +480,12 @@ class PhysicsEngine:
         fallback = dict(getattr(entity, 'last_valid_position', previous))
         entity.position['x'] = fallback['x']
         entity.position['y'] = fallback['y']
-        entity.position['z'] = map_manager.get_terrain_height_m(fallback['x'], fallback['y'])
+        entity.position['z'] = map_manager.get_terrain_height_m(fallback['x'], fallback['y']) + jump_airborne_height
         entity.fly_slope_airborne_height_m = 0.0
         entity.fly_slope_immunity_armed = False
         entity.velocity['vx'] = 0.0
         entity.velocity['vy'] = 0.0
-        entity.velocity['vz'] = 0.0
+        entity.velocity['vz'] = float(getattr(entity, 'jump_vertical_velocity_mps', 0.0))
 
     def _resolved_step_climb_duration(self, entity):
         return float(getattr(entity, 'step_climb_duration_sec', self.infantry_step_climb_duration_sec))

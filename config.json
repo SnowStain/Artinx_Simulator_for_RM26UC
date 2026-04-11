@@ -16,16 +16,16 @@
     "origin_x": 0,
     "origin_y": 0,
     "unit": "px",
-    "width": 2800,
-    "height": 1500,
+    "width": 1576,
+    "height": 873,
     "source_width": 1576,
     "source_height": 873,
-    "strict_scale": true,
+    "strict_scale": false,
     "field_length_m": 28.0,
     "field_width_m": 15.0,
     "facilities": [],
     "terrain_grid": {
-      "cell_size": 1,
+      "cell_size": 8,
       "cells": []
     }
   },
@@ -69,7 +69,7 @@
     "collision_damping": 0.8,
     "step_height": 15,
     "slope_limit": 30,
-    "normal_max_terrain_step_height_m": 0.35,
+    "normal_max_terrain_step_height_m": 0.08,
     "power_system": {
       "hero": {"max_power": 100, "power_recovery_rate": 1.0},
       "engineer": {"max_power": 80, "power_recovery_rate": 1.2},

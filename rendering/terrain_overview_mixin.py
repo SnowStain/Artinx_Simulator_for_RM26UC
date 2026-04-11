@@ -115,6 +115,27 @@ class TerrainOverviewMixin:
             return self._build_terrain_scene_loading_surface(scene_rect.size)
         backend = self._get_terrain_scene_backend()
         try:
+            camera_override = getattr(self, 'terrain_scene_camera_override', None)
+            if isinstance(camera_override, dict):
+                cache_key_getter = getattr(self, '_player_terrain_surface_cache_key', None)
+                cache_key = cache_key_getter(game_engine, scene_rect) if callable(cache_key_getter) else None
+                cached_surface = getattr(self, 'player_terrain_surface_cache', None)
+                if cache_key is not None and getattr(self, 'player_terrain_surface_key', None) == cache_key and cached_surface is not None:
+                    return cached_surface
+                render_scale = max(0.35, min(1.0, float(getattr(self, '_active_player_terrain_render_scale', getattr(self, 'player_terrain_render_scale', 0.6)))))
+                render_size = scene_rect.size
+                if render_scale < 0.999:
+                    render_size = (
+                        max(320, int(scene_rect.width * render_scale)),
+                        max(180, int(scene_rect.height * render_scale)),
+                    )
+                surface = backend.render_scene(self, game_engine, render_size, map_rgb)
+                if render_size != scene_rect.size:
+                    surface = pygame.transform.smoothscale(surface, scene_rect.size)
+                if cache_key is not None:
+                    self.player_terrain_surface_cache = surface
+                    self.player_terrain_surface_key = cache_key
+                return surface
             return backend.render_scene(self, game_engine, scene_rect.size, map_rgb)
         except Exception:
             if getattr(backend, 'name', 'software') == 'software':
@@ -125,6 +146,8 @@ class TerrainOverviewMixin:
     def _invalidate_terrain_scene_cache(self):
         self.terrain_3d_texture = None
         self.terrain_3d_render_key = None
+        self.player_terrain_surface_cache = None
+        self.player_terrain_surface_key = None
 
     def _draw_terrain_scene_hover_panel(self, surface, rect, map_manager, world_pos):
         metrics = self._hover_grid_metrics(map_manager, world_pos)
@@ -352,9 +375,18 @@ class TerrainOverviewMixin:
                 self._start_terrain_scene_prewarm(game_engine)
             self._update_terrain_scene_navigation(game_engine)
             size = terrain_window.size
+            map_manager = game_engine.map_manager
+            scene_data_revision = (
+                int(getattr(map_manager, 'raster_version', 0))
+                if self.terrain_view_mode == '3d'
+                else (
+                    int(getattr(map_manager, 'terrain_overlay_revision', 0)),
+                    int(getattr(map_manager, 'facility_version', 0)),
+                )
+            )
             render_key = (
                 tuple(size),
-                game_engine.map_manager.raster_version,
+                scene_data_revision,
                 getattr(self._get_terrain_scene_backend(), 'name', 'software'),
                 self.terrain_view_mode,
                 round(self.terrain_scene_zoom, 3),

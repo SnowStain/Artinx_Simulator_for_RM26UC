@@ -6,15 +6,15 @@ class TargetingRuntime:
     def __init__(self, controller):
         self._controller = controller
 
-    def target_assessment(self, entity, other, distance, rules_engine):
+    def target_assessment(self, entity, other, distance, rules_engine, require_fov=False):
         controller = self._controller
         if rules_engine is None:
             return {}
-        cache_key = (entity.id, other.id, round(float(distance), 1))
+        cache_key = (entity.id, other.id, round(float(distance), 1), bool(require_fov))
         cached = controller._frame_target_assessment_cache.get(cache_key)
         if cached is not None:
             return cached
-        assessment = rules_engine.evaluate_auto_aim_target(entity, other, distance=distance, require_fov=False)
+        assessment = rules_engine.evaluate_auto_aim_target(entity, other, distance=distance, require_fov=require_fov)
         controller._frame_target_assessment_cache[cache_key] = assessment
         return assessment
 
@@ -40,7 +40,7 @@ class TargetingRuntime:
             threat_score += 70.0
         return threat_score
 
-    def priority_target_score(self, entity, other, priority_map, rules_engine=None, max_distance=None):
+    def priority_target_score(self, entity, other, priority_map, rules_engine=None, max_distance=None, require_fov=False):
         controller = self._controller
         distance = controller._distance(entity, other)
         if max_distance is not None and distance > max_distance:
@@ -55,11 +55,14 @@ class TargetingRuntime:
             finish_score += 75.0
         visibility_score = 0.0
         if rules_engine is not None and entity.type in {'robot', 'sentry'} and getattr(entity, 'robot_type', '') != '工程':
-            assessment = self.target_assessment(entity, other, distance, rules_engine)
-            if assessment.get('can_track', False):
+            assessment = self.target_assessment(entity, other, distance, rules_engine, require_fov=require_fov)
+            visibility_key = 'can_auto_aim' if require_fov else 'can_track'
+            if assessment.get(visibility_key, False):
                 visibility_score += 220.0
                 if assessment.get('can_auto_aim', False):
                     visibility_score += 60.0
+            elif require_fov:
+                visibility_score -= 260.0
             elif not assessment.get('line_of_sight', True):
                 visibility_score -= 180.0
         score = priority_map.get(other.type, 0) * 220.0
@@ -71,7 +74,7 @@ class TargetingRuntime:
             score += 50.0
         return score
 
-    def select_priority_target_entity(self, entity, enemies, strategy, rules_engine=None, max_distance=None):
+    def select_priority_target_entity(self, entity, enemies, strategy, rules_engine=None, max_distance=None, require_fov=False):
         enemy_base = None
         enemy_outpost_alive = False
         for other in enemies:
@@ -85,7 +88,7 @@ class TargetingRuntime:
                 base_unlocked = not bool(rules_engine.is_base_shielded(enemy_base))
             else:
                 base_unlocked = True
-        if base_unlocked:
+        if base_unlocked and not require_fov:
             return enemy_base
         priority_targets = strategy.get('priority_targets', ['sentry', 'robot', 'outpost', 'base'])
         priority_map = {target_type: len(priority_targets) - index for index, target_type in enumerate(priority_targets)}
@@ -97,8 +100,8 @@ class TargetingRuntime:
                 distance = self._controller._distance(entity, other)
                 if max_distance is not None and distance > max_distance:
                     continue
-                assessment = self.target_assessment(entity, other, distance, rules_engine)
-                if assessment.get('can_track', False):
+                assessment = self.target_assessment(entity, other, distance, rules_engine, require_fov=require_fov)
+                if assessment.get('can_auto_aim' if require_fov else 'can_track', False):
                     visible_combat_target_exists = True
                     break
         best_target = None
@@ -108,7 +111,7 @@ class TargetingRuntime:
                 continue
             if visible_combat_target_exists and other.type in {'outpost', 'base'}:
                 continue
-            score = self.priority_target_score(entity, other, priority_map, rules_engine=rules_engine, max_distance=max_distance)
+            score = self.priority_target_score(entity, other, priority_map, rules_engine=rules_engine, max_distance=max_distance, require_fov=require_fov)
             if score is None:
                 continue
             if best_score is None or score > best_score:
@@ -116,8 +119,8 @@ class TargetingRuntime:
                 best_target = other
         return best_target
 
-    def select_priority_target(self, entity, enemies, strategy, rules_engine=None, max_distance=None):
-        best_target = self.select_priority_target_entity(entity, enemies, strategy, rules_engine=rules_engine, max_distance=max_distance)
+    def select_priority_target(self, entity, enemies, strategy, rules_engine=None, max_distance=None, require_fov=False):
+        best_target = self.select_priority_target_entity(entity, enemies, strategy, rules_engine=rules_engine, max_distance=max_distance, require_fov=require_fov)
         if best_target is None:
             return None
         return self._controller.entity_to_target(best_target, entity)

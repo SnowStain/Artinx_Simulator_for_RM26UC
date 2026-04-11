@@ -37,6 +37,7 @@ py -3.13 -m venv .venv
 
 - start.bat
 - start_terrain_editor.bat
+- export_robot_venue_map_asset.bat
 
 ### Windows 迁移到 3.12 / 3.13
 
@@ -79,6 +80,36 @@ setup_windows_env.bat C:\Users\kylin\AppData\Local\Programs\Python\Python312\pyt
 - requirements.txt 中包含 moderngl 和 glcontext；如果你的 Python 版本没有对应 wheel，优先改用 Python 3.12 或 3.13，或者安装 MSVC Build Tools。
 - 如果你看到“当前解释器未安装 pygame 或 pygame-ce”，通常不是没装，而是装到了另一个 Python 版本里。请始终使用 `当前解释器 -m pip` 安装依赖。
 - 如果 PowerShell 拒绝执行 Activate.ps1，可以直接用 .venv\Scripts\python.exe 运行，无需激活环境。
+
+## 3D 地图资产导出
+
+项目现在包含独立的标准化 3D 地图资产构建脚本 [build_robot_venue_map_asset.py](build_robot_venue_map_asset.py)。
+
+默认行为：
+
+- 优先读取仓库根目录的 map.json
+- 若根目录 map.json 不存在，则回退到当前 config/settings 激活的地图预设
+- 输入可为任务书标准 schema，也可为当前项目的 map preset schema
+
+命令行示例：
+
+```powershell
+.venv\Scripts\python.exe build_robot_venue_map_asset.py
+.venv\Scripts\python.exe build_robot_venue_map_asset.py --input maps/basicMap/map.json
+.venv\Scripts\python.exe build_robot_venue_map_asset.py --input map_presets/basicMap.json --output custom_asset_dir
+.venv\Scripts\python.exe build_robot_venue_map_asset.py --help
+```
+
+一键入口：
+
+- 双击 [export_robot_venue_map_asset.bat](export_robot_venue_map_asset.bat)
+- 在地形编辑器中点击“导出3D资产”
+- 在地形编辑器中按 Ctrl+E
+
+独立示例文件：
+
+- [examples/navigation_obstacle_query_example.py](examples/navigation_obstacle_query_example.py)
+- [examples/incremental_facility_rebuild_example.py](examples/incremental_facility_rebuild_example.py)
 
 ## 当前覆盖的核心功能
 

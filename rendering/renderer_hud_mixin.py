@@ -46,42 +46,34 @@ class RendererHudMixin:
         'patrol_key_facilities': '巡关键设施',
     }
 
-    def render_match_hud(self, game_engine):
-        hud_rect = pygame.Rect(0, self.toolbar_height, self.window_width, self.hud_height)
+    def render_match_hud(self, game_engine, top_offset=None):
+        hud_top = self.toolbar_height if top_offset is None else int(top_offset)
+        hud_rect = pygame.Rect(0, hud_top, self.window_width, self.hud_height)
         pygame.draw.rect(self.screen, self.colors['hud_bg'], hud_rect)
 
         hud_data = game_engine.get_match_hud_data()
         center_x = self.window_width // 2
-        center_panel = pygame.Rect(center_x - 96, self.toolbar_height + 10, 192, 86)
-        pygame.draw.rect(self.screen, self.colors['hud_center'], center_panel, border_radius=14)
+        center_panel = pygame.Rect(center_x - 102, hud_top + 8, 204, 92)
+        pygame.draw.rect(self.screen, self.colors['hud_center'], center_panel, border_radius=16)
 
-        round_text = self.tiny_font.render(hud_data['round_text'], True, self.colors['white'])
-        self.screen.blit(round_text, round_text.get_rect(center=(center_x, self.toolbar_height + 18)))
+        round_text = self.tiny_font.render(hud_data['round_text'], True, (225, 230, 236))
+        self.screen.blit(round_text, round_text.get_rect(center=(center_x, center_panel.y + 14)))
 
-        scale_text = self.tiny_font.render(hud_data['scale_text'], True, self.colors['white'])
-        self.screen.blit(scale_text, scale_text.get_rect(center=(center_x, self.toolbar_height + 96)))
+        scale_text = self.tiny_font.render(hud_data['scale_text'], True, (192, 199, 206))
+        self.screen.blit(scale_text, scale_text.get_rect(center=(center_x, center_panel.bottom - 8)))
 
         remaining = max(0, int(hud_data['remaining_time']))
         minutes = remaining // 60
         seconds = remaining % 60
         timer_text = self.hud_big_font.render(f'{minutes}:{seconds:02d}', True, self.colors['white'])
-        self.screen.blit(timer_text, timer_text.get_rect(center=(center_x, self.toolbar_height + 50)))
+        self.screen.blit(timer_text, timer_text.get_rect(center=(center_x, center_panel.y + 42)))
 
-        gold_rect = pygame.Rect(center_x - 78, self.toolbar_height + 64, 156, 26)
-        pygame.draw.rect(self.screen, self.colors['hud_panel'], gold_rect, border_radius=12)
-        gold_text = self.small_font.render(
-            f'金币 红 {hud_data["red"]["gold"]} | 蓝 {hud_data["blue"]["gold"]}',
-            True,
-            self.colors['hud_gold'],
-        )
-        self.screen.blit(gold_text, gold_text.get_rect(center=gold_rect.center))
-
-        self._render_team_hud('red', '红方', pygame.Rect(10, self.toolbar_height + 8, center_x - 120, 96), hud_data['red'])
-        self._render_team_hud('blue', '蓝方', pygame.Rect(center_x + 110, self.toolbar_height + 8, self.window_width - center_x - 120, 96), hud_data['blue'])
+        self._render_team_hud('red', '红方', pygame.Rect(10, hud_top + 8, center_x - 120, 96), hud_data['red'])
+        self._render_team_hud('blue', '蓝方', pygame.Rect(center_x + 110, hud_top + 8, self.window_width - center_x - 120, 96), hud_data['blue'])
 
     def _render_team_hud(self, team_key, team_label, rect, team_data):
         team_color = self.colors['red'] if team_key == 'red' else self.colors['blue']
-        pygame.draw.rect(self.screen, self.colors['hud_panel'], rect, border_radius=12)
+        pygame.draw.rect(self.screen, self.colors['hud_panel'], rect, border_radius=14)
 
         banner_rect = pygame.Rect(rect.x + 8, rect.y + 8, rect.width - 16, 24)
         pygame.draw.rect(self.screen, team_color, banner_rect, border_radius=10)
@@ -91,7 +83,7 @@ class RendererHudMixin:
         structure_text = self.tiny_font.render(
             f'基地 {team_data["base_hp"]}/{team_data["base_max_hp"]}   前哨站 {team_data["outpost_hp"]}/{team_data["outpost_max_hp"]}',
             True,
-            self.colors['white'],
+            (232, 236, 242),
         )
         self.screen.blit(structure_text, (rect.x + 12, rect.y + 40))
 

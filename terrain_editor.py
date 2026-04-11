@@ -3,6 +3,7 @@
 
 import os
 import re
+import subprocess
 import sys
 import threading
 from copy import deepcopy
@@ -48,6 +49,13 @@ class TerrainEditorEngine:
         self._pending_map_sync_job = None
         self._map_sync_worker = threading.Thread(target=self._map_sync_worker_loop, name='terrain-editor-map-sync', daemon=True)
         self._map_sync_worker.start()
+        self._save_lock = threading.Lock()
+        self._save_event = threading.Event()
+        self._save_stop_event = threading.Event()
+        self._pending_save_job = None
+        self._save_worker = threading.Thread(target=self._save_worker_loop, name='terrain-editor-map-save', daemon=True)
+        self._save_worker.start()
+        self._asset_export_thread = None
         self.refresh_available_maps()
         self.reload_map_manager()
 
@@ -60,15 +68,31 @@ class TerrainEditorEngine:
         with self._map_sync_lock:
             self._map_sync_generation += 1
             self._pending_map_sync_job = None
+        old_map_manager = getattr(self, 'map_manager', None)
+        if old_map_manager is not None and hasattr(old_map_manager, 'shutdown'):
+            old_map_manager.shutdown()
         self.map_manager = MapManager(self.config)
         self.map_manager.load_map()
 
     def shutdown(self):
+        pending_save_job = None
+        with self._save_lock:
+            pending_save_job = self._pending_save_job
+            self._pending_save_job = None
+        if pending_save_job is not None:
+            self._perform_save_job(pending_save_job)
+        self._save_stop_event.set()
+        self._save_event.set()
+        save_worker = self._save_worker
+        if save_worker is not None and save_worker.is_alive():
+            save_worker.join(timeout=1.0)
         self._map_sync_stop_event.set()
         self._map_sync_event.set()
         worker = self._map_sync_worker
         if worker is not None and worker.is_alive():
             worker.join(timeout=1.0)
+        if self.map_manager is not None and hasattr(self.map_manager, 'shutdown'):
+            self.map_manager.shutdown()
 
     def refresh_available_maps(self):
         names = self.config_manager.list_map_presets(self.config_path)
@@ -101,27 +125,9 @@ class TerrainEditorEngine:
     def _build_map_sync_payload_fast(self):
         return {
             'metadata': self._build_map_metadata(),
-            'facilities': self._copy_facility_regions(),
-            'terrain_grid': {
-                'cell_size': self.map_manager._serialized_grid_cell_size(self.map_manager.terrain_grid_cell_size),
-                'cells': [dict(cell) for cell in self.map_manager.terrain_grid_overrides.values()],
-            },
-            'function_grid': {
-                'cell_size': self.map_manager._serialized_grid_cell_size(self.map_manager.function_grid_cell_size or self.map_manager.terrain_grid_cell_size),
-                'cells': [dict(cell) for cell in self.map_manager.function_grid_overrides.values()],
-            },
-            'runtime_grid': deepcopy(self.map_manager.export_runtime_grid_config()),
-        }
-
-    def _build_map_sync_job(self, generation):
-        return {
-            'generation': int(generation),
-            'metadata': self._build_map_metadata(),
-            'facilities': self._copy_facility_regions(),
-            'terrain_cell_size': self.map_manager._serialized_grid_cell_size(self.map_manager.terrain_grid_cell_size),
-            'function_cell_size': self.map_manager._serialized_grid_cell_size(self.map_manager.function_grid_cell_size or self.map_manager.terrain_grid_cell_size),
-            'terrain_cells': tuple(self.map_manager.terrain_grid_overrides.values()),
-            'function_cells': tuple(self.map_manager.function_grid_overrides.values()),
+            'facilities': self.map_manager.export_facilities_config(),
+            'terrain_grid': self.map_manager.export_terrain_grid_config(),
+            'function_grid': self.map_manager.export_function_grid_config(),
             'runtime_grid': deepcopy(self.map_manager.export_runtime_grid_config()),
         }
 
@@ -130,25 +136,10 @@ class TerrainEditorEngine:
         for key, value in payload.get('metadata', {}).items():
             map_config[key] = deepcopy(value)
         map_config['facilities'] = payload.get('facilities', [])
-        map_config['terrain_grid'] = payload.get('terrain_grid', {'cell_size': 1, 'cells': []})
-        map_config['function_grid'] = payload.get('function_grid', {'cell_size': 1, 'cells': []})
+        map_config['terrain_grid'] = payload.get('terrain_grid', {'cell_size': 8, 'cells': []})
+        map_config['function_grid'] = payload.get('function_grid', {'cell_size': 8, 'cells': []})
         map_config['runtime_grid'] = payload.get('runtime_grid', {'resolution_m': 0.01, 'shape': [], 'channels': {}})
         map_config['coordinate_space'] = 'world'
-
-    def _materialize_job_payload(self, job):
-        return {
-            'metadata': dict(job.get('metadata', {})),
-            'facilities': deepcopy(job.get('facilities', [])),
-            'terrain_grid': {
-                'cell_size': job.get('terrain_cell_size', 1),
-                'cells': [dict(cell) for cell in job.get('terrain_cells', ())],
-            },
-            'function_grid': {
-                'cell_size': job.get('function_cell_size', 1),
-                'cells': [dict(cell) for cell in job.get('function_cells', ())],
-            },
-            'runtime_grid': deepcopy(job.get('runtime_grid', {})),
-        }
 
     def _map_sync_worker_loop(self):
         while not self._map_sync_stop_event.is_set():
@@ -162,21 +153,16 @@ class TerrainEditorEngine:
                 latest_generation = self._map_sync_generation
             if job is None:
                 continue
-            payload = self._materialize_job_payload(job)
+            payload = self._build_map_sync_payload_fast()
             with self._map_sync_lock:
-                if int(job.get('generation', -1)) != self._map_sync_generation or latest_generation != self._map_sync_generation:
+                if int(job) != self._map_sync_generation or latest_generation != self._map_sync_generation:
                     continue
                 self._apply_map_sync_payload(payload)
 
     def queue_map_sync(self):
         with self._map_sync_lock:
             self._map_sync_generation += 1
-            generation = self._map_sync_generation
-        job = self._build_map_sync_job(generation)
-        with self._map_sync_lock:
-            if generation != self._map_sync_generation:
-                return
-            self._pending_map_sync_job = job
+            self._pending_map_sync_job = int(self._map_sync_generation)
         self._map_sync_event.set()
 
     def sync_map_config(self):
@@ -260,28 +246,143 @@ class TerrainEditorEngine:
         if len(self.logs) > self.max_logs:
             self.logs.pop(0)
 
-    def save_preset(self, preset_name=None):
+    def _build_save_job(self, preset_name, persist_settings=False):
         name = self._sanitize_preset_name(preset_name or self.preset_name)
         self.sync_map_config()
-        preset_path = self.config_manager.save_map_preset(
-            name,
-            config=self.config,
-            config_path=self.config_path,
-            map_manager=self.map_manager,
-        )
         self.preset_name = name
-        self.refresh_available_maps()
         self.config.setdefault('map', {})['preset'] = name
-        saved_label = os.path.basename(preset_path) if preset_path else f'{name}.json'
-        self.add_log(f'地图预设已保存: {saved_label}')
-        return preset_path
+        self.refresh_available_maps()
+        config_snapshot = deepcopy(self.config)
+        settings_payload = None
+        if persist_settings:
+            settings_payload = self.config_manager.build_local_settings_payload(config_snapshot)
+        preset_path = self.config_manager._map_folder_preset_path(name, self.config_path)
+        return {
+            'preset_name': name,
+            'preset_path': preset_path,
+            'config_path': self.config_path,
+            'settings_path': self.settings_path,
+            'config_snapshot': config_snapshot,
+            'settings_payload': settings_payload,
+            'persist_settings': bool(persist_settings),
+        }
+
+    def _queue_save_job(self, job):
+        with self._save_lock:
+            self._pending_save_job = job
+        self._save_event.set()
+
+    def _save_worker_loop(self):
+        while not self._save_stop_event.is_set():
+            self._save_event.wait(0.2)
+            if self._save_stop_event.is_set():
+                return
+            self._save_event.clear()
+            with self._save_lock:
+                job = self._pending_save_job
+                self._pending_save_job = None
+            if job is None:
+                continue
+            self._perform_save_job(job)
+
+    def _perform_save_job(self, job):
+        worker_config_manager = ConfigManager()
+        config_snapshot = deepcopy(job.get('config_snapshot', {}))
+        temp_map_manager = MapManager(config_snapshot)
+        try:
+            preset_path = worker_config_manager.save_map_preset(
+                job.get('preset_name'),
+                config=config_snapshot,
+                config_path=job.get('config_path', self.config_path),
+                map_manager=temp_map_manager,
+            )
+            if job.get('persist_settings') and job.get('settings_payload') is not None:
+                worker_config_manager.save_settings(job.get('settings_path', self.settings_path), payload=job.get('settings_payload'))
+            saved_label = os.path.basename(preset_path) if preset_path else f"{job.get('preset_name')}.json"
+            self.add_log(f'地图预设已后台保存: {saved_label}')
+            if job.get('persist_settings'):
+                self.add_log(f'主程序已切换到地图预设: {job.get("preset_name")}')
+        except Exception as exc:
+            self.add_log(f'地图保存失败: {exc}', 'system')
+        finally:
+            if hasattr(temp_map_manager, 'shutdown'):
+                temp_map_manager.shutdown()
+
+    def save_preset(self, preset_name=None):
+        job = self._build_save_job(preset_name or self.preset_name, persist_settings=False)
+        self._queue_save_job(job)
+        saved_label = os.path.basename(job['preset_path']) if job.get('preset_path') else f"{job['preset_name']}.json"
+        self.add_log(f'地图预设已加入后台保存: {saved_label}')
+        return job['preset_path']
 
     def apply_preset(self, preset_name=None):
-        self.save_preset(preset_name)
-        self.config.setdefault('map', {})['preset'] = self.preset_name
+        job = self._build_save_job(preset_name or self.preset_name, persist_settings=True)
         self.config_manager.config = self.config
-        self.config_manager.save_settings(self.settings_path)
-        self.add_log(f'主程序已切换到地图预设: {self.preset_name}')
+        self._queue_save_job(job)
+        self.add_log(f'地图预设切换已加入后台保存: {job["preset_name"]}')
+
+    def export_map_asset(self, preset_name=None):
+        name = self._sanitize_preset_name(preset_name or self.preset_name)
+        worker = getattr(self, '_asset_export_thread', None)
+        if worker is not None and worker.is_alive():
+            self.add_log('地图资产导出正在进行，请稍候', 'system')
+            return False
+        self.sync_map_config()
+        self.preset_name = name
+        self.config.setdefault('map', {})['preset'] = name
+        self.refresh_available_maps()
+        config_snapshot = deepcopy(self.config)
+        self.add_log(f'已加入 3D 资产导出: {name}')
+        worker = threading.Thread(
+            target=self._export_map_asset_worker,
+            args=(name, config_snapshot),
+            name='terrain-editor-map-asset-export',
+            daemon=True,
+        )
+        self._asset_export_thread = worker
+        worker.start()
+        return True
+
+    def _export_map_asset_worker(self, preset_name, config_snapshot):
+        workspace_root = os.path.dirname(os.path.abspath(self.config_path))
+        script_path = os.path.join(workspace_root, 'build_robot_venue_map_asset.py')
+        output_dir = os.path.join(workspace_root, 'robot_venue_map_asset')
+        worker_config_manager = ConfigManager()
+        temp_map_manager = MapManager(config_snapshot)
+        try:
+            preset_path = worker_config_manager.save_map_preset(
+                preset_name,
+                config=config_snapshot,
+                config_path=self.config_path,
+                map_manager=temp_map_manager,
+            )
+            command = [
+                sys.executable,
+                script_path,
+                '--input',
+                preset_path,
+                '--output',
+                output_dir,
+            ]
+            completed = subprocess.run(
+                command,
+                cwd=workspace_root,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                check=False,
+            )
+            if completed.returncode == 0:
+                self.add_log(f'3D 资产导出完成: {os.path.join(workspace_root, "robot_venue_map_asset.zip")}')
+            else:
+                details = completed.stderr.strip() or completed.stdout.strip() or '未知错误'
+                self.add_log(f'3D 资产导出失败: {details.splitlines()[-1]}', 'system')
+        except Exception as exc:
+            self.add_log(f'3D 资产导出失败: {exc}', 'system')
+        finally:
+            if hasattr(temp_map_manager, 'shutdown'):
+                temp_map_manager.shutdown()
 
     def reload_preset(self, preset_name=None):
         name = self._sanitize_preset_name(preset_name or self.preset_name)
@@ -461,6 +562,7 @@ class TerrainEditorRenderer(Renderer):
         buttons = [
             ('保存预设', 'editor_save_preset', False),
             ('应用到主程序', 'editor_apply_preset', False),
+            ('导出3D资产', 'editor_export_map_asset', False),
             ('重载预设', 'editor_reload_preset', False),
         ]
         x = 12
@@ -502,7 +604,7 @@ class TerrainEditorRenderer(Renderer):
         surface.blit(rendered, (input_rect.x + 10, input_rect.y + 3))
         self.terrain_overview_ui['buttons'].append((input_rect, 'editor_focus_preset_name'))
 
-        hint = self.tiny_font.render('Ctrl+S 保存 | Ctrl+Shift+S 应用 | Ctrl+Z 撤销 | Ctrl+Y 重做 | Tab 切换地形/设施', True, self.colors['toolbar_text'])
+        hint = self.tiny_font.render('Ctrl+S 保存 | Ctrl+Shift+S 应用 | Ctrl+E 导出3D资产 | Ctrl+Z 撤销 | Ctrl+Y 重做 | Tab 切换地形/设施', True, self.colors['toolbar_text'])
         surface.blit(hint, (width - hint.get_width() - 12, 22))
         return header_rect.height
 
@@ -511,6 +613,7 @@ class TerrainEditorRenderer(Renderer):
         buttons = [
             ('保存预设', 'editor_save_preset', False),
             ('应用到主程序', 'editor_apply_preset', False),
+            ('导出3D资产', 'editor_export_map_asset', False),
             ('重载预设', 'editor_reload_preset', False),
             ('上一张', 'editor_prev_map', False),
             ('下一张', 'editor_next_map', False),
@@ -542,7 +645,7 @@ class TerrainEditorRenderer(Renderer):
         self.screen.blit(rendered, (input_rect.x + 10, input_rect.y + 9))
         self.toolbar_actions.append((input_rect, 'editor_focus_preset_name'))
 
-        hint = self.tiny_font.render('Ctrl+S 保存预设 | Ctrl+Shift+S 应用 | Ctrl+Z 撤销 | Ctrl+Y 重做 | Tab 切换工具', True, self.colors['toolbar_text'])
+        hint = self.tiny_font.render('Ctrl+S 保存预设 | Ctrl+Shift+S 应用 | Ctrl+E 导出3D资产 | Ctrl+Z 撤销 | Ctrl+Y 重做 | Tab 切换工具', True, self.colors['toolbar_text'])
         self.screen.blit(hint, (self.window_width - hint.get_width() - 12, 19))
 
     def render_match_hud(self, game_engine):
@@ -612,6 +715,10 @@ class TerrainEditorRenderer(Renderer):
                 self._commit_text_input(game_engine)
                 game_engine.save_preset(self._current_preset_name(game_engine))
                 return True
+            if event.key == pygame.K_e and mods & pygame.KMOD_CTRL:
+                self._commit_text_input(game_engine)
+                game_engine.export_map_asset(self._current_preset_name(game_engine))
+                return True
             if event.key in {pygame.K_F5, pygame.K_F9, pygame.K_p, pygame.K_r}:
                 return True
 
@@ -633,6 +740,10 @@ class TerrainEditorRenderer(Renderer):
         if action == 'editor_apply_preset':
             self._commit_text_input(game_engine)
             game_engine.apply_preset(self._current_preset_name(game_engine))
+            return
+        if action == 'editor_export_map_asset':
+            self._commit_text_input(game_engine)
+            game_engine.export_map_asset(self._current_preset_name(game_engine))
             return
         if action == 'editor_reload_preset':
             self._commit_text_input(game_engine)

@@ -4,6 +4,7 @@
 import math
 import os
 import sys
+import json
 from copy import deepcopy
 from datetime import datetime
 from types import SimpleNamespace
@@ -28,6 +29,20 @@ class BehaviorEditorEngine:
         'sentry': 'robot_7',
         'common': 'robot_3',
     }
+    COLLISION_PROFILE_DEFAULTS = {
+        'hero': {'collision_radius': 20.0, 'body_length_m': 0.65, 'body_width_m': 0.55, 'body_height_m': 0.20, 'body_clearance_m': 0.10, 'wheel_radius_m': 0.08, 'wheel_style': 'mecanum'},
+        'engineer': {'collision_radius': 21.0, 'body_length_m': 0.55, 'body_width_m': 0.50, 'body_height_m': 0.20, 'body_clearance_m': 0.10, 'wheel_radius_m': 0.08, 'wheel_style': 'mecanum'},
+        'infantry': {'collision_radius': 18.0, 'body_length_m': 0.50, 'body_width_m': 0.45, 'body_height_m': 0.20, 'body_clearance_m': 0.20, 'wheel_radius_m': 0.06, 'wheel_style': 'legged'},
+        'sentry': {'collision_radius': 24.0, 'body_length_m': 0.55, 'body_width_m': 0.50, 'body_height_m': 0.20, 'body_clearance_m': 0.10, 'wheel_radius_m': 0.08, 'wheel_style': 'mecanum'},
+    }
+    COLLISION_FIELD_SPECS = (
+        {'key': 'collision_radius', 'label': '碰撞半径（世界单位）', 'min': 8.0, 'max': 48.0},
+        {'key': 'body_length_m', 'label': '碰撞箱长度（米）', 'min': 0.20, 'max': 1.40},
+        {'key': 'body_width_m', 'label': '碰撞箱宽度（米）', 'min': 0.20, 'max': 1.20},
+        {'key': 'body_height_m', 'label': '碰撞箱高度（米）', 'min': 0.05, 'max': 0.80},
+        {'key': 'body_clearance_m', 'label': '离地间隙（米）', 'min': 0.0, 'max': 0.40},
+        {'key': 'wheel_radius_m', 'label': '轮半径（米）', 'min': 0.02, 'max': 0.25},
+    )
     REGION_MODE_LABELS = {
         'enter_then_execute': '先进入区域再执行',
         'strict_inside': '仅在区域内触发',
@@ -114,6 +129,8 @@ class BehaviorEditorEngine:
         default_preset = str(self.config.get('ai', {}).get('behavior_preset', '') or '').strip() or 'latest_behavior'
         self.preset_name = default_preset[:-5] if default_preset.lower().endswith('.json') else default_preset
         self.behavior_payload = self._load_behavior_payload(self.preset_name)
+        self.appearance_preset_path = self._resolve_appearance_preset_path()
+        self.appearance_payload = self._load_appearance_payload()
         self.preview_world = []
         self.preview_plan = None
         self.preview_feedback = []
@@ -150,6 +167,81 @@ class BehaviorEditorEngine:
                         decisions[decision_id] = self._normalize_override(override)
             return payload
         return self._empty_payload(preset_name)
+
+    def _resolve_appearance_preset_path(self):
+        configured_path = str(self.config.get('entities', {}).get('appearance_preset_path', os.path.join('appearance_presets', 'latest_appearance.json')))
+        if os.path.isabs(configured_path):
+            return configured_path
+        return os.path.join(os.path.dirname(os.path.abspath(self.config_path)), configured_path)
+
+    def _load_appearance_payload(self):
+        if not os.path.exists(self.appearance_preset_path):
+            return {'profiles': {}}
+        try:
+            with open(self.appearance_preset_path, 'r', encoding='utf-8') as file:
+                payload = json.load(file)
+        except Exception:
+            return {'profiles': {}}
+        if not isinstance(payload, dict):
+            return {'profiles': {}}
+        if not isinstance(payload.get('profiles'), dict):
+            payload['profiles'] = {}
+        return payload
+
+    def _save_appearance_payload(self):
+        directory = os.path.dirname(self.appearance_preset_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(self.appearance_preset_path, 'w', encoding='utf-8') as file:
+            json.dump(self.appearance_payload, file, ensure_ascii=False, indent=2)
+
+    def _collision_role_key(self, role_key=None):
+        role = str(role_key or self.selected_role_key() or 'hero')
+        return role if role in self.COLLISION_PROFILE_DEFAULTS else None
+
+    def current_collision_profile(self, role_key=None):
+        role = self._collision_role_key(role_key)
+        if role is None:
+            return None
+        merged = dict(self.COLLISION_PROFILE_DEFAULTS.get(role, {}))
+        profiles = self.appearance_payload.get('profiles', {}) if isinstance(self.appearance_payload, dict) else {}
+        override = profiles.get(role, {}) if isinstance(profiles, dict) else {}
+        if isinstance(override, dict):
+            merged.update(override)
+        return merged
+
+    def _sync_collision_profile_fields(self, role_key, profile):
+        wheel_style = str(profile.get('wheel_style', self.COLLISION_PROFILE_DEFAULTS.get(role_key, {}).get('wheel_style', 'mecanum')) or 'mecanum')
+        body_length_m = float(profile.get('body_length_m', self.COLLISION_PROFILE_DEFAULTS[role_key]['body_length_m']))
+        body_width_m = float(profile.get('body_width_m', self.COLLISION_PROFILE_DEFAULTS[role_key]['body_width_m']))
+        wheel_radius_m = float(profile.get('wheel_radius_m', self.COLLISION_PROFILE_DEFAULTS[role_key]['wheel_radius_m']))
+        if wheel_style == 'legged':
+            wheel_y = round(body_width_m * 0.5 + wheel_radius_m * 0.55, 3)
+            profile['custom_wheel_positions_m'] = [[0.0, -wheel_y], [0.0, wheel_y]]
+        else:
+            wheel_x = round(body_length_m * 0.39, 3)
+            wheel_y = round(body_width_m * 0.5 + wheel_radius_m * 0.55, 3)
+            profile['custom_wheel_positions_m'] = [[-wheel_x, -wheel_y], [wheel_x, -wheel_y], [-wheel_x, wheel_y], [wheel_x, wheel_y]]
+        profile.pop('gimbal_height_m', None)
+
+    def set_collision_field(self, field_name, value, role_key=None):
+        role = self._collision_role_key(role_key)
+        if role is None:
+            return False
+        profiles = self.appearance_payload.setdefault('profiles', {})
+        profile = profiles.get(role)
+        if not isinstance(profile, dict):
+            profile = dict(self.COLLISION_PROFILE_DEFAULTS.get(role, {}))
+            profiles[role] = profile
+        spec = next((item for item in self.COLLISION_FIELD_SPECS if item['key'] == field_name), None)
+        if spec is None:
+            return False
+        profile[field_name] = max(float(spec['min']), min(float(spec['max']), float(value)))
+        self._sync_collision_profile_fields(role, profile)
+        self._save_appearance_payload()
+        self._reset_preview_world()
+        self.add_log(f'已更新{self.role_label(role)}碰撞箱参数: {spec["label"]}')
+        return True
 
     def role_keys(self):
         return tuple(role_key for role_key in self.ROLE_ORDER if self.ai_controller.get_available_decision_plugins(role_key))
@@ -1283,6 +1375,7 @@ class BehaviorEditorEngine:
         name = str(preset_name or self.preset_name or 'latest_behavior').strip() or 'latest_behavior'
         self.preset_name = name
         self.behavior_payload = self._load_behavior_payload(name)
+        self.appearance_payload = self._load_appearance_payload()
         self.ai_controller._refresh_behavior_runtime_overrides(force=True)
         self._reset_preview_world()
         self.add_log(f'已重载行为预设: {name}')
@@ -1314,6 +1407,7 @@ class BehaviorEditorApp:
             ('condition', '条件'),
             ('strategy', '策略'),
             ('region', '区域'),
+            ('collision', '碰撞箱'),
             ('implementation', '实现说明'),
         )
         self.detail_page = 'overview'
@@ -2360,6 +2454,7 @@ class BehaviorEditorApp:
         selected_stage_index = max(0, min(self.selected_strategy_stage_index, self.engine.MAX_STRATEGY_STAGES - 1))
         self.selected_strategy_stage_index = selected_stage_index
         implementation_details = self.engine.current_decision_implementation_details()
+        collision_profile = self.engine.current_collision_profile()
         edit_values = {
             'label': active_input.get('text', '') if active_input.get('field') == 'label' else str(override.get('label', '')),
             'brief': active_input.get('text', '') if active_input.get('field') == 'brief' else str(override.get('brief', '')),
@@ -2371,6 +2466,14 @@ class BehaviorEditorApp:
             'end_sec': active_input.get('text', '') if active_input.get('field') == 'end_sec' else str((override.get('time_window') or {}).get('end_sec', '')),
             'engage_distance_m': active_input.get('text', '') if active_input.get('field') == f'engage_distance_m:{selected_stage_index}' else self.engine.current_engage_distance_text(selected_stage_index),
         }
+        for collision_spec in self.engine.COLLISION_FIELD_SPECS:
+            collision_field = f'collision:{collision_spec["key"]}'
+            if active_input.get('field') == collision_field:
+                edit_values[collision_field] = active_input.get('text', '')
+            elif collision_profile is not None:
+                edit_values[collision_field] = str(collision_profile.get(collision_spec['key'], ''))
+            else:
+                edit_values[collision_field] = '当前角色无实体碰撞配置'
 
         self._clamp_panel_scroll()
         self.panel_viewport_rect = viewport_rect
@@ -2486,6 +2589,41 @@ class BehaviorEditorApp:
                 '点击已有区域可选中并拖拽编辑，右侧列表也可直接选中或删除。',
             ])
             card_y += 130
+        elif self.detail_page == 'collision':
+            role_key = self.engine.selected_role_key()
+            if collision_profile is None:
+                self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, 96), '当前角色', [
+                    f'{self._role_label(role_key)} 不对应具体机器人实体。',
+                    '通用角色没有独立碰撞箱配置。',
+                ])
+                card_y += 104
+            else:
+                self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, 92), '碰撞箱说明', [
+                    '这里编辑的是机器人运行时底盘碰撞参数，会写入 appearance preset。',
+                    '修改后主程序按住 F3 可直接查看碰撞箱。',
+                    '长度、宽度、离地间隙和轮半径也会影响底盘模型与越障表现。',
+                ])
+                card_y += 100
+                half_width = (viewport_rect.width - 28) // 2
+                for field_index, collision_spec in enumerate(self.engine.COLLISION_FIELD_SPECS):
+                    row_index = field_index // 2
+                    col_index = field_index % 2
+                    field_rect = pygame.Rect(
+                        viewport_rect.x + 10 + col_index * (half_width + 8),
+                        card_y + row_index * (card_h_small + 8),
+                        half_width,
+                        card_h_small,
+                    )
+                    collision_field = f'collision:{collision_spec["key"]}'
+                    self._panel_card(field_rect, collision_spec['label'], [edit_values[collision_field]], action=f'edit:{collision_field}', active=True)
+                card_y += ((len(self.engine.COLLISION_FIELD_SPECS) + 1) // 2) * (card_h_small + 8)
+                self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, 88), '当前角色碰撞摘要', [
+                    f'角色: {self._role_label(role_key)}',
+                    f"长 {float(collision_profile.get('body_length_m', 0.0)):.2f}m / 宽 {float(collision_profile.get('body_width_m', 0.0)):.2f}m / 高 {float(collision_profile.get('body_height_m', 0.0)):.2f}m",
+                    f"碰撞半径 {float(collision_profile.get('collision_radius', 0.0)):.1f}   轮半径 {float(collision_profile.get('wheel_radius_m', 0.0)):.2f}m",
+                    f'保存位置: {self.engine.appearance_preset_path}',
+                ])
+                card_y += 96
         elif self.detail_page == 'implementation':
             self._panel_card(pygame.Rect(viewport_rect.x + 10, card_y, viewport_rect.width - 20, 108), '系统触发说明', implementation_details.get('trigger_lines', []))
             card_y += 116
@@ -2557,6 +2695,12 @@ class BehaviorEditorApp:
                     self.engine.set_override_field(field, float(value))
                 except ValueError:
                     self.engine.add_log(f'{field} 不是有效数字，已保留原值')
+        elif str(field).startswith('collision:'):
+            collision_field = str(field).split(':', 1)[1]
+            try:
+                self.engine.set_collision_field(collision_field, float(text.strip()))
+            except ValueError:
+                self.engine.add_log(f'{collision_field} 不是有效数字，已保留原值')
         self.active_text.input = None
         return True
 
@@ -2685,6 +2829,9 @@ class BehaviorEditorApp:
             override = self.engine.current_override(create=False) or {}
             if field in {'label', 'condition_expr', 'brief', 'trigger_note', 'logic_note', 'function_note'}:
                 text = str(override.get(field, ''))
+            elif field.startswith('collision:'):
+                collision_profile = self.engine.current_collision_profile() or {}
+                text = str(collision_profile.get(field.split(':', 1)[1], ''))
             elif field.startswith('engage_distance_m:'):
                 try:
                     stage_index = int(field.split(':', 1)[1])

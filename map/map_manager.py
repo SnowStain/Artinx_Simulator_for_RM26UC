@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 import time
+from copy import deepcopy
 from heapq import heappop, heappush
 
 try:
@@ -28,13 +29,17 @@ class MapManager:
         self.origin_y = config.get('map', {}).get('origin_y', 0)
         self.source_map_width = int(config.get('map', {}).get('source_width', config.get('map', {}).get('width', 1576)))
         self.source_map_height = int(config.get('map', {}).get('source_height', config.get('map', {}).get('height', 873)))
-        self.strict_scale_enabled = bool(config.get('map', {}).get('strict_scale', True))
+        self.strict_scale_enabled = bool(config.get('map', {}).get('strict_scale', False))
         self.map_width = int(config.get('map', {}).get('width', self.source_map_width))
         self.map_height = int(config.get('map', {}).get('height', self.source_map_height))
         self.field_length_m = config.get('map', {}).get('field_length_m', 28.0)
         self.field_width_m = config.get('map', {}).get('field_width_m', 15.0)
-        self.terrain_grid_cell_size = max(0.2, float(config.get('map', {}).get('terrain_grid', {}).get('cell_size', 8)))
-        self.function_grid_cell_size = max(0.2, float(config.get('map', {}).get('function_grid', {}).get('cell_size', self.terrain_grid_cell_size)))
+        self.vertical_height_scale = 1.0
+        configured_terrain_grid_cell_size = max(0.2, float(config.get('map', {}).get('terrain_grid', {}).get('cell_size', 8)))
+        configured_function_grid_cell_size = max(0.2, float(config.get('map', {}).get('function_grid', {}).get('cell_size', configured_terrain_grid_cell_size)))
+        self.grid_precision_cell_size = max(0.2, float(config.get('map', {}).get('grid_precision_cell_size', 4)))
+        self.terrain_grid_cell_size = 1.0 if self.strict_scale_enabled else min(configured_terrain_grid_cell_size, self.grid_precision_cell_size)
+        self.function_grid_cell_size = 1.0 if self.strict_scale_enabled else min(configured_function_grid_cell_size, self.grid_precision_cell_size)
         self.runtime_grid_resolution_m = 0.01
         self.runtime_grid_width = 0
         self.runtime_grid_height = 0
@@ -91,15 +96,16 @@ class MapManager:
             13: '起伏路段',
             14: '死区',
         }
-        self.height_map = None
-        self.terrain_type_map = None
-        self.move_block_map = None
-        self.movement_block_map = None
-        self.vision_block_map = None
-        self.vision_block_height_map = None
-        self.function_pass_map = None
-        self.function_heading_map = None
-        self.priority_map = None
+        self.height_map = np.zeros((1, 1), dtype=np.float32)
+        self.terrain_type_map = np.zeros((1, 1), dtype=np.uint8)
+        self.move_block_map = np.zeros((1, 1), dtype=np.bool_)
+        self.movement_block_map = self.move_block_map
+        self.scene_obstacle_map = np.zeros((1, 1), dtype=np.bool_)
+        self.vision_block_map = np.zeros((1, 1), dtype=np.bool_)
+        self.vision_block_height_map = np.zeros((1, 1), dtype=np.float32)
+        self.function_pass_map = np.zeros((1, 1), dtype=np.uint8)
+        self.function_heading_map = np.full((1, 1), np.nan, dtype=np.float32)
+        self.priority_map = np.zeros((1, 1), dtype=np.uint8)
         self.raster_dirty = True
         self.raster_version = 0
         self.terrain_priority = [
@@ -131,6 +137,19 @@ class MapManager:
         self._path_failure_cache_ttl_sec = max(0.1, float(config.get('ai', {}).get('path_failure_cache_ttl_sec', 0.35)))
         self._raster_batch_depth = 0
         self._raster_batch_pending = False
+        self._edit_state_lock = threading.RLock()
+        self.facility_version = 0
+        self.terrain_overlay_revision = 0
+        self._terrain_overlay_dirty_keys = set()
+        self._terrain_overlay_reset_required = True
+        self._raster_rebuild_lock = threading.Lock()
+        self._raster_rebuild_event = threading.Event()
+        self._raster_rebuild_stop_event = threading.Event()
+        self._pending_raster_rebuild_job = None
+        self._raster_rebuild_requested_at = 0.0
+        self._raster_rebuild_debounce_sec = max(0.0, float(config.get('simulator', {}).get('terrain_raster_rebuild_debounce_sec', 0.35) or 0.35))
+        self._raster_rebuild_thread = threading.Thread(target=self._raster_rebuild_worker_loop, name='map-manager-raster-rebuild', daemon=True)
+        self._raster_rebuild_thread.start()
         preserved_runtime_grid_bundle = dict(config.get('map', {}).get('runtime_grid', {}) or {})
         self._refresh_runtime_grid_metrics()
         self._load_facilities_from_config()
@@ -143,6 +162,13 @@ class MapManager:
 
     def begin_raster_batch(self):
         self._raster_batch_depth += 1
+
+    def shutdown(self):
+        self._raster_rebuild_stop_event.set()
+        self._raster_rebuild_event.set()
+        worker = self._raster_rebuild_thread
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=1.0)
 
     def end_raster_batch(self):
         if self._raster_batch_depth <= 0:
@@ -161,6 +187,7 @@ class MapManager:
         self.runtime_grid_bundle = {
             'resolution_m': float(self.runtime_grid_resolution_m),
             'shape': list(self._runtime_grid_shape()),
+            'height_scale_baked_in': 1.0,
             'channels': {},
         }
         self.config.setdefault('map', {})['runtime_grid'] = dict(self.runtime_grid_bundle)
@@ -173,6 +200,181 @@ class MapManager:
         self._lpa_planner_cache.clear()
         with self._path_result_cache_lock:
             self._path_result_cache.clear()
+        if self._has_raster_layers():
+            self._schedule_async_raster_rebuild()
+
+    def _has_raster_layers(self):
+        expected_shape = self._runtime_grid_shape()
+        arrays = (
+            self.height_map,
+            self.terrain_type_map,
+            self.movement_block_map,
+            self.vision_block_map,
+            self.vision_block_height_map,
+            self.function_pass_map,
+            self.function_heading_map,
+            self.priority_map,
+        )
+        return all(array is not None and tuple(array.shape) == expected_shape for array in arrays)
+
+    def _clear_raster_layers(self):
+        self.height_map = None
+        self.terrain_type_map = None
+        self.movement_block_map = None
+        self.move_block_map = None
+        self.vision_block_map = None
+        self.vision_block_height_map = None
+        self.function_pass_map = None
+        self.function_heading_map = None
+        self.priority_map = None
+
+    def _mark_facility_overlay_dirty(self):
+        self.facility_version += 1
+
+    def _mark_terrain_overlay_dirty(self, keys=None, reset=False):
+        with self._edit_state_lock:
+            self.terrain_overlay_revision += 1
+            if reset:
+                self._terrain_overlay_dirty_keys.clear()
+                self._terrain_overlay_reset_required = True
+                return
+            if keys:
+                for key in keys:
+                    if key is not None:
+                        self._terrain_overlay_dirty_keys.add(str(key))
+
+    def consume_terrain_overlay_dirty_state(self):
+        with self._edit_state_lock:
+            state = {
+                'revision': int(self.terrain_overlay_revision),
+                'reset': bool(self._terrain_overlay_reset_required),
+                'keys': tuple(self._terrain_overlay_dirty_keys),
+            }
+            self._terrain_overlay_dirty_keys.clear()
+            self._terrain_overlay_reset_required = False
+            return state
+
+    def _snapshot_raster_rebuild_state(self):
+        with self._edit_state_lock:
+            return {
+                'generation': int(self.raster_version),
+                'map_width': int(self.map_width),
+                'map_height': int(self.map_height),
+                'terrain_grid_cell_size': float(self.terrain_grid_cell_size),
+                'runtime_grid_width': int(self.runtime_grid_width),
+                'runtime_grid_height': int(self.runtime_grid_height),
+                'runtime_cell_width_world': float(self.runtime_cell_width_world),
+                'runtime_cell_height_world': float(self.runtime_cell_height_world),
+                'runtime_grid_resolution_m': float(self.runtime_grid_resolution_m),
+                'facilities': deepcopy(self.facilities),
+                'terrain_grid_overrides': {key: dict(cell) for key, cell in self.terrain_grid_overrides.items()},
+                'function_grid_overrides': {key: dict(cell) for key, cell in self.function_grid_overrides.items()},
+            }
+
+    def _build_raster_state_from_snapshot(self, snapshot):
+        worker_state = object.__new__(MapManager)
+        worker_state.map_width = int(snapshot['map_width'])
+        worker_state.map_height = int(snapshot['map_height'])
+        worker_state.terrain_grid_cell_size = float(snapshot['terrain_grid_cell_size'])
+        worker_state.runtime_grid_width = int(snapshot['runtime_grid_width'])
+        worker_state.runtime_grid_height = int(snapshot['runtime_grid_height'])
+        worker_state.runtime_cell_width_world = float(snapshot['runtime_cell_width_world'])
+        worker_state.runtime_cell_height_world = float(snapshot['runtime_cell_height_world'])
+        worker_state.runtime_grid_resolution_m = float(snapshot['runtime_grid_resolution_m'])
+        worker_state.facilities = snapshot['facilities']
+        worker_state.terrain_grid_overrides = snapshot['terrain_grid_overrides']
+        worker_state.function_grid_overrides = snapshot['function_grid_overrides']
+        worker_state.terrain_priority = self.terrain_priority
+        worker_state.priority_rank = self.priority_rank
+        worker_state.terrain_code_by_type = self.terrain_code_by_type
+        worker_state.function_pass_mode_by_code = self.function_pass_mode_by_code
+        worker_state.runtime_grid_bundle = {
+            'resolution_m': float(worker_state.runtime_grid_resolution_m),
+            'shape': [int(worker_state.runtime_grid_height), int(worker_state.runtime_grid_width)],
+            'height_scale_baked_in': 1.0,
+            'channels': {},
+        }
+        worker_state.runtime_grid_loaded = False
+        worker_state._create_raster_layers()
+        for facility_type in reversed(worker_state.terrain_priority):
+            for region in worker_state.facilities:
+                if region.get('type') == facility_type:
+                    worker_state._apply_region_to_raster(region)
+        for cell in worker_state.terrain_grid_overrides.values():
+            worker_state._apply_terrain_override_to_raster(cell)
+        for cell in worker_state.function_grid_overrides.values():
+            worker_state._apply_function_override_to_raster(cell)
+        worker_state.move_block_map = worker_state.movement_block_map
+        return {
+            'generation': int(snapshot['generation']),
+            'height_map': worker_state.height_map,
+            'terrain_type_map': worker_state.terrain_type_map,
+            'movement_block_map': worker_state.movement_block_map,
+            'vision_block_map': worker_state.vision_block_map,
+            'vision_block_height_map': worker_state.vision_block_height_map,
+            'function_pass_map': worker_state.function_pass_map,
+            'function_heading_map': worker_state.function_heading_map,
+            'priority_map': worker_state.priority_map,
+            'runtime_grid_bundle': dict(worker_state.runtime_grid_bundle),
+            'runtime_grid_loaded': False,
+        }
+
+    def _install_raster_state(self, raster_state):
+        self.height_map = raster_state['height_map']
+        self.terrain_type_map = raster_state['terrain_type_map']
+        self.movement_block_map = raster_state['movement_block_map']
+        self.move_block_map = self.movement_block_map
+        self.scene_obstacle_map = None
+        self.vision_block_map = raster_state['vision_block_map']
+        self.vision_block_height_map = raster_state['vision_block_height_map']
+        self.function_pass_map = raster_state['function_pass_map']
+        self.function_heading_map = raster_state['function_heading_map']
+        self.priority_map = raster_state['priority_map']
+        self.runtime_grid_bundle = dict(raster_state.get('runtime_grid_bundle', {}))
+        self.runtime_grid_loaded = bool(raster_state.get('runtime_grid_loaded', False))
+        self.raster_dirty = False
+
+    def _schedule_async_raster_rebuild(self):
+        if self._raster_rebuild_stop_event.is_set():
+            return
+        current_generation = int(self.raster_version)
+        with self._raster_rebuild_lock:
+            if self._pending_raster_rebuild_job == current_generation:
+                return
+            self._pending_raster_rebuild_job = current_generation
+            self._raster_rebuild_requested_at = time.perf_counter()
+        self._raster_rebuild_event.set()
+
+    def _raster_rebuild_worker_loop(self):
+        while not self._raster_rebuild_stop_event.is_set():
+            self._raster_rebuild_event.wait(0.2)
+            if self._raster_rebuild_stop_event.is_set():
+                return
+            self._raster_rebuild_event.clear()
+            while not self._raster_rebuild_stop_event.is_set():
+                with self._raster_rebuild_lock:
+                    job = self._pending_raster_rebuild_job
+                    requested_at = float(self._raster_rebuild_requested_at)
+                    self._pending_raster_rebuild_job = None
+                if job is None:
+                    break
+                wait_sec = self._raster_rebuild_debounce_sec - (time.perf_counter() - requested_at)
+                if wait_sec > 1e-3:
+                    self._raster_rebuild_event.wait(wait_sec)
+                    if self._raster_rebuild_stop_event.is_set():
+                        return
+                    self._raster_rebuild_event.clear()
+                    with self._raster_rebuild_lock:
+                        if self._pending_raster_rebuild_job is not None:
+                            continue
+                raster_state = self._build_raster_state_from_snapshot(self._snapshot_raster_rebuild_state())
+                if self._raster_rebuild_stop_event.is_set():
+                    return
+                with self._raster_rebuild_lock:
+                    if int(job) != int(self.raster_version) or int(raster_state.get('generation', -1)) != int(self.raster_version):
+                        continue
+                    self._install_raster_state(raster_state)
+                break
 
     def _terrain_cell_key(self, grid_x, grid_y):
         return f'{int(grid_x)},{int(grid_y)}'
@@ -221,22 +423,28 @@ class MapManager:
         return payload
 
     def _set_function_override_cell(self, grid_x, grid_y, pass_mode='passable', heading_deg=None):
-        key = self._function_cell_key(grid_x, grid_y)
-        normalized_mode = str(pass_mode or 'passable')
-        if normalized_mode == 'passable':
-            return self.function_grid_overrides.pop(key, None) is not None
-        payload = self._function_override_payload(grid_x, grid_y, pass_mode=normalized_mode, heading_deg=heading_deg)
-        previous = self.function_grid_overrides.get(key)
-        if previous == payload:
-            return False
-        self.function_grid_overrides[key] = payload
-        return True
+        with self._edit_state_lock:
+            key = self._function_cell_key(grid_x, grid_y)
+            normalized_mode = str(pass_mode or 'passable')
+            if normalized_mode == 'passable':
+                return self.function_grid_overrides.pop(key, None) is not None
+            payload = self._function_override_payload(grid_x, grid_y, pass_mode=normalized_mode, heading_deg=heading_deg)
+            previous = self.function_grid_overrides.get(key)
+            if previous == payload:
+                return False
+            self.function_grid_overrides[key] = payload
+            return True
 
     def _serialized_grid_cell_size(self, cell_size):
         value = round(float(cell_size), 4)
         if abs(value - round(value)) <= 1e-6:
             return int(round(value))
         return value
+
+    def _resolved_grid_cell_size(self, configured_cell_size):
+        if self.strict_scale_enabled:
+            return 1.0
+        return min(max(0.2, float(configured_cell_size)), float(self.grid_precision_cell_size))
 
     def _grid_cell_center(self, grid_x, grid_y):
         x1, y1, x2, y2 = self._grid_cell_bounds(grid_x, grid_y)
@@ -412,7 +620,7 @@ class MapManager:
         terrain_grid = map_config.get('terrain_grid', {}) or {}
         terrain_cells = terrain_grid.get('cells', []) or []
         terrain_source_cell_size = max(0.2, float(terrain_grid.get('cell_size', self.terrain_grid_cell_size)))
-        terrain_target_cell_size = 1.0 if self.strict_scale_enabled else terrain_source_cell_size
+        terrain_target_cell_size = self._resolved_grid_cell_size(terrain_source_cell_size)
         inferred = self._infer_coordinate_space_from_grid_cells(terrain_cells, terrain_source_cell_size, terrain_target_cell_size)
         if inferred is not None:
             self._config_coordinate_space_hint = inferred
@@ -548,6 +756,13 @@ class MapManager:
                 return False
             loaded_arrays[channel_name] = loaded.astype(dtype, copy=False)
 
+        baked_height_scale = max(1.0, float(runtime_grid.get('height_scale_baked_in', 1.0)))
+        target_height_scale = 1.0
+        height_scale_ratio = target_height_scale / baked_height_scale
+        if abs(height_scale_ratio - 1.0) > 1e-6:
+            loaded_arrays['height_map'] = (loaded_arrays['height_map'].astype(np.float32, copy=False) * height_scale_ratio).astype(np.float32, copy=False)
+            loaded_arrays['vision_block_height_map'] = (loaded_arrays['vision_block_height_map'].astype(np.float32, copy=False) * height_scale_ratio).astype(np.float32, copy=False)
+
         self.height_map = loaded_arrays['height_map']
         self.terrain_type_map = loaded_arrays['terrain_type_map']
         self.movement_block_map = loaded_arrays['movement_block_map']
@@ -557,7 +772,9 @@ class MapManager:
         self.priority_map = loaded_arrays['priority_map']
         self.function_pass_map = loaded_arrays['function_pass_map']
         self.function_heading_map = loaded_arrays['function_heading_map']
+        runtime_grid['height_scale_baked_in'] = 1.0
         self.runtime_grid_bundle = runtime_grid
+        self.config.setdefault('map', {})['runtime_grid'] = dict(runtime_grid)
         self.runtime_grid_loaded = True
         self.raster_dirty = False
         return True
@@ -574,15 +791,22 @@ class MapManager:
         }
 
     def _set_terrain_override_cell(self, grid_x, grid_y, terrain_type, height_m, team='neutral', blocks_movement=None, blocks_vision=None):
-        self.terrain_grid_overrides[self._terrain_cell_key(grid_x, grid_y)] = self._terrain_override_payload(
-            grid_x,
-            grid_y,
-            terrain_type,
-            height_m,
-            team=team,
-            blocks_movement=blocks_movement,
-            blocks_vision=blocks_vision,
-        )
+        with self._edit_state_lock:
+            key = self._terrain_cell_key(grid_x, grid_y)
+            payload = self._terrain_override_payload(
+                grid_x,
+                grid_y,
+                terrain_type,
+                height_m,
+                team=team,
+                blocks_movement=blocks_movement,
+                blocks_vision=blocks_vision,
+            )
+            if self.terrain_grid_overrides.get(key) == payload:
+                return False
+            self.terrain_grid_overrides[key] = payload
+        self._mark_terrain_overlay_dirty((key,))
+        return True
 
     def _grid_ranges_from_world_bounds(self, x1, y1, x2, y2):
         cell_size = max(self.terrain_grid_cell_size, 1)
@@ -744,7 +968,7 @@ class MapManager:
         terrain_grid = self.config.get('map', {}).get('terrain_grid', {})
         self._refresh_runtime_grid_metrics()
         source_cell_size = max(0.2, float(terrain_grid.get('cell_size', self.terrain_grid_cell_size)))
-        self.terrain_grid_cell_size = 1.0 if self.strict_scale_enabled else source_cell_size
+        self.terrain_grid_cell_size = self._resolved_grid_cell_size(source_cell_size)
         coordinate_space = self._configured_coordinate_space()
         self.terrain_grid_overrides = {}
         for cell in terrain_grid.get('cells', []):
@@ -774,12 +998,13 @@ class MapManager:
                         'blocks_vision': bool(cell.get('blocks_vision', False)),
                     }
                     self.terrain_grid_overrides[self._terrain_cell_key(grid_x, grid_y)] = normalized
+                self._mark_terrain_overlay_dirty(reset=True)
         self._mark_raster_dirty()
 
     def _load_function_grid_from_config(self):
         function_grid = self.config.get('map', {}).get('function_grid', {})
         source_cell_size = max(0.2, float(function_grid.get('cell_size', self.terrain_grid_cell_size)))
-        self.function_grid_cell_size = 1.0 if self.strict_scale_enabled else source_cell_size
+        self.function_grid_cell_size = self._resolved_grid_cell_size(source_cell_size)
         coordinate_space = self._configured_coordinate_space()
         self.function_grid_overrides = {}
         for cell in function_grid.get('cells', []):
@@ -811,33 +1036,37 @@ class MapManager:
         self._mark_raster_dirty()
 
     def export_terrain_grid_config(self):
-        cells = []
-        for key in sorted(self.terrain_grid_overrides.keys(), key=lambda item: tuple(map(int, item.split(',')))):
-            cell = dict(self.terrain_grid_overrides[key])
-            cells.append(cell)
-        return {
-            'cell_size': self._serialized_grid_cell_size(self.terrain_grid_cell_size),
-            'cells': cells,
-        }
+        with self._edit_state_lock:
+            cells = []
+            for key in sorted(self.terrain_grid_overrides.keys(), key=lambda item: tuple(map(int, item.split(',')))):
+                cell = dict(self.terrain_grid_overrides[key])
+                cells.append(cell)
+            return {
+                'cell_size': self._serialized_grid_cell_size(self.terrain_grid_cell_size),
+                'cells': cells,
+            }
 
     def export_function_grid_config(self):
-        cells = []
-        for key in sorted(self.function_grid_overrides.keys(), key=lambda item: tuple(map(int, item.split(',')))):
-            cells.append(dict(self.function_grid_overrides[key]))
-        return {
-            'cell_size': self._serialized_grid_cell_size(self.function_grid_cell_size or self.terrain_grid_cell_size),
-            'cells': cells,
-        }
+        with self._edit_state_lock:
+            cells = []
+            for key in sorted(self.function_grid_overrides.keys(), key=lambda item: tuple(map(int, item.split(',')))):
+                cells.append(dict(self.function_grid_overrides[key]))
+            return {
+                'cell_size': self._serialized_grid_cell_size(self.function_grid_cell_size or self.terrain_grid_cell_size),
+                'cells': cells,
+            }
 
     def export_runtime_grid_config(self):
-        runtime_grid = dict(self.runtime_grid_bundle or {})
-        runtime_grid['resolution_m'] = float(self.runtime_grid_resolution_m)
-        runtime_grid['shape'] = list(self._runtime_grid_shape())
-        runtime_grid.setdefault('channels', {})
-        return runtime_grid
+        with self._edit_state_lock:
+            runtime_grid = dict(self.runtime_grid_bundle or {})
+            runtime_grid['resolution_m'] = float(self.runtime_grid_resolution_m)
+            runtime_grid['shape'] = list(self._runtime_grid_shape())
+            runtime_grid['height_scale_baked_in'] = 1.0
+            runtime_grid.setdefault('channels', {})
+            return runtime_grid
 
     def persist_runtime_grid_bundle(self, preset_name, preset_path=None):
-        self._ensure_raster_layers()
+        self._ensure_raster_layers(wait=True)
         directory = os.path.dirname(os.path.abspath(preset_path)) if preset_path else self._map_preset_directory()
         os.makedirs(directory, exist_ok=True)
         safe_name = str(preset_name or 'map').strip() or 'map'
@@ -850,6 +1079,7 @@ class MapManager:
         self.runtime_grid_bundle = {
             'resolution_m': float(self.runtime_grid_resolution_m),
             'shape': list(self._runtime_grid_shape()),
+            'height_scale_baked_in': 1.0,
             'channels': channel_files,
         }
         self.config.setdefault('map', {})['runtime_grid'] = dict(self.runtime_grid_bundle)
@@ -858,12 +1088,14 @@ class MapManager:
     def paint_terrain_grid(self, world_x, world_y, terrain_type, height_m=0.0, brush_radius=0, team='neutral', blocks_movement=None, blocks_vision=None):
         center_grid_x, center_grid_y = self._world_to_grid(world_x, world_y)
         max_x, max_y = self._grid_dimensions()
+        changed = False
         for grid_y in range(max(0, center_grid_y - brush_radius), min(max_y, center_grid_y + brush_radius + 1)):
             for grid_x in range(max(0, center_grid_x - brush_radius), min(max_x, center_grid_x + brush_radius + 1)):
                 if math.hypot(grid_x - center_grid_x, grid_y - center_grid_y) > brush_radius + 0.25:
                     continue
-                self._set_terrain_override_cell(grid_x, grid_y, terrain_type, height_m, team=team, blocks_movement=blocks_movement, blocks_vision=blocks_vision)
-        self._mark_raster_dirty()
+                changed = self._set_terrain_override_cell(grid_x, grid_y, terrain_type, height_m, team=team, blocks_movement=blocks_movement, blocks_vision=blocks_vision) or changed
+        if changed:
+            self._mark_raster_dirty()
 
     def paint_function_grid(self, world_x, world_y, pass_mode='passable', brush_radius=0, heading_deg=None):
         center_grid_x, center_grid_y = self._world_to_grid(world_x, world_y)
@@ -880,10 +1112,20 @@ class MapManager:
 
     def paint_terrain_rect(self, x1, y1, x2, y2, terrain_type, height_m=0.0, team='neutral', blocks_movement=None, blocks_vision=None):
         grid_x1, grid_x2, grid_y1, grid_y2 = self._grid_ranges_from_world_bounds(x1, y1, x2, y2)
+        changed = False
         for grid_y in range(grid_y1, grid_y2 + 1):
             for grid_x in range(grid_x1, grid_x2 + 1):
-                self._set_terrain_override_cell(grid_x, grid_y, terrain_type, height_m, team=team, blocks_movement=blocks_movement, blocks_vision=blocks_vision)
-        self._mark_raster_dirty()
+                changed = self._set_terrain_override_cell(
+                    grid_x,
+                    grid_y,
+                    terrain_type,
+                    height_m,
+                    team=team,
+                    blocks_movement=blocks_movement,
+                    blocks_vision=blocks_vision,
+                ) or changed
+        if changed:
+            self._mark_raster_dirty()
 
     def paint_function_rect(self, x1, y1, x2, y2, pass_mode='passable', heading_deg=None):
         grid_x1, grid_x2, grid_y1, grid_y2 = self._grid_ranges_from_world_bounds(x1, y1, x2, y2)
@@ -899,12 +1141,14 @@ class MapManager:
         radius_world = max(0.0, float(radius_world))
         grid_x1, grid_x2, grid_y1, grid_y2 = self._grid_ranges_from_world_bounds(center_x - radius_world, center_y - radius_world, center_x + radius_world, center_y + radius_world)
         cell_size = max(self.terrain_grid_cell_size, 1)
+        changed = False
         for grid_y in range(grid_y1, grid_y2 + 1):
             for grid_x in range(grid_x1, grid_x2 + 1):
                 sample_x, sample_y = self._grid_cell_center(grid_x, grid_y)
                 if math.hypot(sample_x - center_x, sample_y - center_y) <= radius_world + cell_size * 0.35:
-                    self._set_terrain_override_cell(grid_x, grid_y, terrain_type, height_m, team=team, blocks_movement=blocks_movement, blocks_vision=blocks_vision)
-        self._mark_raster_dirty()
+                    changed = self._set_terrain_override_cell(grid_x, grid_y, terrain_type, height_m, team=team, blocks_movement=blocks_movement, blocks_vision=blocks_vision) or changed
+        if changed:
+            self._mark_raster_dirty()
 
     def paint_function_circle(self, center_x, center_y, radius_world, pass_mode='passable', heading_deg=None):
         radius_world = max(0.0, float(radius_world))
@@ -926,8 +1170,7 @@ class MapManager:
             return False
         changed = False
         for grid_x, grid_y in self._polygon_selected_cells(normalized_points):
-            self._set_terrain_override_cell(grid_x, grid_y, terrain_type, height_m, team=team, blocks_movement=blocks_movement, blocks_vision=blocks_vision)
-            changed = True
+            changed = self._set_terrain_override_cell(grid_x, grid_y, terrain_type, height_m, team=team, blocks_movement=blocks_movement, blocks_vision=blocks_vision) or changed
         if changed:
             self._mark_raster_dirty()
         return changed
@@ -1139,11 +1382,16 @@ class MapManager:
         center_grid_x, center_grid_y = self._world_to_grid(world_x, world_y)
         max_x, max_y = self._grid_dimensions()
         removed = False
-        for grid_y in range(max(0, center_grid_y - brush_radius), min(max_y, center_grid_y + brush_radius + 1)):
-            for grid_x in range(max(0, center_grid_x - brush_radius), min(max_x, center_grid_x + brush_radius + 1)):
-                if math.hypot(grid_x - center_grid_x, grid_y - center_grid_y) > brush_radius + 0.25:
-                    continue
-                removed = self.terrain_grid_overrides.pop(self._terrain_cell_key(grid_x, grid_y), None) is not None or removed
+        with self._edit_state_lock:
+            for grid_y in range(max(0, center_grid_y - brush_radius), min(max_y, center_grid_y + brush_radius + 1)):
+                for grid_x in range(max(0, center_grid_x - brush_radius), min(max_x, center_grid_x + brush_radius + 1)):
+                    if math.hypot(grid_x - center_grid_x, grid_y - center_grid_y) > brush_radius + 0.25:
+                        continue
+                    key = self._terrain_cell_key(grid_x, grid_y)
+                    removed_now = self.terrain_grid_overrides.pop(key, None) is not None
+                    if removed_now:
+                        self._mark_terrain_overlay_dirty((key,))
+                    removed = removed_now or removed
         if removed:
             self._mark_raster_dirty()
         return removed
@@ -1152,24 +1400,30 @@ class MapManager:
         center_grid_x, center_grid_y = self._world_to_grid(world_x, world_y)
         max_x, max_y = self._grid_dimensions()
         removed = False
-        for grid_y in range(max(0, center_grid_y - brush_radius), min(max_y, center_grid_y + brush_radius + 1)):
-            for grid_x in range(max(0, center_grid_x - brush_radius), min(max_x, center_grid_x + brush_radius + 1)):
-                if math.hypot(grid_x - center_grid_x, grid_y - center_grid_y) > brush_radius + 0.25:
-                    continue
-                removed = self.function_grid_overrides.pop(self._function_cell_key(grid_x, grid_y), None) is not None or removed
+        with self._edit_state_lock:
+            for grid_y in range(max(0, center_grid_y - brush_radius), min(max_y, center_grid_y + brush_radius + 1)):
+                for grid_x in range(max(0, center_grid_x - brush_radius), min(max_x, center_grid_x + brush_radius + 1)):
+                    if math.hypot(grid_x - center_grid_x, grid_y - center_grid_y) > brush_radius + 0.25:
+                        continue
+                    removed = self.function_grid_overrides.pop(self._function_cell_key(grid_x, grid_y), None) is not None or removed
         if removed:
             self._mark_raster_dirty()
         return removed
 
     def remove_terrain_grid_cell(self, grid_x, grid_y):
-        removed = self.terrain_grid_overrides.pop(self._terrain_cell_key(grid_x, grid_y), None)
+        with self._edit_state_lock:
+            key = self._terrain_cell_key(grid_x, grid_y)
+            removed = self.terrain_grid_overrides.pop(key, None)
+            if removed is not None:
+                self._mark_terrain_overlay_dirty((key,))
         if removed is not None:
             self._mark_raster_dirty()
             return True
         return False
 
     def remove_function_grid_cell(self, grid_x, grid_y):
-        removed = self.function_grid_overrides.pop(self._function_cell_key(grid_x, grid_y), None)
+        with self._edit_state_lock:
+            removed = self.function_grid_overrides.pop(self._function_cell_key(grid_x, grid_y), None)
         if removed is not None:
             self._mark_raster_dirty()
             return True
@@ -1345,9 +1599,43 @@ class MapManager:
                 return False
         return True
 
-    def compute_fov_visibility(self, origin_point, heading_deg, fov_deg, max_distance_world, angle_step_deg=1.0, include_mask=False):
+    def is_terrain_line_clear_3d(self, start_point, end_point, clearance_m=0.02, include_end=False, blocking_height_scale=1.0):
+        self._ensure_raster_layers()
+        if start_point is None or end_point is None:
+            return False
+        start_x, start_y, start_z = float(start_point[0]), float(start_point[1]), float(start_point[2])
+        end_x, end_y, end_z = float(end_point[0]), float(end_point[1]), float(end_point[2])
+        delta_x = end_x - start_x
+        delta_y = end_y - start_y
+        delta_z = end_z - start_z
+        distance_world = math.hypot(delta_x, delta_y)
+        if distance_world <= 1e-6:
+            return True
+        step_world = max(2.0, float(getattr(self, 'terrain_grid_cell_size', 8.0)) * 0.5)
+        sample_steps = max(1, int(math.ceil(distance_world / max(step_world, 1e-6))))
+        for step_index in range(1, sample_steps + 1):
+            if step_index == sample_steps and not include_end:
+                break
+            ratio = step_index / max(sample_steps, 1)
+            sample_x = start_x + delta_x * ratio
+            sample_y = start_y + delta_y * ratio
+            sample_z = start_z + delta_z * ratio
+            sample = self.sample_raster_layers(sample_x, sample_y)
+            if sample.get('terrain_type') == 'boundary':
+                return False
+            ground_height = float(sample.get('height_m', 0.0)) * float(blocking_height_scale)
+            blocking_height = ground_height
+            if bool(sample.get('vision_blocked', False)):
+                blocking_height = max(blocking_height, float(sample.get('vision_block_height_m', 0.0)) * float(blocking_height_scale))
+            if sample_z <= blocking_height + float(clearance_m):
+                return False
+        return True
+
+    def compute_fov_visibility(self, origin_point, heading_deg, fov_deg, max_distance_world, angle_step_deg=1.0, include_mask=False, origin_height_m=None, terrain_height_scale=1.0, max_pitch_up_deg=40.0, max_pitch_down_deg=35.0, terrain_pitch_margin_deg=1.2):
         self._ensure_raster_layers()
         if origin_point is None:
+            return {'polygon_world': tuple(), 'visible_mask': None}
+        if self.height_map is None or self.vision_block_map is None:
             return {'polygon_world': tuple(), 'visible_mask': None}
 
         cache_key = None
@@ -1358,6 +1646,10 @@ class MapManager:
                 round(float(fov_deg), 2),
                 round(float(max_distance_world), 2),
                 round(float(angle_step_deg), 2),
+                round(float(origin_height_m if origin_height_m is not None else -1.0), 2),
+                round(float(terrain_height_scale), 2),
+                round(float(max_pitch_up_deg), 2),
+                round(float(max_pitch_down_deg), 2),
                 int(self.raster_version),
             )
             cached = self._fov_cache.get(cache_key)
@@ -1365,6 +1657,13 @@ class MapManager:
                 return cached
 
         origin_cell = self._world_to_runtime_cell(origin_point[0], origin_point[1])
+        origin_ground_height = float(self.get_terrain_height_m(origin_point[0], origin_point[1]))
+        effective_origin_height = float(origin_height_m) if origin_height_m is not None else origin_ground_height
+        effective_origin_height = origin_ground_height * float(terrain_height_scale) + (effective_origin_height - origin_ground_height)
+        meters_per_world_unit = max(float(self.meters_to_world_units(1.0)), 1e-6)
+        terrain_pitch_margin_rad = math.radians(max(0.0, float(terrain_pitch_margin_deg)))
+        height_map = self.height_map
+        vision_block_map = self.vision_block_map
         safe_step = max(0.25, float(angle_step_deg))
         sample_count = max(1, int(math.ceil(max(0.0, float(fov_deg)) / safe_step)))
         start_angle = float(heading_deg) - float(fov_deg) * 0.5
@@ -1382,13 +1681,26 @@ class MapManager:
             end_y = float(origin_point[1]) + math.sin(angle_rad) * float(max_distance_world)
             end_cell = self._world_to_runtime_cell(end_x, end_y)
             last_visible = origin_cell
+            skyline_pitch_rad = -math.inf
             ray_cells = self._bresenham_line_cells(origin_cell, end_cell)
             for cell_index, (cell_x, cell_y) in enumerate(ray_cells):
                 if cell_index == 0:
                     if visible_mask is not None:
                         visible_mask[cell_y, cell_x] = True
                     continue
-                if bool(self.vision_block_map[cell_y, cell_x]):
+                world_point = self._runtime_cell_center_world(cell_x, cell_y)
+                horizontal_distance = math.hypot(float(world_point[0]) - float(origin_point[0]), float(world_point[1]) - float(origin_point[1]))
+                if horizontal_distance > 1e-6:
+                    terrain_height = float(height_map[cell_y, cell_x])
+                    effective_terrain_height = terrain_height * float(terrain_height_scale)
+                    target_pitch_rad = math.atan2(effective_terrain_height - effective_origin_height, horizontal_distance / meters_per_world_unit)
+                    target_pitch_deg = math.degrees(target_pitch_rad)
+                    if target_pitch_deg > float(max_pitch_up_deg) or target_pitch_deg < -float(max_pitch_down_deg):
+                        break
+                    if target_pitch_rad + terrain_pitch_margin_rad < skyline_pitch_rad:
+                        break
+                    skyline_pitch_rad = max(skyline_pitch_rad, target_pitch_rad)
+                if bool(vision_block_map[cell_y, cell_x]):
                     break
                 last_visible = (cell_x, cell_y)
                 if visible_mask is not None:
@@ -1410,19 +1722,79 @@ class MapManager:
         self.terrain_type_map = np.zeros(shape, dtype=np.uint8)
         self.movement_block_map = np.zeros(shape, dtype=np.bool_)
         self.move_block_map = self.movement_block_map
+        self.scene_obstacle_map = np.zeros(shape, dtype=np.bool_)
         self.vision_block_map = np.zeros(shape, dtype=np.bool_)
         self.vision_block_height_map = np.zeros(shape, dtype=np.float32)
         self.function_pass_map = np.zeros(shape, dtype=np.uint8)
         self.function_heading_map = np.full(shape, np.nan, dtype=np.float32)
         self.priority_map = np.full(shape, fill_value=255, dtype=np.uint8)
 
-    def _ensure_raster_layers(self):
+    def _ensure_raster_layers(self, wait=False):
         if self.height_map is None or self.height_map.shape != self._runtime_grid_shape():
             if not self._try_load_runtime_grid_bundle():
-                self._create_raster_layers()
-                self.raster_dirty = True
+                self._rebuild_raster_layers()
+                self._ensure_scene_obstacle_map()
+                return
         if self.raster_dirty:
-            self._rebuild_raster_layers()
+            if wait or not self._has_raster_layers():
+                self._rebuild_raster_layers()
+                self._ensure_scene_obstacle_map()
+                return
+            else:
+                self._schedule_async_raster_rebuild()
+        self._ensure_scene_obstacle_map()
+
+    def _ensure_scene_obstacle_map(self):
+        shape = self._runtime_grid_shape()
+        if self.scene_obstacle_map is not None and self.scene_obstacle_map.shape == shape:
+            return
+        if self.movement_block_map is None or self.height_map is None:
+            self.scene_obstacle_map = np.zeros(shape, dtype=np.bool_)
+            return
+        if self.vision_block_map is None or self.vision_block_height_map is None or self.terrain_type_map is None:
+            self.scene_obstacle_map = np.zeros(shape, dtype=np.bool_)
+            return
+
+        move_block = self.movement_block_map.astype(np.bool_)
+        height_map = self.height_map
+        vision_block_map = self.vision_block_map
+        vision_block_height_map = self.vision_block_height_map
+        terrain_type_map = self.terrain_type_map
+        vision_wall = vision_block_map.astype(np.bool_) & ((vision_block_height_map - height_map) > 0.06)
+        local_step = np.zeros(shape, dtype=np.bool_)
+        cliff_edge = np.zeros(shape, dtype=np.bool_)
+        step_height_threshold = max(
+            0.10,
+            float(self.config.get('physics', {}).get('normal_max_terrain_step_height_m', 0.35)),
+        )
+        step_codes = np.array([
+            self.terrain_code_by_type.get('first_step', 255),
+            self.terrain_code_by_type.get('second_step', 255),
+            self.terrain_code_by_type.get('fly_slope', 255),
+        ], dtype=np.uint8)
+        current_step_like = np.isin(terrain_type_map, step_codes)
+        for shift_y, shift_x in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            neighbor_height = np.roll(height_map, shift=(shift_y, shift_x), axis=(0, 1))
+            neighbor_block = np.roll(move_block | vision_wall, shift=(shift_y, shift_x), axis=(0, 1))
+            neighbor_type = np.roll(terrain_type_map, shift=(shift_y, shift_x), axis=(0, 1))
+            neighbor_step_like = np.isin(neighbor_type, step_codes)
+            height_delta = np.abs(neighbor_height - height_map)
+            local_step |= neighbor_block & (height_delta > 0.10)
+            cliff_edge |= (height_delta > step_height_threshold) & ~(current_step_like | neighbor_step_like)
+
+        wall_like = vision_wall | local_step | cliff_edge
+        expanded_wall_like = wall_like.copy()
+        for shift_y in (-1, 0, 1):
+            for shift_x in (-1, 0, 1):
+                if shift_x == 0 and shift_y == 0:
+                    continue
+                expanded_wall_like |= np.roll(wall_like, shift=(shift_y, shift_x), axis=(0, 1))
+
+        expanded_wall_like[0, :] = True
+        expanded_wall_like[-1, :] = True
+        expanded_wall_like[:, 0] = True
+        expanded_wall_like[:, -1] = True
+        self.scene_obstacle_map = move_block | expanded_wall_like
 
     def _clamp_bounds(self, x1, y1, x2, y2):
         return (
@@ -1518,9 +1890,10 @@ class MapManager:
         priority_view = self.priority_map[rows, cols]
         replace_mask = mask & (priority <= priority_view)
         if replace_mask.any():
+            scaled_height = float(region.get('height_m', 0.0))
             self.priority_map[rows, cols][replace_mask] = priority
             self.terrain_type_map[rows, cols][replace_mask] = self.terrain_code_by_type.get(region.get('type', 'flat'), 0)
-            self.height_map[rows, cols][replace_mask] = float(region.get('height_m', 0.0))
+            self.height_map[rows, cols][replace_mask] = scaled_height
 
             move_block = False
             if region.get('type') == 'wall':
@@ -1584,18 +1957,8 @@ class MapManager:
             self.function_heading_map[rows, cols] = np.nan
 
     def _rebuild_raster_layers(self):
-        self._create_raster_layers()
-        for facility_type in reversed(self.terrain_priority):
-            for region in self.facilities:
-                if region.get('type') == facility_type:
-                    self._apply_region_to_raster(region)
-        for cell in self.terrain_grid_overrides.values():
-            self._apply_terrain_override_to_raster(cell)
-        for cell in self.function_grid_overrides.values():
-            self._apply_function_override_to_raster(cell)
-        self.move_block_map = self.movement_block_map
-        self.runtime_grid_loaded = False
-        self.raster_dirty = False
+        raster_state = self._build_raster_state_from_snapshot(self._snapshot_raster_rebuild_state())
+        self._install_raster_state(raster_state)
 
     def get_raster_layers(self):
         self._ensure_raster_layers()
@@ -1606,6 +1969,7 @@ class MapManager:
             'terrain_type_map': self.terrain_type_map,
             'move_block_map': self.movement_block_map,
             'movement_block_map': self.movement_block_map,
+            'scene_obstacle_map': self.scene_obstacle_map,
             'vision_block_map': self.vision_block_map,
             'vision_block_height_map': self.vision_block_height_map,
             'function_pass_map': self.function_pass_map,
@@ -1646,13 +2010,29 @@ class MapManager:
             'terrain_code': terrain_code,
             'terrain_label': self.terrain_label_by_code.get(terrain_code, '平地'),
             'height_m': round(float(self.height_map[runtime_y, runtime_x]), 2),
-            'move_blocked': bool(self.movement_block_map[runtime_y, runtime_x]) or function_pass_code == self.function_pass_mode_by_code['blocked'],
+            'move_blocked': bool(self.scene_obstacle_map[runtime_y, runtime_x]) or function_pass_code == self.function_pass_mode_by_code['blocked'],
             'vision_blocked': bool(self.vision_block_map[runtime_y, runtime_x]),
             'vision_block_height_m': round(float(self.vision_block_height_map[runtime_y, runtime_x]), 2),
             'function_pass_mode': function_pass_mode,
             'function_pass_mode_label': self.function_pass_mode_label_by_code[self.function_pass_mode_by_code.get(function_pass_mode, 0)],
             'function_heading_deg': function_heading,
         }
+
+    def _hard_movement_block_view(self, min_x, max_x, min_y, max_y):
+        blocked_code = self.function_pass_mode_by_code['blocked']
+        boundary_code = self.terrain_code_by_type['boundary']
+        return (
+            self.movement_block_map[min_y:max_y + 1, min_x:max_x + 1]
+            | (self.terrain_type_map[min_y:max_y + 1, min_x:max_x + 1] == boundary_code)
+            | (self.function_pass_map[min_y:max_y + 1, min_x:max_x + 1] == blocked_code)
+        )
+
+    def _is_hard_blocked_world(self, x, y):
+        if not (0 <= int(x) < self.map_width and 0 <= int(y) < self.map_height):
+            return True
+        runtime_x, runtime_y = self._world_to_runtime_cell(x, y)
+        block_view = self._hard_movement_block_view(runtime_x, runtime_x, runtime_y, runtime_y)
+        return bool(block_view[0, 0])
 
     def _normalize_points(self, points):
         normalized = []
@@ -1754,15 +2134,7 @@ class MapManager:
                 if preserved_runtime_grid_bundle.get('channels'):
                     self.runtime_grid_bundle = preserved_runtime_grid_bundle
                     self.config.setdefault('map', {})['runtime_grid'] = dict(preserved_runtime_grid_bundle)
-                    self.height_map = None
-                    self.terrain_type_map = None
-                    self.movement_block_map = None
-                    self.move_block_map = None
-                    self.vision_block_map = None
-                    self.vision_block_height_map = None
-                    self.function_pass_map = None
-                    self.function_heading_map = None
-                    self.priority_map = None
+                    self._clear_raster_layers()
                     self.raster_dirty = False
                     self.runtime_grid_loaded = False
                 else:
@@ -1787,15 +2159,7 @@ class MapManager:
             if preserved_runtime_grid_bundle.get('channels'):
                 self.runtime_grid_bundle = preserved_runtime_grid_bundle
                 self.config.setdefault('map', {})['runtime_grid'] = dict(preserved_runtime_grid_bundle)
-                self.height_map = None
-                self.terrain_type_map = None
-                self.movement_block_map = None
-                self.move_block_map = None
-                self.vision_block_map = None
-                self.vision_block_height_map = None
-                self.function_pass_map = None
-                self.function_heading_map = None
-                self.priority_map = None
+                self._clear_raster_layers()
                 self.raster_dirty = False
                 self.runtime_grid_loaded = False
             else:
@@ -1811,10 +2175,12 @@ class MapManager:
         if 'facilities' in map_config:
             configured = map_config.get('facilities', []) or []
             coordinate_space = self._configured_coordinate_space()
-            if coordinate_space == 'source':
-                self.facilities = [self._normalize_region(self._scale_region_to_current_map(self._normalize_region(region))) for region in configured]
-            else:
-                self.facilities = [self._normalize_region(region) for region in configured]
+            with self._edit_state_lock:
+                if coordinate_space == 'source':
+                    self.facilities = [self._normalize_region(self._scale_region_to_current_map(self._normalize_region(region))) for region in configured]
+                else:
+                    self.facilities = [self._normalize_region(region) for region in configured]
+            self._mark_facility_overlay_dirty()
             self._mark_raster_dirty()
             return
 
@@ -1845,7 +2211,9 @@ class MapManager:
             {'id': 'blue_fort', 'type': 'fort', 'team': 'blue', 'shape': 'rect', 'x1': 1215, 'y1': 320, 'x2': 1330, 'y2': 520},
             {'id': 'boundary_outer', 'type': 'boundary', 'team': 'neutral', 'shape': 'rect', 'x1': 0, 'y1': 0, 'x2': 1575, 'y2': 872, 'thickness': 14},
         ]
-        self.facilities = [self._normalize_region(self._scale_region_to_current_map(region)) for region in self.facilities]
+        with self._edit_state_lock:
+            self.facilities = [self._normalize_region(self._scale_region_to_current_map(region)) for region in self.facilities]
+        self._mark_facility_overlay_dirty()
         self._mark_raster_dirty()
 
     def _in_rect(self, x, y, region):
@@ -1984,13 +2352,16 @@ class MapManager:
             'height_m': float(existing.get('height_m', 0.0)) if existing else 0.0,
         }
 
-        for index, region in enumerate(self.facilities):
-            if region.get('id') == facility_id:
-                self.facilities[index] = normalized
-                self._mark_raster_dirty()
-                return normalized
+        with self._edit_state_lock:
+            for index, region in enumerate(self.facilities):
+                if region.get('id') == facility_id:
+                    self.facilities[index] = normalized
+                    self._mark_facility_overlay_dirty()
+                    self._mark_raster_dirty()
+                    return normalized
 
-        self.facilities.append(normalized)
+            self.facilities.append(normalized)
+        self._mark_facility_overlay_dirty()
         self._mark_raster_dirty()
         return normalized
 
@@ -2014,7 +2385,9 @@ class MapManager:
             'height_m': 0.0,
         }
         normalized = self._normalize_region(region)
-        self.facilities.append(normalized)
+        with self._edit_state_lock:
+            self.facilities.append(normalized)
+        self._mark_facility_overlay_dirty()
         self._mark_raster_dirty()
         return normalized
 
@@ -2042,7 +2415,9 @@ class MapManager:
             'height_m': 1.0,
         }
         normalized = self._normalize_region(region)
-        self.facilities.append(normalized)
+        with self._edit_state_lock:
+            self.facilities.append(normalized)
+        self._mark_facility_overlay_dirty()
         self._mark_raster_dirty()
         return normalized
 
@@ -2050,12 +2425,14 @@ class MapManager:
         facility = self.get_facility_by_id(wall_id)
         if facility is None or facility.get('type') != 'wall':
             return None
-        if blocks_movement is not None:
-            facility['blocks_movement'] = bool(blocks_movement)
-        if blocks_vision is not None:
-            facility['blocks_vision'] = bool(blocks_vision)
-        if height_m is not None:
-            facility['height_m'] = max(0.0, round(float(height_m), 2))
+        with self._edit_state_lock:
+            if blocks_movement is not None:
+                facility['blocks_movement'] = bool(blocks_movement)
+            if blocks_vision is not None:
+                facility['blocks_vision'] = bool(blocks_vision)
+            if height_m is not None:
+                facility['height_m'] = max(0.0, round(float(height_m), 2))
+        self._mark_facility_overlay_dirty()
         self._mark_raster_dirty()
         return facility
 
@@ -2063,18 +2440,23 @@ class MapManager:
         facility = self.get_facility_by_id(facility_id)
         if facility is None or facility.get('type') == 'boundary':
             return None
-        facility['height_m'] = max(0.0, round(float(height_m), 2))
+        with self._edit_state_lock:
+            facility['height_m'] = max(0.0, round(float(height_m), 2))
+        self._mark_facility_overlay_dirty()
         self._mark_raster_dirty()
         return facility
 
     def remove_facility_region(self, facility_id):
         """删除设施区域。"""
-        self.facilities = [region for region in self.facilities if region.get('id') != facility_id]
+        with self._edit_state_lock:
+            self.facilities = [region for region in self.facilities if region.get('id') != facility_id]
+        self._mark_facility_overlay_dirty()
         self._mark_raster_dirty()
 
     def export_facilities_config(self):
         """导出设施配置。"""
-        return [dict(region) for region in self.facilities]
+        with self._edit_state_lock:
+            return [dict(region) for region in self.facilities]
 
     def get_facility_summary(self):
         """返回按设施类型分组的区域概要，供裁判系统使用。"""
@@ -2102,7 +2484,7 @@ class MapManager:
         cell_x, cell_y = int(cell[0]), int(cell[1])
         if not (0 <= cell_x < self.runtime_grid_width and 0 <= cell_y < self.runtime_grid_height):
             return True
-        if bool(self.movement_block_map[cell_y, cell_x]):
+        if bool(self.scene_obstacle_map[cell_y, cell_x]):
             return True
         if int(self.function_pass_map[cell_y, cell_x]) == self.function_pass_mode_by_code['blocked']:
             return True
@@ -3530,10 +3912,22 @@ class MapManager:
                     return transition
         return None
 
-    def evaluate_movement_path(self, from_x, from_y, to_x, to_y, max_height_delta_m=0.05, collision_radius=0.0):
+    def evaluate_movement_path(self, from_x, from_y, to_x, to_y, max_height_delta_m=0.05, collision_radius=0.0, angle_deg=None, body_length_m=None, body_width_m=None, body_clearance_m=0.0):
         start_sample = self.sample_raster_layers(from_x, from_y)
         end_sample = self.sample_raster_layers(to_x, to_y)
-        if not self.is_position_valid_for_radius(to_x, to_y, collision_radius=collision_radius):
+        use_chassis_box = body_length_m is not None and body_width_m is not None and float(body_length_m) > 0.0 and float(body_width_m) > 0.0
+        if use_chassis_box:
+            pose_valid = self.is_position_valid_for_chassis(
+                to_x,
+                to_y,
+                angle_deg if angle_deg is not None else 0.0,
+                body_length_m,
+                body_width_m,
+                body_clearance_m=body_clearance_m,
+            )
+        else:
+            pose_valid = self.is_position_valid_for_radius(to_x, to_y, collision_radius=collision_radius)
+        if not pose_valid:
             return {
                 'ok': False,
                 'reason': 'blocked',
@@ -3561,7 +3955,18 @@ class MapManager:
                     'start_height_m': start_sample['height_m'],
                     'end_height_m': end_sample['height_m'],
                 }
-            if not self.is_position_valid_for_radius(sample_x, sample_y, collision_radius=collision_radius):
+            if use_chassis_box:
+                sample_pose_valid = self.is_position_valid_for_chassis(
+                    sample_x,
+                    sample_y,
+                    angle_deg if angle_deg is not None else 0.0,
+                    body_length_m,
+                    body_width_m,
+                    body_clearance_m=body_clearance_m,
+                )
+            else:
+                sample_pose_valid = self.is_position_valid_for_radius(sample_x, sample_y, collision_radius=collision_radius)
+            if not sample_pose_valid:
                 return {
                     'ok': False,
                     'reason': 'blocked',
@@ -3720,11 +4125,93 @@ class MapManager:
         sample = self.sample_raster_layers(x, y)
         return not sample['move_blocked']
 
+    def _chassis_half_extents_world(self, body_length_m, body_width_m):
+        half_length = max(0.0, float(self.meters_to_world_units(float(body_length_m) * 0.5)))
+        half_width = max(0.0, float(self.meters_to_world_units(float(body_width_m) * 0.5)))
+        return half_length, half_width
+
+    def _chassis_sample_points(self, x, y, angle_deg, body_length_m, body_width_m, sample_step_world=None):
+        half_length, half_width = self._chassis_half_extents_world(body_length_m, body_width_m)
+        if half_length <= 1e-6 or half_width <= 1e-6:
+            return ((float(x), float(y), 0.0, 0.0),)
+        sample_step = max(
+            max(self.runtime_cell_width_world, self.runtime_cell_height_world) * 0.8,
+            float(sample_step_world or self.meters_to_world_units(0.10)),
+            1.0,
+        )
+        length_steps = max(1, int(math.ceil((half_length * 2.0) / max(sample_step, 1e-6))))
+        width_steps = max(1, int(math.ceil((half_width * 2.0) / max(sample_step, 1e-6))))
+        yaw_rad = math.radians(float(angle_deg))
+        forward_x = math.cos(yaw_rad)
+        forward_y = math.sin(yaw_rad)
+        right_x = -forward_y
+        right_y = forward_x
+        samples = []
+        for length_index in range(-length_steps, length_steps + 1):
+            local_x = half_length * (float(length_index) / max(length_steps, 1))
+            for width_index in range(-width_steps, width_steps + 1):
+                local_y = half_width * (float(width_index) / max(width_steps, 1))
+                sample_x = float(x) + forward_x * local_x + right_x * local_y
+                sample_y = float(y) + forward_y * local_x + right_y * local_y
+                samples.append((sample_x, sample_y, local_x, local_y))
+        return tuple(samples)
+
+    def _chassis_bottom_plane_height(self, x, y, angle_deg, body_length_m, body_width_m, body_clearance_m):
+        center_height = float(self.get_terrain_height_m(x, y))
+        half_length, half_width = self._chassis_half_extents_world(body_length_m, body_width_m)
+        if half_length <= 1e-6 or half_width <= 1e-6:
+            return center_height + float(body_clearance_m), 0.0, 0.0
+        yaw_rad = math.radians(float(angle_deg))
+        forward_x = math.cos(yaw_rad)
+        forward_y = math.sin(yaw_rad)
+        right_x = -forward_y
+        right_y = forward_x
+        front_height = float(self.get_terrain_height_m(float(x) + forward_x * half_length, float(y) + forward_y * half_length))
+        rear_height = float(self.get_terrain_height_m(float(x) - forward_x * half_length, float(y) - forward_y * half_length))
+        left_height = float(self.get_terrain_height_m(float(x) + right_x * half_width, float(y) + right_y * half_width))
+        right_height = float(self.get_terrain_height_m(float(x) - right_x * half_width, float(y) - right_y * half_width))
+        forward_slope = (front_height - rear_height) / max(half_length * 2.0, 1e-6)
+        right_slope = (left_height - right_height) / max(half_width * 2.0, 1e-6)
+        return center_height + float(body_clearance_m), forward_slope, right_slope
+
+    def is_position_valid_for_chassis(self, x, y, angle_deg, body_length_m, body_width_m, body_clearance_m=0.0):
+        self._ensure_raster_layers()
+        half_length, half_width = self._chassis_half_extents_world(body_length_m, body_width_m)
+        if half_length <= 1e-6 or half_width <= 1e-6:
+            return self.is_position_valid_for_radius(x, y, collision_radius=0.0)
+        base_bottom_height, forward_slope, right_slope = self._chassis_bottom_plane_height(x, y, angle_deg, body_length_m, body_width_m, body_clearance_m)
+        height_slop = max(0.02, float(body_clearance_m) * 0.1)
+        for sample_x, sample_y, local_x, local_y in self._chassis_sample_points(x, y, angle_deg, body_length_m, body_width_m):
+            if not (0 <= int(sample_x) < self.map_width and 0 <= int(sample_y) < self.map_height):
+                return False
+            if self._is_hard_blocked_world(sample_x, sample_y):
+                return False
+            sample = self.sample_raster_layers(sample_x, sample_y)
+            terrain_height = float(sample.get('height_m', 0.0))
+            support_height = base_bottom_height + forward_slope * local_x + right_slope * local_y
+            if terrain_height > support_height + height_slop:
+                return False
+        return True
+
+    def is_segment_valid_for_chassis(self, from_x, from_y, to_x, to_y, angle_deg, body_length_m, body_width_m, body_clearance_m=0.0, collision_radius=0.0, sample_stride=None):
+        self._ensure_raster_layers()
+        if not self.is_directionally_passable_segment(from_x, from_y, to_x, to_y, collision_radius=collision_radius, sample_stride=sample_stride):
+            return False
+        distance = math.hypot(float(to_x) - float(from_x), float(to_y) - float(from_y))
+        stride = max(1.0, float(sample_stride or self.terrain_grid_cell_size * 0.35))
+        sample_count = max(1, int(math.ceil(distance / stride)))
+        for sample_index in range(sample_count + 1):
+            ratio = sample_index / max(sample_count, 1)
+            sample_x = float(from_x) + (float(to_x) - float(from_x)) * ratio
+            sample_y = float(from_y) + (float(to_y) - float(from_y)) * ratio
+            if not self.is_position_valid_for_chassis(sample_x, sample_y, angle_deg, body_length_m, body_width_m, body_clearance_m=body_clearance_m):
+                return False
+        return True
+
     def is_position_valid_for_radius(self, x, y, collision_radius=0.0):
         self._ensure_raster_layers()
         if not (0 <= int(x) < self.map_width and 0 <= int(y) < self.map_height):
             return False
-        blocked_code = self.function_pass_mode_by_code['blocked']
         clearance_radius = max(0.0, float(collision_radius))
         center_x, center_y = self._world_to_runtime_cell(x, y)
         radius_cells_x = max(0, int(math.ceil(clearance_radius / max(self.runtime_cell_width_world, 1e-6))))
@@ -3733,9 +4220,7 @@ class MapManager:
         max_x = min(self.runtime_grid_width - 1, center_x + radius_cells_x)
         min_y = max(0, center_y - radius_cells_y)
         max_y = min(self.runtime_grid_height - 1, center_y + radius_cells_y)
-        block_view = self.movement_block_map[min_y:max_y + 1, min_x:max_x + 1] | (
-            self.function_pass_map[min_y:max_y + 1, min_x:max_x + 1] == blocked_code
-        )
+        block_view = self._hard_movement_block_view(min_x, max_x, min_y, max_y)
         if not block_view.any():
             return True
         if clearance_radius <= 1e-6:

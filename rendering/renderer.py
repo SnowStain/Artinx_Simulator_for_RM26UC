@@ -4,11 +4,14 @@
 import math
 import os
 
+import numpy as np
+
 from pygame_compat import pygame
 
 from rendering.renderer_detail_popup_mixin import RendererDetailPopupMixin
 from rendering.renderer_hud_mixin import RendererHudMixin
 from rendering.renderer_sidebar_mixin import RendererSidebarMixin
+from rendering.terrain_scene_backends import _sample_terrain_scene_data, _terrain_scene_look_at, _terrain_scene_perspective_matrix
 from rendering.terrain_overview_mixin import TerrainOverviewMixin
 
 
@@ -43,7 +46,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             self.screen = pygame.display.set_mode((self.window_width, self.window_height), display_flags, vsync=1)
         except TypeError:
             self.screen = pygame.display.set_mode((self.window_width, self.window_height), display_flags)
-        pygame.display.set_caption('RM26 Artinx-Asoul模拟器')
+        pygame.display.set_caption('RM26 ARTINX-Asoul模拟器')
 
         self.toolbar_height = 54
         self.hud_height = 118
@@ -196,13 +199,30 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.terrain_overview_window_open = False
         self.terrain_3d_window_size = (1200, 820)
         self.terrain_3d_render_key = None
+        self.player_terrain_surface_cache = None
+        self.player_terrain_surface_key = None
         self.terrain_3d_last_build_ms = 0
         self.terrain_scene_backend_requested = config.get('simulator', {}).get('terrain_scene_backend', 'auto')
         self.terrain_scene_backend = None
         self.terrain_3d_map_rgb_cache_key = None
         self.terrain_3d_map_rgb_cache = None
-        self.terrain_scene_vertical_exaggeration = float(max(1.0, config.get('simulator', {}).get('terrain_scene_vertical_exaggeration', 5.0)))
-        self.terrain_scene_max_cells = int(max(12000, config.get('simulator', {}).get('terrain_scene_max_cells', 90000)))
+        self.terrain_scene_vertical_exaggeration = 1.0
+        self.terrain_scene_ground_height_scale = 1.0
+        self.terrain_scene_max_cells = int(max(12000, config.get('simulator', {}).get('terrain_scene_max_cells', 64000)))
+        self.player_terrain_scene_max_cells = int(max(6000, config.get('simulator', {}).get('player_terrain_scene_max_cells', 16000)))
+        self.terrain_scene_force_dark_gray = False
+        self.player_control_terrain_dark_gray = bool(config.get('simulator', {}).get('player_control_terrain_dark_gray', True))
+        self.player_camera_mode = str(config.get('simulator', {}).get('player_camera_mode', 'first_person') or 'first_person')
+        if self.player_camera_mode not in {'first_person', 'third_person'}:
+            self.player_camera_mode = 'first_person'
+        self.player_third_person_distance_m = float(config.get('simulator', {}).get('player_third_person_distance_m', 1.85))
+        self.player_third_person_height_m = float(config.get('simulator', {}).get('player_third_person_height_m', 0.58))
+        self.player_view_ray_alpha = int(max(32, min(255, config.get('simulator', {}).get('player_view_ray_alpha', 176))))
+        self.player_terrain_render_scale = float(max(0.35, min(1.0, config.get('simulator', {}).get('player_terrain_render_scale', 0.6))))
+        self.player_motion_terrain_render_scale = float(max(0.35, min(self.player_terrain_render_scale, config.get('simulator', {}).get('player_motion_terrain_render_scale', 0.42))))
+        self.player_camera_motion_threshold_m = float(max(0.005, config.get('simulator', {}).get('player_camera_motion_threshold_m', 0.035)))
+        self._active_player_terrain_render_scale = self.player_terrain_render_scale
+        self._last_player_camera_sample = None
         self.terrain_scene_prewarm_thread = None
         self.terrain_scene_prewarm_key = None
         self.terrain_scene_prewarm_ready_key = None
@@ -238,6 +258,17 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.overlay_status_box_key = None
         self.overlay_status_log_surface = None
         self.overlay_status_log_key = None
+        self.player_purchase_menu_open = False
+        self.player_purchase_amount = 50
+        self.player_settings_menu_open = False
+        self.pre_match_config_menu_open = False
+        self.player_mouse_captured = False
+        self.terrain_scene_camera_override = None
+        self.standalone_3d_program = bool(config.get('simulator', {}).get('standalone_3d_program', False))
+        self.standalone_3d_state = 'main_menu' if self.standalone_3d_program else None
+        self.standalone_3d_selected_team = 'red'
+        self.standalone_3d_selected_entity_id = config.get('simulator', {}).get('standalone_3d_selected_entity_id', 'red_robot_1')
+        self.standalone_3d_ricochet_enabled = bool(config.get('simulator', {}).get('player_projectile_ricochet_enabled', True))
 
         self.colors = {
             'bg': (231, 233, 237),
@@ -306,6 +337,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.aim_fov_overlay_cache_key = None
         self.terrain_3d_texture = None
         self.terrain_3d_render_key = None
+        self.player_terrain_surface_cache = None
+        self.player_terrain_surface_key = None
 
     def _create_font(self, size):
         candidates = [
@@ -399,8 +432,24 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.hud_actions = []
         self.panel_actions = []
 
+        if self.standalone_3d_program:
+            if self.standalone_3d_state != 'in_match':
+                self._sync_player_mouse_capture(False)
+                self._render_standalone_program(game_engine)
+                pygame.display.flip()
+                return
+            self.render_player_simulator(game_engine, top_offset=0, hud_top=0, draw_match_hud=True)
+            pygame.display.flip()
+            return
+
         self._update_viewport(game_engine.map_manager)
         self.render_toolbar(game_engine)
+        if game_engine.player_control_enabled and game_engine.get_player_controlled_entity() is not None:
+            self.render_player_simulator(game_engine, draw_match_hud=True)
+            self.render_perf_overlay(game_engine)
+            pygame.display.flip()
+            return
+        self._sync_player_mouse_capture(False)
         self.render_match_hud(game_engine)
         previous_clip = self.screen.get_clip()
         map_clip_rect = self._visible_map_clip_rect()
@@ -410,6 +459,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.render_aim_fov(game_engine)
         if self.show_entities:
             self.render_entities(game_engine.entity_manager.entities)
+        if self._collision_overlay_active():
+            self.render_collision_boxes(game_engine.entity_manager.entities)
         self.screen.set_clip(previous_clip)
         self.render_region_hover_hint(game_engine.map_manager)
         self.render_overlay_status(game_engine)
@@ -418,6 +469,1404 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.render_perf_overlay(game_engine)
         self.render_terrain_3d_window(game_engine)
         pygame.display.flip()
+
+    def _standalone_control_candidate_ids(self):
+        return ('red_robot_1', 'red_robot_3', 'red_robot_4', 'blue_robot_1', 'blue_robot_3', 'blue_robot_4')
+
+    def _standalone_control_candidates(self, game_engine, team=None):
+        entity_map = {entity.id: entity for entity in getattr(game_engine.entity_manager, 'entities', [])}
+        candidates = []
+        for entity_id in self._standalone_control_candidate_ids():
+            entity = entity_map.get(entity_id)
+            if entity is None or not entity.is_alive():
+                continue
+            if team is not None and entity.team != team:
+                continue
+            candidates.append(entity)
+        return candidates
+
+    def _ensure_standalone_selection(self, game_engine):
+        candidates = self._standalone_control_candidates(game_engine, self.standalone_3d_selected_team)
+        if candidates and self.standalone_3d_selected_entity_id not in {entity.id for entity in candidates}:
+            self.standalone_3d_selected_entity_id = candidates[0].id
+        elif not candidates:
+            all_candidates = self._standalone_control_candidates(game_engine)
+            self.standalone_3d_selected_entity_id = all_candidates[0].id if all_candidates else None
+
+    def _render_standalone_program(self, game_engine):
+        self._ensure_standalone_selection(game_engine)
+        background = pygame.Surface((self.window_width, self.window_height))
+        background.fill((12, 16, 22))
+        pygame.draw.circle(background, (26, 36, 48), (self.window_width // 2, self.window_height // 3), int(self.window_width * 0.33))
+        pygame.draw.circle(background, (18, 24, 32), (self.window_width // 4, self.window_height // 2), int(self.window_width * 0.18))
+        pygame.draw.circle(background, (18, 28, 38), (self.window_width * 3 // 4, self.window_height // 2), int(self.window_width * 0.22))
+        self.screen.blit(background, (0, 0))
+        if self.standalone_3d_state == 'main_menu':
+            self._render_standalone_main_menu(game_engine)
+        else:
+            self._render_standalone_prematch_menu(game_engine)
+
+    def _render_standalone_main_menu(self, game_engine):
+        title = self.hud_big_font.render('3D 对局模拟器', True, self.colors['white'])
+        subtitle = self.small_font.render('独立程序模式', True, (198, 204, 212))
+        self.screen.blit(title, title.get_rect(center=(self.window_width // 2, 154)))
+        self.screen.blit(subtitle, subtitle.get_rect(center=(self.window_width // 2, 190)))
+
+        panel_rect = pygame.Rect(0, 0, 420, 250)
+        panel_rect.center = (self.window_width // 2, self.window_height // 2 + 40)
+        pygame.draw.rect(self.screen, (28, 34, 42), panel_rect, border_radius=24)
+        pygame.draw.rect(self.screen, self.colors['panel_border'], panel_rect, 1, border_radius=24)
+
+        lines = [
+            '开始对局后，可在赛前选择可控机器人。',
+            '当前支持红/蓝 1、3、4 进入手控第一视角。',
+        ]
+        draw_y = panel_rect.y + 42
+        for line in lines:
+            rendered = self.small_font.render(line, True, (220, 225, 232))
+            self.screen.blit(rendered, rendered.get_rect(center=(panel_rect.centerx, draw_y)))
+            draw_y += 30
+
+        start_rect = pygame.Rect(panel_rect.x + 60, panel_rect.bottom - 136, panel_rect.width - 120, 42)
+        settings_rect = pygame.Rect(panel_rect.x + 60, panel_rect.bottom - 86, panel_rect.width - 120, 34)
+        exit_rect = pygame.Rect(panel_rect.x + 60, panel_rect.bottom - 44, panel_rect.width - 120, 34)
+        pygame.draw.rect(self.screen, self.colors['toolbar_button_active'], start_rect, border_radius=12)
+        pygame.draw.rect(self.screen, (86, 96, 108), settings_rect, border_radius=10)
+        pygame.draw.rect(self.screen, (64, 72, 84), exit_rect, border_radius=10)
+        self.screen.blit(self.small_font.render('开始对局', True, self.colors['white']), self.small_font.render('开始对局', True, self.colors['white']).get_rect(center=start_rect.center))
+        self.screen.blit(self.small_font.render('设置', True, self.colors['white']), self.small_font.render('设置', True, self.colors['white']).get_rect(center=settings_rect.center))
+        self.screen.blit(self.small_font.render('退出程序', True, self.colors['white']), self.small_font.render('退出程序', True, self.colors['white']).get_rect(center=exit_rect.center))
+        self.panel_actions.append((start_rect, 'standalone_open_lobby'))
+        self.panel_actions.append((settings_rect, 'toggle_player_settings'))
+        self.panel_actions.append((exit_rect, 'standalone_exit'))
+        if self.player_settings_menu_open:
+            self._render_player_settings_menu(game_engine, self.screen.get_rect())
+
+    def _render_standalone_prematch_menu(self, game_engine):
+        title = self.hud_mid_font.render('赛前选择', True, self.colors['white'])
+        self.screen.blit(title, title.get_rect(center=(self.window_width // 2, 70)))
+
+        panel_rect = pygame.Rect(0, 0, 760, 420)
+        panel_rect.center = (self.window_width // 2, self.window_height // 2 + 20)
+        pygame.draw.rect(self.screen, (28, 34, 42), panel_rect, border_radius=24)
+        pygame.draw.rect(self.screen, self.colors['panel_border'], panel_rect, 1, border_radius=24)
+
+        team_y = panel_rect.y + 34
+        for index, team in enumerate(('red', 'blue')):
+            rect = pygame.Rect(panel_rect.x + 40 + index * 124, team_y, 104, 34)
+            active = self.standalone_3d_selected_team == team
+            color = self.colors['red'] if team == 'red' and active else self.colors['blue'] if team == 'blue' and active else (68, 76, 88)
+            pygame.draw.rect(self.screen, color, rect, border_radius=10)
+            label = '红方' if team == 'red' else '蓝方'
+            rendered = self.small_font.render(label, True, self.colors['white'])
+            self.screen.blit(rendered, rendered.get_rect(center=rect.center))
+            self.panel_actions.append((rect, f'standalone_team:{team}'))
+
+        card_y = panel_rect.y + 94
+        candidates = self._standalone_control_candidates(game_engine, self.standalone_3d_selected_team)
+        for index, entity in enumerate(candidates):
+            card_rect = pygame.Rect(panel_rect.x + 42 + (index % 3) * 220, card_y + (index // 3) * 108, 190, 82)
+            active = entity.id == self.standalone_3d_selected_entity_id
+            pygame.draw.rect(self.screen, (42, 48, 58), card_rect, border_radius=14)
+            pygame.draw.rect(self.screen, self.colors['yellow'] if active else self.colors['panel_border'], card_rect, 2 if active else 1, border_radius=14)
+            title = self.small_font.render(entity.display_name, True, self.colors['white'])
+            subtitle = self.tiny_font.render(f'{"红方" if entity.team == "red" else "蓝方"} {getattr(entity, "robot_type", "")}', True, (198, 204, 212))
+            self.screen.blit(title, (card_rect.x + 14, card_rect.y + 14))
+            self.screen.blit(subtitle, (card_rect.x + 14, card_rect.y + 40))
+            self.panel_actions.append((card_rect, f'standalone_pick:{entity.id}'))
+
+        ricochet_rect = pygame.Rect(panel_rect.x + 42, panel_rect.bottom - 100, 260, 42)
+        settings_rect = pygame.Rect(panel_rect.x + 42, panel_rect.bottom - 52, 136, 34)
+        back_rect = pygame.Rect(panel_rect.right - 348, panel_rect.bottom - 52, 136, 34)
+        confirm_rect = pygame.Rect(panel_rect.right - 194, panel_rect.bottom - 58, 152, 42)
+        pygame.draw.rect(self.screen, self.colors['toolbar_button_active'] if self.standalone_3d_ricochet_enabled else self.colors['toolbar_button'], ricochet_rect, border_radius=12)
+        pygame.draw.rect(self.screen, (70, 76, 88), settings_rect, border_radius=10)
+        pygame.draw.rect(self.screen, (70, 76, 88), back_rect, border_radius=10)
+        pygame.draw.rect(self.screen, self.colors['toolbar_button_active'], confirm_rect, border_radius=12)
+        ricochet_label = '弹丸碰障碍反弹: 开' if self.standalone_3d_ricochet_enabled else '弹丸碰障碍反弹: 关'
+        self.screen.blit(self.small_font.render(ricochet_label, True, self.colors['white']), self.small_font.render(ricochet_label, True, self.colors['white']).get_rect(center=ricochet_rect.center))
+        self.screen.blit(self.small_font.render('设置', True, self.colors['white']), self.small_font.render('设置', True, self.colors['white']).get_rect(center=settings_rect.center))
+        self.screen.blit(self.small_font.render('返回', True, self.colors['white']), self.small_font.render('返回', True, self.colors['white']).get_rect(center=back_rect.center))
+        self.screen.blit(self.small_font.render('确认开始', True, self.colors['white']), self.small_font.render('确认开始', True, self.colors['white']).get_rect(center=confirm_rect.center))
+        self.panel_actions.append((ricochet_rect, 'standalone_toggle_ricochet'))
+        self.panel_actions.append((settings_rect, 'toggle_player_settings'))
+        self.panel_actions.append((back_rect, 'standalone_back_main'))
+        self.panel_actions.append((confirm_rect, 'standalone_confirm_start'))
+        if self.player_settings_menu_open:
+            self._render_player_settings_menu(game_engine, self.screen.get_rect())
+
+    def _sync_player_mouse_capture(self, active):
+        desired = bool(active)
+        if self.player_mouse_captured == desired:
+            return
+        self.player_mouse_captured = desired
+        try:
+            pygame.event.set_grab(desired)
+        except Exception:
+            pass
+        try:
+            pygame.mouse.set_visible(not desired)
+        except Exception:
+            pass
+
+    def _player_control_candidate_id(self, game_engine):
+        entities = list(game_engine.entity_manager.entities)
+        if self.selected_hud_entity_id:
+            for entity in entities:
+                if entity.id == self.selected_hud_entity_id and entity.is_alive() and entity.type in {'robot', 'sentry'}:
+                    return entity.id
+        for preferred_id in ('red_robot_3',):
+            for entity in entities:
+                if entity.id == preferred_id and entity.is_alive() and entity.type in {'robot', 'sentry'}:
+                    return entity.id
+        focus_id = game_engine.get_single_unit_test_focus_entity_id()
+        if focus_id:
+            return focus_id
+        for entity in entities:
+            if entity.is_alive() and entity.team == 'red' and entity.type == 'robot':
+                return entity.id
+        for entity in entities:
+            if entity.is_alive() and entity.type in {'robot', 'sentry'}:
+                return entity.id
+        return None
+
+    def _world_to_scene_point(self, map_manager, sample_data, world_x, world_y, height_m):
+        scene_step = max(1, int(sample_data.get('scene_step', 1)))
+        sampled_cell_size = max(float(map_manager.terrain_grid_cell_size) * scene_step, 1e-6)
+        effective_height = self._meters_to_world_units(map_manager, float(height_m)) / sampled_cell_size
+        return np.array([
+            float(world_x) / sampled_cell_size - float(sample_data['grid_width']) * 0.5,
+            effective_height,
+            float(world_y) / sampled_cell_size - float(sample_data['grid_height']) * 0.5,
+            1.0,
+        ], dtype='f4')
+
+    def _entity_vertical_scale(self, entity):
+        return 1.0
+
+    def _terrain_editor_display_height(self, value):
+        return float(value)
+
+    def _terrain_editor_storage_height(self, value):
+        return float(value)
+
+    def _effective_terrain_scene_max_cells(self):
+        if getattr(self, 'terrain_scene_camera_override', None) is not None or bool(getattr(self, '_building_player_camera_override', False)):
+            return max(6000, min(int(self.terrain_scene_max_cells), int(self.player_terrain_scene_max_cells)))
+        return int(self.terrain_scene_max_cells)
+
+    def _meters_to_world_units(self, map_manager, meters):
+        if map_manager is None:
+            return float(meters)
+        return float(map_manager.meters_to_world_units(float(meters)))
+
+    def _build_player_camera_override(self, game_engine, rect):
+        entity = game_engine.get_player_controlled_entity()
+        if entity is None:
+            return None
+        map_manager = game_engine.map_manager
+        map_rgb = self._get_terrain_3d_map_rgb(map_manager)
+        self._building_player_camera_override = True
+        try:
+            sample_data = _sample_terrain_scene_data(self, map_manager, map_rgb)
+        finally:
+            self._building_player_camera_override = False
+        base_height_m = float(getattr(entity, 'position', {}).get('z', map_manager.get_terrain_height_m(entity.position['x'], entity.position['y'])))
+        yaw_rad = math.radians(float(getattr(entity, 'turret_angle', entity.angle)))
+        pitch_rad = math.radians(float(getattr(entity, 'gimbal_pitch_deg', 0.0)))
+        anchor_height_m = base_height_m + float(getattr(entity, 'gimbal_height_m', 0.50)) * self._entity_vertical_scale(entity)
+        direction = np.array([
+            math.cos(pitch_rad) * math.cos(yaw_rad),
+            math.sin(pitch_rad),
+            math.cos(pitch_rad) * math.sin(yaw_rad),
+        ], dtype='f4')
+        world_target = np.array([
+            float(entity.position['x']),
+            float(entity.position['y']),
+            anchor_height_m,
+        ], dtype='f4') + direction * max(6.0, float(sample_data['grid_width']) * 0.12)
+        if self.player_camera_mode == 'third_person':
+            backward = np.array([math.cos(yaw_rad), 0.0, math.sin(yaw_rad)], dtype='f4')
+            world_eye = self._resolve_third_person_camera_eye(
+                map_manager,
+                float(entity.position['x']),
+                float(entity.position['y']),
+                anchor_height_m,
+                backward,
+            )
+        else:
+            world_eye = np.array([
+                float(entity.position['x']),
+                float(entity.position['y']),
+                anchor_height_m,
+            ], dtype='f4')
+        eye = self._world_to_scene_point(map_manager, sample_data, world_eye[0], world_eye[1], world_eye[2])[:3]
+        target = self._world_to_scene_point(map_manager, sample_data, world_target[0], world_target[1], world_target[2])[:3]
+        projection = _terrain_scene_perspective_matrix(math.radians(76.0), rect.width / max(rect.height, 1), 0.05, 280.0)
+        view = _terrain_scene_look_at(eye, target, np.array([0.0, 1.0, 0.0], dtype='f4'))
+        return {
+            'mvp': projection @ view,
+            'projection': projection,
+            'view': view,
+            'eye': eye,
+            'target': target,
+            'world_eye': (float(world_eye[0]), float(world_eye[1]), float(world_eye[2])),
+            'world_target': (float(world_target[0]), float(world_target[1]), float(world_target[2])),
+            'world_direction': (float(direction[0]), float(direction[1]), float(direction[2])),
+            'camera_mode': self.player_camera_mode,
+            'sample_data': sample_data,
+        }
+
+    def _player_terrain_surface_cache_key(self, game_engine, rect):
+        camera_state = getattr(self, 'terrain_scene_camera_override', None)
+        if not isinstance(camera_state, dict):
+            return None
+        map_manager = game_engine.map_manager
+        world_eye = tuple(round(float(value), 2) for value in camera_state.get('world_eye', (0.0, 0.0, 0.0)))
+        world_target = tuple(round(float(value), 2) for value in camera_state.get('world_target', (0.0, 0.0, 0.0)))
+        return (
+            'player_view',
+            getattr(self._get_terrain_scene_backend(), 'name', 'software'),
+            int(getattr(map_manager, 'raster_version', 0)),
+            int(rect.width),
+            int(rect.height),
+            round(float(getattr(self, '_active_player_terrain_render_scale', getattr(self, 'player_terrain_render_scale', 0.6))), 3),
+            bool(getattr(self, 'terrain_scene_force_dark_gray', False)),
+            str(camera_state.get('camera_mode', 'first_person')),
+            world_eye,
+            world_target,
+        )
+
+    def _collision_overlay_active(self):
+        try:
+            keys = pygame.key.get_pressed()
+        except Exception:
+            return False
+        return bool(keys[pygame.K_F3])
+
+    def _player_camera_motion_metric_m(self, map_manager, camera_state):
+        if not isinstance(camera_state, dict):
+            self._last_player_camera_sample = None
+            return 0.0
+        world_eye = camera_state.get('world_eye')
+        world_target = camera_state.get('world_target')
+        if world_eye is None or world_target is None:
+            self._last_player_camera_sample = None
+            return 0.0
+        current_sample = (
+            (float(world_eye[0]), float(world_eye[1]), float(world_eye[2])),
+            (float(world_target[0]), float(world_target[1]), float(world_target[2])),
+        )
+        previous_sample = self._last_player_camera_sample
+        self._last_player_camera_sample = current_sample
+        if previous_sample is None:
+            return 0.0
+        meters_per_world_unit = 1.0 / max(float(map_manager.meters_to_world_units(1.0)), 1e-6)
+
+        def distance_m(current_point, previous_point):
+            delta_x_m = (float(current_point[0]) - float(previous_point[0])) * meters_per_world_unit
+            delta_y_m = (float(current_point[1]) - float(previous_point[1])) * meters_per_world_unit
+            delta_z_m = float(current_point[2]) - float(previous_point[2])
+            return math.sqrt(delta_x_m * delta_x_m + delta_y_m * delta_y_m + delta_z_m * delta_z_m)
+
+        return max(
+            distance_m(current_sample[0], previous_sample[0]),
+            distance_m(current_sample[1], previous_sample[1]),
+        )
+
+    def _entity_collision_polygon_world(self, entity, map_manager):
+        half_length = max(0.0, float(map_manager.meters_to_world_units(float(getattr(entity, 'body_length_m', getattr(entity, 'body_size_m', 0.42))) * 0.5)))
+        half_width = max(0.0, float(map_manager.meters_to_world_units(float(getattr(entity, 'body_width_m', getattr(entity, 'body_size_m', 0.42))) * 0.5)))
+        angle_rad = math.radians(float(getattr(entity, 'angle', 0.0)))
+        heading_x = math.cos(angle_rad)
+        heading_y = math.sin(angle_rad)
+        right_x = -heading_y
+        right_y = heading_x
+        center_x = float(entity.position['x'])
+        center_y = float(entity.position['y'])
+        return [
+            (center_x + heading_x * half_length - right_x * half_width, center_y + heading_y * half_length - right_y * half_width),
+            (center_x + heading_x * half_length + right_x * half_width, center_y + heading_y * half_length + right_y * half_width),
+            (center_x - heading_x * half_length + right_x * half_width, center_y - heading_y * half_length + right_y * half_width),
+            (center_x - heading_x * half_length - right_x * half_width, center_y - heading_y * half_length - right_y * half_width),
+        ]
+
+    def render_collision_boxes(self, entities):
+        if self.viewport is None:
+            return
+        map_manager = getattr(self.game_engine, 'map_manager', None)
+        if map_manager is None:
+            return
+        overlay = pygame.Surface((self.window_width, self.window_height), pygame.SRCALPHA)
+        for entity in entities:
+            if not entity.is_alive() or entity.type not in {'robot', 'sentry'}:
+                continue
+            world_polygon = self._entity_collision_polygon_world(entity, map_manager)
+            polygon = [self.world_to_screen(point[0], point[1]) for point in world_polygon]
+            if any(point is None for point in polygon):
+                continue
+            color_rgb = (255, 104, 104) if entity.team == 'red' else (102, 182, 255)
+            fill_color = (*color_rgb, 34)
+            outline_color = (*color_rgb, 214)
+            pygame.draw.polygon(overlay, fill_color, polygon)
+            pygame.draw.polygon(overlay, outline_color, polygon, 2)
+            center = self.world_to_screen(entity.position['x'], entity.position['y'])
+            radius_px = max(4, int(float(getattr(entity, 'collision_radius', 0.0)) * float(self.viewport['scale'])))
+            pygame.draw.circle(overlay, (*color_rgb, 156), center, radius_px, 1)
+            pygame.draw.line(overlay, outline_color, polygon[0], polygon[1], 3)
+        self.screen.blit(overlay, (0, 0))
+
+    def _project_entity_collision_box_edges(self, entity, map_manager, sample_data, camera_state, rect):
+        terrain_height = float(map_manager.get_terrain_height_m(entity.position['x'], entity.position['y']))
+        base_height = float(getattr(entity, 'position', {}).get('z', terrain_height))
+        vertical_scale = self._entity_vertical_scale(entity)
+        body_length_half = self._meters_to_world_units(map_manager, float(getattr(entity, 'body_length_m', getattr(entity, 'body_size_m', 0.42))) * 0.5)
+        body_width_half = self._meters_to_world_units(map_manager, float(getattr(entity, 'body_width_m', getattr(entity, 'body_size_m', 0.42))) * 0.5)
+        body_bottom = base_height + float(getattr(entity, 'body_clearance_m', 0.10)) * vertical_scale
+        body_top = body_bottom + float(getattr(entity, 'body_height_m', 0.18)) * vertical_scale
+        center_scene, forward_basis, right_basis, up_basis = self._entity_scene_axes(entity, map_manager, sample_data, base_height)
+
+        def project_corner(local_x, local_y, height_m):
+            scene_xyz = center_scene + forward_basis * float(local_x) + right_basis * float(local_y) + up_basis * (float(height_m) - base_height)
+            projected = self._project_scene_point(np.array([scene_xyz[0], scene_xyz[1], scene_xyz[2], 1.0], dtype='f4'), camera_state, rect)
+            if projected is None:
+                return None
+            return (int(projected[0] - rect.x), int(projected[1] - rect.y))
+
+        local_points = [
+            (-body_length_half, -body_width_half),
+            (body_length_half, -body_width_half),
+            (body_length_half, body_width_half),
+            (-body_length_half, body_width_half),
+        ]
+        corners = []
+        for height in (body_bottom, body_top):
+            for local_x, local_y in local_points:
+                corners.append(project_corner(local_x, local_y, height))
+        if any(point is None for point in corners):
+            return []
+        edge_indices = (
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        )
+        return [(corners[start], corners[end]) for start, end in edge_indices]
+
+    def _render_player_collision_boxes(self, game_engine, rect, camera_state):
+        map_manager = game_engine.map_manager
+        sample_data = camera_state.get('sample_data') or {}
+        overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
+        for entity in game_engine.entity_manager.entities:
+            if not entity.is_alive() or entity.type not in {'robot', 'sentry'}:
+                continue
+            if not self._entity_visible_from_camera(entity, map_manager, camera_state):
+                continue
+            edges = self._project_entity_collision_box_edges(entity, map_manager, sample_data, camera_state, rect)
+            if not edges:
+                continue
+            color_rgb = (255, 110, 110) if entity.team == 'red' else (112, 188, 255)
+            for start, end in edges:
+                pygame.draw.line(overlay, (*color_rgb, 220), start, end, 2)
+        self.screen.blit(overlay, rect.topleft)
+
+    def _resolve_third_person_camera_eye(self, map_manager, anchor_x, anchor_y, anchor_height_m, backward):
+        anchor_point = np.array([
+            float(anchor_x),
+            float(anchor_y),
+            float(anchor_height_m),
+        ], dtype='f4')
+        desired_distance = float(map_manager.meters_to_world_units(self.player_third_person_distance_m))
+        step_distance = max(2.0, float(map_manager.meters_to_world_units(0.35)))
+        extra_height = float(self.player_third_person_height_m)
+        direction = np.array(backward, dtype='f4')
+        direction_norm = float(np.linalg.norm(direction))
+        if direction_norm <= 1e-6:
+            direction = np.array([1.0, 0.0, 0.0], dtype='f4')
+        else:
+            direction = direction / direction_norm
+        distance = desired_distance
+        while distance >= 0.0:
+            candidate = np.array([
+                anchor_point[0] - direction[0] * distance,
+                anchor_point[1] - direction[2] * distance,
+                anchor_point[2] + extra_height,
+            ], dtype='f4')
+            sample = map_manager.sample_raster_layers(float(candidate[0]), float(candidate[1]))
+            if sample.get('terrain_type') != 'boundary':
+                candidate[2] = max(candidate[2], float(sample.get('height_m', 0.0)) + 0.12)
+                if map_manager.is_terrain_line_clear_3d(candidate, anchor_point, clearance_m=0.04):
+                    return candidate
+            distance -= step_distance
+        fallback = np.array([
+            anchor_point[0],
+            anchor_point[1],
+            anchor_point[2] + extra_height,
+        ], dtype='f4')
+        fallback[2] = max(fallback[2], float(map_manager.get_terrain_height_m(fallback[0], fallback[1])) + 0.12)
+        return fallback
+
+    def _camera_visibility_points(self, entity, map_manager):
+        base_height = float(getattr(entity, 'position', {}).get('z', map_manager.get_terrain_height_m(entity.position['x'], entity.position['y'])))
+        vertical_scale = self._entity_vertical_scale(entity)
+        body_mid = base_height + (float(getattr(entity, 'body_clearance_m', 0.10)) + float(getattr(entity, 'body_height_m', 0.18)) * 0.55) * vertical_scale
+        turret_mid = base_height + float(getattr(entity, 'gimbal_height_m', 0.50)) * vertical_scale
+        half_length = self._meters_to_world_units(map_manager, float(getattr(entity, 'body_length_m', getattr(entity, 'body_size_m', 0.42))) * 0.5)
+        half_width = self._meters_to_world_units(map_manager, float(getattr(entity, 'body_width_m', getattr(entity, 'body_size_m', 0.42))) * 0.5)
+        yaw_rad = math.radians(float(getattr(entity, 'angle', 0.0)))
+        forward_x = math.cos(yaw_rad)
+        forward_y = math.sin(yaw_rad)
+        right_x = -forward_y
+        right_y = forward_x
+        chassis_points = []
+        for length_sign in (-1.0, 1.0):
+            for width_sign in (-1.0, 1.0):
+                chassis_points.append((
+                    float(entity.position['x']) + forward_x * half_length * length_sign + right_x * half_width * width_sign,
+                    float(entity.position['y']) + forward_y * half_length * length_sign + right_y * half_width * width_sign,
+                    body_mid,
+                ))
+        chassis_points.append((float(entity.position['x']), float(entity.position['y']), body_mid))
+        chassis_points.append((float(entity.position['x']), float(entity.position['y']), turret_mid))
+        return tuple(chassis_points)
+
+    def _entity_visible_from_camera(self, entity, map_manager, camera_state):
+        world_eye = camera_state.get('world_eye') if isinstance(camera_state, dict) else None
+        if world_eye is None:
+            return True
+        for point in self._camera_visibility_points(entity, map_manager):
+            if map_manager.is_terrain_line_clear_3d(world_eye, point, clearance_m=0.03):
+                return True
+        return False
+
+    def _resolve_player_view_aim_state(self, game_engine, camera_state):
+        if not isinstance(camera_state, dict):
+            return None
+        world_eye = camera_state.get('world_eye')
+        world_direction = camera_state.get('world_direction')
+        entity = game_engine.get_player_controlled_entity()
+        if world_eye is None or world_direction is None or entity is None:
+            return None
+        map_manager = game_engine.map_manager
+        max_range = float(game_engine.rules_engine.get_range(getattr(entity, 'type', 'robot')))
+        step_world = max(2.0, float(map_manager.meters_to_world_units(0.20)))
+        direction = np.array(world_direction, dtype='f4')
+        direction = direction / max(float(np.linalg.norm(direction)), 1e-6)
+        last_point = np.array(world_eye, dtype='f4')
+        path_points = [tuple(float(value) for value in last_point)]
+        traveled = 0.0
+        while traveled < max_range:
+            travel = min(step_world, max_range - traveled)
+            current = last_point + direction * travel
+            sample = map_manager.sample_raster_layers(float(current[0]), float(current[1]))
+            if sample.get('terrain_type') == 'boundary':
+                break
+            blocking_height = float(sample.get('height_m', 0.0))
+            if bool(sample.get('vision_blocked', False)):
+                blocking_height = max(blocking_height, float(sample.get('vision_block_height_m', 0.0)))
+            if float(current[2]) <= blocking_height + 0.02:
+                current[2] = blocking_height + 0.02
+                path_points.append((float(current[0]), float(current[1]), float(current[2])))
+                last_point = current
+                break
+            path_points.append((float(current[0]), float(current[1]), float(current[2])))
+            last_point = current
+            traveled += travel
+        return {
+            'x': float(last_point[0]),
+            'y': float(last_point[1]),
+            'z': float(last_point[2]),
+            'origin_x': float(world_eye[0]),
+            'origin_y': float(world_eye[1]),
+            'origin_z': float(world_eye[2]),
+            'path_points': tuple(path_points),
+            'camera_mode': str(camera_state.get('camera_mode', 'first_person')),
+        }
+
+    def _render_player_view_ray(self, rect, camera_state, view_aim_state, map_manager, sample_data):
+        if not isinstance(view_aim_state, dict):
+            return
+        trace_points = view_aim_state.get('path_points')
+        if not isinstance(trace_points, (list, tuple)) or len(trace_points) < 2:
+            return
+        polyline, _ = self._project_trace_polyline(trace_points, map_manager, sample_data, camera_state, rect)
+        if len(polyline) < 2:
+            return
+        overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
+        glow = (255, 212, 112, max(56, self.player_view_ray_alpha // 2))
+        ray = (255, 244, 184, self.player_view_ray_alpha)
+        pygame.draw.lines(overlay, glow, False, polyline, 4)
+        pygame.draw.lines(overlay, ray, False, polyline, 2)
+        pygame.draw.circle(overlay, glow, polyline[-1], 6)
+        pygame.draw.circle(overlay, ray, polyline[-1], 3)
+        self.screen.blit(overlay, rect.topleft)
+
+    def _project_scene_point(self, point4, camera_state, rect):
+        clip = camera_state['mvp'] @ point4
+        w = float(clip[3])
+        if w <= 1e-5:
+            return None
+        ndc = clip[:3] / w
+        if ndc[2] < -1.2 or ndc[2] > 1.2:
+            return None
+        screen_x = rect.x + int((float(ndc[0]) * 0.5 + 0.5) * rect.width)
+        screen_y = rect.y + int((1.0 - (float(ndc[1]) * 0.5 + 0.5)) * rect.height)
+        return (screen_x, screen_y, float(ndc[2]))
+
+    def _append_box_faces(self, faces, corners, color):
+        face_indices = (
+            (0, 1, 2, 3),
+            (4, 5, 6, 7),
+            (0, 1, 5, 4),
+            (2, 3, 7, 6),
+            (1, 2, 6, 5),
+            (0, 3, 7, 4),
+        )
+        shades = (0.95, 0.55, 0.70, 0.66, 0.80, 0.62)
+        for indices, shade in zip(face_indices, shades):
+            pts = [corners[index] for index in indices]
+            if any(point is None for point in pts):
+                continue
+            polygon = [(point[0], point[1]) for point in pts]
+            depth = sum(point[2] for point in pts) / len(pts)
+            face_color = tuple(max(0, min(255, int(channel * shade))) for channel in color)
+            faces.append((depth, polygon, face_color))
+
+    def _trace_path_points(self, trace, map_manager):
+        path_points = trace.get('path_points')
+        if isinstance(path_points, (list, tuple)) and len(path_points) >= 2:
+            return [(float(point[0]), float(point[1]), float(point[2])) for point in path_points if point is not None and len(point) >= 3]
+        start = trace.get('start')
+        end = trace.get('end')
+        if start is None or end is None:
+            return []
+        start_height_m = float(trace.get('start_height_m', float(map_manager.get_terrain_height_m(float(start[0]), float(start[1]))) + 0.50))
+        end_height_m = float(trace.get('end_height_m', float(map_manager.get_terrain_height_m(float(end[0]), float(end[1]))) + 0.32))
+        return [
+            (float(start[0]), float(start[1]), start_height_m),
+            (float(end[0]), float(end[1]), end_height_m),
+        ]
+
+    def _trace_point_at_progress(self, points, progress):
+        if len(points) < 2:
+            return None
+        progress = max(0.0, min(1.0, float(progress)))
+        game_engine = getattr(self, 'game_engine', None)
+        map_manager = getattr(game_engine, 'map_manager', None)
+        meters_per_world_unit = 1.0
+        if map_manager is not None and hasattr(map_manager, 'meters_to_world_units'):
+            meters_per_world_unit = 1.0 / max(float(map_manager.meters_to_world_units(1.0)), 1e-6)
+        segment_lengths = []
+        total_length = 0.0
+        for start, end in zip(points, points[1:]):
+            seg_len = math.sqrt(
+                ((end[0] - start[0]) * meters_per_world_unit) ** 2
+                + ((end[1] - start[1]) * meters_per_world_unit) ** 2
+                + (end[2] - start[2]) ** 2
+            )
+            segment_lengths.append(seg_len)
+            total_length += seg_len
+        if total_length <= 1e-6:
+            return points[-1]
+        remaining = total_length * progress
+        for index, seg_len in enumerate(segment_lengths):
+            start = points[index]
+            end = points[index + 1]
+            if remaining <= seg_len or index == len(segment_lengths) - 1:
+                ratio = 0.0 if seg_len <= 1e-6 else remaining / seg_len
+                return (
+                    start[0] + (end[0] - start[0]) * ratio,
+                    start[1] + (end[1] - start[1]) * ratio,
+                    start[2] + (end[2] - start[2]) * ratio,
+                )
+            remaining -= seg_len
+        return points[-1]
+
+    def _project_trace_polyline(self, trace_points, map_manager, sample_data, camera_state, rect):
+        projected_points = []
+        max_depth = None
+        sample_count = max(12, min(48, len(trace_points) * 2))
+        previous_point = None
+        for sample_index in range(sample_count + 1):
+            progress = sample_index / max(sample_count, 1)
+            world_point = self._trace_point_at_progress(trace_points, progress)
+            if world_point is None:
+                continue
+            scene_point = self._world_to_scene_point(map_manager, sample_data, world_point[0], world_point[1], world_point[2])
+            projected = self._project_scene_point(scene_point, camera_state, rect)
+            if projected is None:
+                previous_point = None
+                continue
+            screen_point = (int(projected[0] - rect.x), int(projected[1] - rect.y))
+            if previous_point != screen_point:
+                projected_points.append(screen_point)
+            previous_point = screen_point
+            max_depth = projected[2] if max_depth is None else max(max_depth, projected[2])
+        return projected_points, max_depth
+
+    def _entity_scene_axes(self, entity, map_manager, sample_data, base_height):
+        scene_step = max(1, int(sample_data.get('scene_step', 1)))
+        sampled_cell_size = max(float(map_manager.terrain_grid_cell_size) * scene_step, 1e-6)
+        terrain_height = float(map_manager.get_terrain_height_m(entity.position['x'], entity.position['y']))
+        body_length_half = self._meters_to_world_units(map_manager, float(getattr(entity, 'body_length_m', getattr(entity, 'body_size_m', 0.42))) * 0.5)
+        body_width_half = self._meters_to_world_units(map_manager, float(getattr(entity, 'body_width_m', getattr(entity, 'body_size_m', 0.42))) * 0.5)
+        yaw_rad = math.radians(float(getattr(entity, 'angle', 0.0)))
+        center_scene = self._world_to_scene_point(map_manager, sample_data, entity.position['x'], entity.position['y'], base_height)[:3]
+        up_basis = self._world_to_scene_point(map_manager, sample_data, entity.position['x'], entity.position['y'], base_height + 1.0)[:3] - center_scene
+        if np.linalg.norm(up_basis) <= 1e-6:
+            up_basis = np.array([0.0, 0.82, 0.0], dtype='f4')
+
+        airborne = (
+            float(base_height - terrain_height) > 0.03
+            or float(getattr(entity, 'jump_airborne_height_m', 0.0)) > 1e-3
+            or float(getattr(entity, 'fly_slope_airborne_height_m', 0.0)) > 1e-3
+        )
+        if airborne:
+            forward_basis = np.array([
+                math.cos(yaw_rad) / sampled_cell_size,
+                0.0,
+                math.sin(yaw_rad) / sampled_cell_size,
+            ], dtype='f4')
+            right_basis = np.array([
+                -math.sin(yaw_rad) / sampled_cell_size,
+                0.0,
+                math.cos(yaw_rad) / sampled_cell_size,
+            ], dtype='f4')
+            return center_scene, forward_basis, right_basis, up_basis
+
+        forward_dx = math.cos(yaw_rad)
+        forward_dy = math.sin(yaw_rad)
+        right_dx = -forward_dy
+        right_dy = forward_dx
+        sample_forward = max(1.0, body_length_half)
+        sample_right = max(1.0, body_width_half)
+
+        front_world = (float(entity.position['x']) + forward_dx * sample_forward, float(entity.position['y']) + forward_dy * sample_forward)
+        rear_world = (float(entity.position['x']) - forward_dx * sample_forward, float(entity.position['y']) - forward_dy * sample_forward)
+        right_world = (float(entity.position['x']) + right_dx * sample_right, float(entity.position['y']) + right_dy * sample_right)
+        left_world = (float(entity.position['x']) - right_dx * sample_right, float(entity.position['y']) - right_dy * sample_right)
+
+        front_scene = self._world_to_scene_point(map_manager, sample_data, front_world[0], front_world[1], map_manager.get_terrain_height_m(front_world[0], front_world[1]))[:3]
+        rear_scene = self._world_to_scene_point(map_manager, sample_data, rear_world[0], rear_world[1], map_manager.get_terrain_height_m(rear_world[0], rear_world[1]))[:3]
+        right_scene = self._world_to_scene_point(map_manager, sample_data, right_world[0], right_world[1], map_manager.get_terrain_height_m(right_world[0], right_world[1]))[:3]
+        left_scene = self._world_to_scene_point(map_manager, sample_data, left_world[0], left_world[1], map_manager.get_terrain_height_m(left_world[0], left_world[1]))[:3]
+
+        forward_axis = (front_scene - rear_scene) / max(sample_forward * 2.0, 1e-6)
+        right_axis = (right_scene - left_scene) / max(sample_right * 2.0, 1e-6)
+        forward_scale = max(np.linalg.norm(forward_axis), 1e-6)
+        right_scale = max(np.linalg.norm(right_axis), 1e-6)
+        up_scale = max(np.linalg.norm(up_basis), 1e-6)
+        forward_dir = forward_axis / forward_scale
+        right_dir = right_axis / right_scale
+        up_dir = np.cross(right_dir, forward_dir)
+        if np.linalg.norm(up_dir) <= 1e-6:
+            up_dir = up_basis / up_scale
+        else:
+            up_dir = up_dir / max(np.linalg.norm(up_dir), 1e-6)
+        right_dir = np.cross(forward_dir, up_dir)
+        if np.linalg.norm(right_dir) <= 1e-6:
+            right_dir = right_axis / right_scale
+        else:
+            right_dir = right_dir / max(np.linalg.norm(right_dir), 1e-6)
+        forward_dir = np.cross(up_dir, right_dir)
+        forward_dir = forward_dir / max(np.linalg.norm(forward_dir), 1e-6)
+        return center_scene, forward_dir * forward_scale, right_dir * right_scale, up_dir * up_scale
+
+    def _climb_assist_animation_state(self, entity):
+        front_drop_m = 0.04
+        front_raise_m = 0.02
+        rear_drop_m = 0.02
+        rear_reach_m = 0.03
+        state = getattr(entity, 'step_climb_state', None)
+        if not isinstance(state, dict):
+            return {
+                'front_drop_m': front_drop_m,
+                'front_raise_m': front_raise_m,
+                'rear_drop_m': rear_drop_m,
+                'rear_reach_m': rear_reach_m,
+            }
+
+        phase = str(state.get('phase', 'front_ascent'))
+        progress = float(state.get('progress', 0.0))
+
+        def _ratio(duration_key, fallback):
+            duration = max(1e-6, float(state.get(duration_key, fallback)))
+            return max(0.0, min(1.0, progress / duration))
+
+        if phase == 'align':
+            front_drop_m = 0.08
+            front_raise_m = 0.05
+        elif phase == 'front_ascent':
+            ratio = _ratio('front_ascent_duration', 0.35)
+            front_drop_m = 0.10 + 0.18 * ratio
+            front_raise_m = 0.05 + 0.06 * ratio
+        elif phase == 'rear_pause':
+            front_drop_m = 0.18
+            front_raise_m = 0.08
+            rear_drop_m = 0.20
+            rear_reach_m = 0.18
+        elif phase == 'rear_ascent':
+            ratio = _ratio('rear_ascent_duration', 0.25)
+            front_drop_m = 0.18 - 0.10 * ratio
+            front_raise_m = 0.08 - 0.04 * ratio
+            rear_drop_m = 0.20 * (1.0 - ratio)
+            rear_reach_m = 0.18 * (1.0 - ratio)
+
+        return {
+            'front_drop_m': max(0.0, front_drop_m),
+            'front_raise_m': max(0.0, front_raise_m),
+            'rear_drop_m': max(0.0, rear_drop_m),
+            'rear_reach_m': max(0.0, rear_reach_m),
+        }
+
+    def _build_entity_model_faces(self, entity, camera_state, rect, map_manager, sample_data):
+        terrain_height = float(map_manager.get_terrain_height_m(entity.position['x'], entity.position['y']))
+        base_height = float(getattr(entity, 'position', {}).get('z', terrain_height))
+        vertical_scale = self._entity_vertical_scale(entity)
+        body_length_half = self._meters_to_world_units(map_manager, float(getattr(entity, 'body_length_m', getattr(entity, 'body_size_m', 0.42))) * 0.5)
+        render_width_scale = max(0.45, min(1.0, float(getattr(entity, 'body_render_width_scale', 0.82))))
+        body_width_half = self._meters_to_world_units(map_manager, float(getattr(entity, 'body_width_m', getattr(entity, 'body_size_m', 0.42))) * 0.5 * render_width_scale)
+        body_bottom = base_height + float(getattr(entity, 'body_clearance_m', 0.10)) * vertical_scale
+        body_top = body_bottom + float(getattr(entity, 'body_height_m', 0.18)) * vertical_scale
+        wheel_radius_world = self._meters_to_world_units(map_manager, float(getattr(entity, 'wheel_radius_m', 0.08)))
+        wheel_radius_height = float(getattr(entity, 'wheel_radius_m', 0.08)) * vertical_scale
+        yaw_rad = math.radians(float(getattr(entity, 'angle', 0.0)))
+        turret_yaw_rad = math.radians(float(getattr(entity, 'turret_angle', entity.angle)))
+        wheel_style = str(getattr(entity, 'wheel_style', 'standard'))
+        suspension_style = str(getattr(entity, 'suspension_style', 'none'))
+        arm_style = str(getattr(entity, 'arm_style', 'none'))
+        front_climb_style = str(getattr(entity, 'front_climb_assist_style', 'none'))
+        rear_climb_style = str(getattr(entity, 'rear_climb_assist_style', 'none'))
+        has_turret = float(getattr(entity, 'gimbal_length_m', 0.0)) > 1e-6 and float(getattr(entity, 'gimbal_body_height_m', 0.0)) > 1e-6
+        has_mount = has_turret and float(getattr(entity, 'gimbal_mount_height_m', 0.0)) > 1e-6
+        has_barrel = has_turret and float(getattr(entity, 'barrel_length_m', 0.0)) > 1e-6 and float(getattr(entity, 'barrel_radius_m', 0.0)) > 1e-6
+        faces = []
+
+        center_scene, forward_basis, right_basis, up_basis = self._entity_scene_axes(entity, map_manager, sample_data, base_height)
+
+        def local_to_scene(local_x, local_y, height_m, angle_rad):
+            relative_angle = angle_rad - yaw_rad
+            cos_a = math.cos(relative_angle)
+            sin_a = math.sin(relative_angle)
+            rotated_x = local_x * cos_a - local_y * sin_a
+            rotated_y = local_x * sin_a + local_y * cos_a
+            scene_xyz = center_scene + forward_basis * rotated_x + right_basis * rotated_y + up_basis * (float(height_m) - base_height)
+            return np.array([scene_xyz[0], scene_xyz[1], scene_xyz[2], 1.0], dtype='f4')
+
+        def box_corners(cx, cy, half_x, half_y, low_h, high_h, angle_rad):
+            local_points = [(-half_x, -half_y), (half_x, -half_y), (half_x, half_y), (-half_x, half_y)]
+            projected = []
+            for height in (low_h, high_h):
+                for local_x, local_y in local_points:
+                    projected.append(self._project_scene_point(local_to_scene(local_x + cx, local_y + cy, height, angle_rad), camera_state, rect))
+            return projected
+
+        team_color = self.colors['red'] if entity.team == 'red' else self.colors['blue']
+        body_base_color = tuple(getattr(entity, 'body_color_rgb', ()) or team_color)
+        turret_base_color = tuple(getattr(entity, 'turret_color_rgb', ()) or (232, 232, 236))
+        armor_color = tuple(getattr(entity, 'armor_color_rgb', ()) or (224, 229, 234))
+        wheel_color = tuple(getattr(entity, 'wheel_color_rgb', ()) or (44, 44, 44))
+        body_color = tuple(max(48, min(255, int(channel * 0.78 + 34))) for channel in body_base_color)
+        self._append_box_faces(faces, box_corners(0.0, 0.0, body_length_half, body_width_half, body_bottom, body_top, yaw_rad), body_color)
+        self._append_box_faces(
+            faces,
+            box_corners(0.0, 0.0, body_length_half * 0.82, body_width_half * 0.82, body_top - 0.02, body_top + 0.03, yaw_rad),
+            tuple(max(52, min(255, int(channel * 0.58 + 56))) for channel in body_base_color),
+        )
+
+        wheel_offset_x = max(0.10, body_length_half * (0.72 if wheel_style == 'legged' else 0.78))
+        wheel_offset_y = max(1.0, body_width_half + wheel_radius_world * 0.55)
+        wheel_bottom = terrain_height
+        wheel_top = base_height + wheel_radius_height * 2.0
+        custom_wheel_positions_raw = getattr(entity, 'custom_wheel_positions_m', None)
+        if isinstance(custom_wheel_positions_raw, (list, tuple)) and custom_wheel_positions_raw:
+            wheel_positions = tuple(
+                (
+                    self._meters_to_world_units(map_manager, float(position[0])),
+                    self._meters_to_world_units(map_manager, float(position[1]) * render_width_scale),
+                )
+                for position in custom_wheel_positions_raw
+                if isinstance(position, (list, tuple)) and len(position) >= 2
+            )
+        else:
+            if int(getattr(entity, 'wheel_count', 4)) <= 2:
+                wheel_positions = ((0.0, -wheel_offset_y), (0.0, wheel_offset_y))
+            else:
+                wheel_positions = ((-wheel_offset_x, -wheel_offset_y), (wheel_offset_x, -wheel_offset_y), (-wheel_offset_x, wheel_offset_y), (wheel_offset_x, wheel_offset_y))
+        wheel_half_width = max(0.8, self._meters_to_world_units(map_manager, float(getattr(entity, 'wheel_radius_m', 0.08)) * 0.32))
+        for local_x, local_y in wheel_positions:
+            self._append_box_faces(
+                faces,
+                box_corners(local_x, local_y, max(1.0, wheel_radius_world * 0.82), wheel_half_width, wheel_bottom, wheel_top, yaw_rad),
+                tuple(max(26, min(180, int(channel * 0.78))) for channel in wheel_color),
+            )
+            if suspension_style == 'five_link':
+                support_low = body_bottom + 0.02
+                support_high = wheel_top - wheel_radius_height * 0.10
+                link_half = self._meters_to_world_units(map_manager, 0.018)
+                self._append_box_faces(faces, box_corners(local_x, local_y * 0.72, link_half, link_half, support_low, support_high, yaw_rad), (108, 112, 122))
+                for offset_x in (-0.055, 0.055):
+                    self._append_box_faces(
+                        faces,
+                        box_corners(
+                            local_x + self._meters_to_world_units(map_manager, offset_x),
+                            local_y * 0.88,
+                            self._meters_to_world_units(map_manager, 0.012),
+                            self._meters_to_world_units(map_manager, 0.060),
+                            support_high - 0.08,
+                            support_high - 0.01,
+                            yaw_rad,
+                        ),
+                        (118, 122, 132),
+                    )
+
+        climb_assist = self._climb_assist_animation_state(entity)
+        assist_side_offset = max(1.0, body_width_half + wheel_half_width * 0.45)
+        if front_climb_style != 'none':
+            pulley_half_x = self._meters_to_world_units(map_manager, 0.028)
+            pulley_half_y = self._meters_to_world_units(map_manager, 0.018)
+            belt_half_x = self._meters_to_world_units(map_manager, 0.020)
+            belt_half_y = self._meters_to_world_units(map_manager, 0.015)
+            belt_center_x = body_length_half * 0.82 + self._meters_to_world_units(map_manager, 0.040)
+            pulley_center_x = body_length_half * 0.62
+            belt_low = max(terrain_height, body_bottom - float(climb_assist['front_drop_m']) * vertical_scale)
+            belt_high = body_top + float(climb_assist['front_raise_m']) * vertical_scale
+            pulley_low = body_top - 0.015 * vertical_scale
+            pulley_high = body_top + 0.055 * vertical_scale
+            for side_sign in (-1.0, 1.0):
+                side_y = assist_side_offset * side_sign
+                self._append_box_faces(
+                    faces,
+                    box_corners(pulley_center_x, side_y, pulley_half_x, pulley_half_y, pulley_low, pulley_high, yaw_rad),
+                    (118, 122, 132),
+                )
+                self._append_box_faces(
+                    faces,
+                    box_corners(belt_center_x, side_y, belt_half_x, belt_half_y, belt_low, belt_high, yaw_rad),
+                    (82, 86, 96),
+                )
+        if rear_climb_style != 'none':
+            upper_half_x = self._meters_to_world_units(map_manager, 0.070)
+            upper_half_y = self._meters_to_world_units(map_manager, 0.014)
+            lower_half_x = self._meters_to_world_units(map_manager, 0.060)
+            lower_half_y = self._meters_to_world_units(map_manager, 0.014)
+            rear_reach_world = self._meters_to_world_units(map_manager, float(climb_assist['rear_reach_m']))
+            upper_center_x = -body_length_half * 0.46 - rear_reach_world * 0.25
+            lower_center_x = -body_length_half * 0.78 - rear_reach_world * 0.75
+            upper_low = body_top + 0.01 * vertical_scale
+            upper_high = body_top + (0.05 + float(climb_assist['rear_drop_m']) * 0.35) * vertical_scale
+            lower_low = max(terrain_height, body_bottom - float(climb_assist['rear_drop_m']) * vertical_scale)
+            lower_high = body_bottom + 0.030 * vertical_scale
+            for side_sign in (-1.0, 1.0):
+                side_y = assist_side_offset * side_sign
+                self._append_box_faces(
+                    faces,
+                    box_corners(upper_center_x, side_y, upper_half_x, upper_half_y, upper_low, upper_high, yaw_rad),
+                    (106, 110, 120),
+                )
+                self._append_box_faces(
+                    faces,
+                    box_corners(lower_center_x, side_y, lower_half_x, lower_half_y, lower_low, lower_high, yaw_rad),
+                    (92, 96, 108),
+                )
+
+        if arm_style == 'fixed_7':
+            arm_low = body_top
+            arm_high = body_top + 0.50 * vertical_scale
+            self._append_box_faces(
+                faces,
+                box_corners(0.0, 0.0, self._meters_to_world_units(map_manager, 0.05), self._meters_to_world_units(map_manager, 0.05), arm_low, arm_high, yaw_rad),
+                (172, 176, 184),
+            )
+            self._append_box_faces(
+                faces,
+                box_corners(body_length_half * 0.18, 0.0, self._meters_to_world_units(map_manager, 0.22), self._meters_to_world_units(map_manager, 0.05), arm_high - 0.10 * vertical_scale, arm_high, yaw_rad),
+                (188, 192, 198),
+            )
+
+        armor_plate_half_width = max(1.0, self._meters_to_world_units(map_manager, float(getattr(entity, 'armor_plate_width_m', getattr(entity, 'armor_plate_size_m', 0.12))) * 0.5))
+        armor_plate_half_length = max(1.0, self._meters_to_world_units(map_manager, float(getattr(entity, 'armor_plate_length_m', getattr(entity, 'armor_plate_size_m', 0.12))) * 0.5))
+        armor_plate_half_height = max(0.05, float(getattr(entity, 'armor_plate_height_m', getattr(entity, 'armor_plate_size_m', 0.12))) * 0.5 * vertical_scale)
+        armor_thickness = max(0.8, self._meters_to_world_units(map_manager, float(getattr(entity, 'armor_plate_gap_m', 0.02))) + min(armor_plate_half_width, armor_plate_half_length) * 0.08)
+        armor_center_h = body_bottom + (body_top - body_bottom) * 0.54
+        armor_low = armor_center_h - armor_plate_half_height
+        armor_high = armor_center_h + armor_plate_half_height
+        armor_offset_x = body_length_half + armor_thickness * 1.35
+        armor_offset_y = body_width_half + armor_thickness * 1.35
+        light_half_len = max(0.4, self._meters_to_world_units(map_manager, float(getattr(entity, 'armor_light_length_m', 0.10)) * 0.5))
+        light_half_width = max(0.2, self._meters_to_world_units(map_manager, float(getattr(entity, 'armor_light_width_m', 0.02)) * 0.5))
+        light_half_height = max(0.01, float(getattr(entity, 'armor_light_height_m', 0.02)) * 0.5 * vertical_scale)
+        light_color = tuple(max(96, min(255, int(channel * 0.95 + 22))) for channel in team_color)
+        armor_specs = (
+            (armor_offset_x, 0.0, armor_thickness, armor_plate_half_width),
+            (-armor_offset_x, 0.0, armor_thickness, armor_plate_half_width),
+            (0.0, armor_offset_y, armor_plate_half_length, armor_thickness),
+            (0.0, -armor_offset_y, armor_plate_half_length, armor_thickness),
+        )
+        for local_x, local_y, half_x, half_y in armor_specs:
+            self._append_box_faces(faces, box_corners(local_x, local_y, half_x, half_y, armor_low, armor_high, yaw_rad), armor_color)
+            if abs(local_x) > abs(local_y):
+                self._append_box_faces(faces, box_corners(local_x, local_y + armor_plate_half_width + light_half_width, light_half_len, light_half_width, armor_center_h - light_half_height, armor_center_h + light_half_height, yaw_rad), light_color)
+                self._append_box_faces(faces, box_corners(local_x, local_y - armor_plate_half_width - light_half_width, light_half_len, light_half_width, armor_center_h - light_half_height, armor_center_h + light_half_height, yaw_rad), light_color)
+            else:
+                self._append_box_faces(faces, box_corners(local_x + armor_plate_half_length + light_half_width, local_y, light_half_width, light_half_len, armor_center_h - light_half_height, armor_center_h + light_half_height, yaw_rad), light_color)
+                self._append_box_faces(faces, box_corners(local_x - armor_plate_half_length - light_half_width, local_y, light_half_width, light_half_len, armor_center_h - light_half_height, armor_center_h + light_half_height, yaw_rad), light_color)
+
+        barrel_start = None
+        barrel_end = None
+        barrel_light_segments = []
+        if has_turret:
+            turret_half_x = max(1.2, self._meters_to_world_units(map_manager, float(getattr(entity, 'gimbal_length_m', 0.30)) * 0.5))
+            turret_half_y = max(0.9, self._meters_to_world_units(map_manager, float(getattr(entity, 'gimbal_width_m', 0.10)) * 0.5))
+            turret_half_h = max(0.04, float(getattr(entity, 'gimbal_body_height_m', 0.10)) * 0.5 * vertical_scale)
+            turret_center_h = base_height + float(getattr(entity, 'gimbal_height_m', 0.50)) * vertical_scale
+            turret_offset_x = self._meters_to_world_units(map_manager, float(getattr(entity, 'gimbal_offset_x_m', 0.0)))
+            turret_offset_y = self._meters_to_world_units(map_manager, float(getattr(entity, 'gimbal_offset_y_m', 0.0)))
+            if has_mount:
+                mount_half_x = max(0.5, self._meters_to_world_units(map_manager, float(getattr(entity, 'gimbal_mount_length_m', 0.10)) * 0.5))
+                mount_half_y = max(0.5, self._meters_to_world_units(map_manager, float(getattr(entity, 'gimbal_mount_width_m', 0.10)) * 0.5 * render_width_scale))
+                mount_half_h = max(0.03, float(getattr(entity, 'gimbal_mount_height_m', getattr(entity, 'gimbal_mount_gap_m', 0.10))) * 0.5 * vertical_scale)
+                mount_center_h = body_top + mount_half_h
+                self._append_box_faces(
+                    faces,
+                    box_corners(turret_offset_x, turret_offset_y, mount_half_x, mount_half_y, mount_center_h - mount_half_h, mount_center_h + mount_half_h, yaw_rad),
+                    (96, 100, 112),
+                )
+            self._append_box_faces(
+                faces,
+                box_corners(turret_offset_x, turret_offset_y, turret_half_x, turret_half_y, turret_center_h - turret_half_h, turret_center_h + turret_half_h, turret_yaw_rad),
+                turret_base_color,
+            )
+            if has_barrel:
+                barrel_start = self._project_scene_point(local_to_scene(turret_offset_x, turret_offset_y, turret_center_h, turret_yaw_rad), camera_state, rect)
+                barrel_length_m = float(getattr(entity, 'barrel_length_m', 0.36))
+                barrel_pitch_rad = math.radians(float(getattr(entity, 'gimbal_pitch_deg', 0.0)))
+                barrel_horizontal = self._meters_to_world_units(map_manager, barrel_length_m * max(0.0, math.cos(barrel_pitch_rad)))
+                barrel_vertical = barrel_length_m * math.sin(barrel_pitch_rad) * vertical_scale
+                barrel_end = self._project_scene_point(
+                    local_to_scene(
+                        turret_offset_x + barrel_horizontal,
+                        turret_offset_y,
+                        turret_center_h + barrel_vertical,
+                        turret_yaw_rad,
+                    ),
+                    camera_state,
+                    rect,
+                )
+                light_width_world = self._meters_to_world_units(map_manager, float(getattr(entity, 'barrel_light_width_m', 0.02)))
+                if barrel_start is not None and barrel_end is not None and light_width_world > 0.0:
+                    lateral_start = self._project_scene_point(local_to_scene(turret_offset_x, turret_offset_y + light_width_world, turret_center_h, turret_yaw_rad), camera_state, rect)
+                    lateral_end = self._project_scene_point(local_to_scene(turret_offset_x + barrel_horizontal, turret_offset_y + light_width_world, turret_center_h + barrel_vertical, turret_yaw_rad), camera_state, rect)
+                    if lateral_start is not None and lateral_end is not None:
+                        offset_start = np.array([lateral_start[0] - barrel_start[0], lateral_start[1] - barrel_start[1]], dtype='f4')
+                        offset_end = np.array([lateral_end[0] - barrel_end[0], lateral_end[1] - barrel_end[1]], dtype='f4')
+                        barrel_light_segments.append(((int(barrel_start[0] + offset_start[0]), int(barrel_start[1] + offset_start[1])), (int(barrel_end[0] + offset_end[0]), int(barrel_end[1] + offset_end[1])), light_color))
+                        barrel_light_segments.append(((int(barrel_start[0] - offset_start[0]), int(barrel_start[1] - offset_start[1])), (int(barrel_end[0] - offset_end[0]), int(barrel_end[1] - offset_end[1])), light_color))
+        return faces, barrel_start, barrel_end, wheel_positions, wheel_radius_world, wheel_radius_height, base_height, barrel_light_segments, wheel_color
+
+    def _build_entity_wheel_overlays(self, entity, camera_state, rect, map_manager, sample_data, wheel_positions, wheel_radius_world, wheel_radius_height, base_height, game_time, wheel_color):
+        if not wheel_positions:
+            return []
+        wheel_style = str(getattr(entity, 'wheel_style', 'standard'))
+        center_scene, forward_basis, right_basis, up_basis = self._entity_scene_axes(entity, map_manager, sample_data, base_height)
+        terrain_height = float(map_manager.get_terrain_height_m(entity.position['x'], entity.position['y']))
+
+        def local_to_scene(local_x, local_y, height_m):
+            scene_xyz = center_scene + forward_basis * local_x + right_basis * local_y + up_basis * (float(height_m) - base_height)
+            return np.array([scene_xyz[0], scene_xyz[1], scene_xyz[2], 1.0], dtype='f4')
+
+        velocity = getattr(entity, 'velocity', {}) or {}
+        speed_world = math.hypot(float(velocity.get('vx', 0.0)), float(velocity.get('vy', 0.0)))
+        spin_phase = (speed_world / max(wheel_radius_world, 1e-6)) * float(game_time)
+        side_offset = max(0.4, self._meters_to_world_units(map_manager, float(getattr(entity, 'wheel_radius_m', 0.08)) * 0.35))
+        overlays = []
+        for local_x, local_y in wheel_positions:
+            wheel_center_h = terrain_height + wheel_radius_height
+            center = self._project_scene_point(local_to_scene(local_x, local_y, wheel_center_h), camera_state, rect)
+            axis_a = self._project_scene_point(local_to_scene(local_x, local_y + side_offset, wheel_center_h), camera_state, rect)
+            axis_b = self._project_scene_point(local_to_scene(local_x, local_y, wheel_center_h + wheel_radius_height), camera_state, rect)
+            if center is None or axis_a is None or axis_b is None:
+                continue
+            vec_a = np.array([axis_a[0] - center[0], axis_a[1] - center[1]], dtype='f4')
+            vec_b = np.array([axis_b[0] - center[0], axis_b[1] - center[1]], dtype='f4')
+            polygon = []
+            for sample_index in range(16):
+                angle = (math.pi * 2.0 * sample_index) / 16.0
+                point = np.array([center[0], center[1]], dtype='f4') + vec_a * math.cos(angle) + vec_b * math.sin(angle)
+                polygon.append((int(point[0]), int(point[1])))
+            spoke_pairs = []
+            for angle in (spin_phase, spin_phase + math.pi * 0.5):
+                start = np.array([center[0], center[1]], dtype='f4') + vec_a * math.cos(angle) + vec_b * math.sin(angle)
+                end = np.array([center[0], center[1]], dtype='f4') - vec_a * math.cos(angle) - vec_b * math.sin(angle)
+                spoke_pairs.append(((int(start[0]), int(start[1])), (int(end[0]), int(end[1]))))
+            overlays.append((float(center[2]), polygon, spoke_pairs, wheel_style, wheel_color))
+        return overlays
+
+    def _render_player_models(self, game_engine, rect, camera_state):
+        map_manager = game_engine.map_manager
+        sample_data = camera_state.get('sample_data') or {}
+        faces = []
+        barrel_segments = []
+        barrel_light_segments = []
+        controlled_getter = getattr(game_engine, 'get_player_controlled_entity', None)
+        controlled = controlled_getter() if callable(controlled_getter) else None
+        controlled_id = getattr(controlled, 'id', None)
+        camera_mode = str(camera_state.get('camera_mode', 'first_person'))
+        for entity in game_engine.entity_manager.entities:
+            if not entity.is_alive() or entity.type not in {'robot', 'sentry'}:
+                continue
+            if controlled_id is not None and entity.id == controlled_id and camera_mode != 'third_person':
+                continue
+            if not self._entity_visible_from_camera(entity, map_manager, camera_state):
+                continue
+            entity_faces, barrel_start, barrel_end, wheel_positions, wheel_radius_world, wheel_radius_height, base_height, light_segments, wheel_color = self._build_entity_model_faces(entity, camera_state, rect, map_manager, sample_data)
+            faces.extend(entity_faces)
+            if barrel_start is not None and barrel_end is not None:
+                barrel_segments.append((barrel_start, barrel_end))
+            barrel_light_segments.extend(light_segments)
+
+        faces.sort(key=lambda item: item[0], reverse=True)
+        for _, polygon, color in faces:
+            if len(polygon) < 3:
+                continue
+            pygame.draw.polygon(self.screen, color, polygon)
+            pygame.draw.polygon(self.screen, self.colors['black'], polygon, 1)
+        for start, end in barrel_segments:
+            pygame.draw.line(self.screen, self.colors['black'], start[:2], end[:2], 2)
+        for start, end, color in barrel_light_segments:
+            pygame.draw.line(self.screen, color, start, end, 2)
+
+    def _render_player_projectiles(self, game_engine, rect, camera_state):
+        rules_engine = getattr(game_engine, 'rules_engine', None)
+        traces = list(getattr(rules_engine, 'projectile_traces', ())) if rules_engine is not None else []
+        if not traces:
+            return
+        map_manager = game_engine.map_manager
+        sample_data = camera_state.get('sample_data') or {}
+        overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
+        drawables = []
+        eye = np.array(camera_state.get('eye', (0.0, 0.0, 0.0)), dtype='f4')
+        for trace in traces:
+            trace_points = self._trace_path_points(trace, map_manager)
+            if len(trace_points) < 2:
+                continue
+            polyline, max_depth = self._project_trace_polyline(trace_points, map_manager, sample_data, camera_state, rect)
+            if len(polyline) < 2:
+                continue
+            lifetime = max(1e-6, float(trace.get('lifetime', 0.12)))
+            progress = max(0.0, min(1.0, float(trace.get('elapsed', 0.0)) / lifetime))
+            tail_progress = max(0.0, progress - (0.22 if trace.get('ammo_type') == '42mm' else 0.14))
+
+            def interpolate(progress_value):
+                point = self._trace_point_at_progress(trace_points, progress_value)
+                if point is None:
+                    return None, None
+                world_x, world_y, world_h = point
+                scene_point = self._world_to_scene_point(map_manager, sample_data, world_x, world_y, world_h)
+                projected = self._project_scene_point(scene_point, camera_state, rect)
+                return projected, scene_point[:3]
+
+            tip, tip_scene = interpolate(progress)
+            tail, _ = interpolate(tail_progress)
+            if tip is None:
+                continue
+            ammo_type = trace.get('ammo_type')
+            is_large = ammo_type == '42mm'
+            distance = max(0.75, float(np.linalg.norm(tip_scene - eye)))
+            radius = int(max(3, min(20, (10.5 if is_large else 7.5) / distance * 10.0)))
+            width = max(1, radius - 1)
+            color = (255, 170, 74) if is_large else (255, 242, 170)
+            glow = (255, 118, 54, 180) if is_large else (255, 248, 208, 150)
+            team = trace.get('team')
+            if team == 'blue' and not is_large:
+                color = (198, 236, 255)
+                glow = (120, 190, 255, 150)
+            drawables.append((max_depth if max_depth is not None else tip[2], polyline, tip, tail, radius, width, color, glow))
+
+        drawables.sort(key=lambda item: item[0], reverse=True)
+        for _, polyline, tip, tail, radius, width, color, glow in drawables:
+            if len(polyline) >= 2:
+                pygame.draw.lines(overlay, (glow[0], glow[1], glow[2], min(176, glow[3])), False, polyline, max(2, width + 1))
+                pygame.draw.lines(overlay, (*color, 180), False, polyline, max(1, width // 2))
+            tip_pos = (int(tip[0] - rect.x), int(tip[1] - rect.y))
+            if tail is not None:
+                tail_pos = (int(tail[0] - rect.x), int(tail[1] - rect.y))
+                pygame.draw.line(overlay, glow, tail_pos, tip_pos, max(1, width + 2))
+                pygame.draw.line(overlay, (*color, 220), tail_pos, tip_pos, width)
+            pygame.draw.circle(overlay, glow, tip_pos, radius + 2)
+            pygame.draw.circle(overlay, (*color, 245), tip_pos, radius)
+            pygame.draw.circle(overlay, (255, 255, 255, 220), tip_pos, max(1, radius // 2))
+        self.screen.blit(overlay, rect.topleft)
+
+    def _render_player_status_hud(self, game_engine, rect):
+        hud = game_engine.get_player_hud_data()
+        if hud is None:
+            return
+        panel_rect = pygame.Rect(rect.x + 18, rect.bottom - 138, 420, 118)
+        pygame.draw.rect(self.screen, (18, 24, 30), panel_rect, border_radius=10)
+        pygame.draw.rect(self.screen, self.colors['panel_border'], panel_rect, 1, border_radius=10)
+        lines = [
+            f'{hud["label"]} {hud["robot_type"]}',
+            f'发弹量 {hud["ammo"]}   底盘功率 {hud["power"]:.1f}/{hud["max_power"]:.1f}',
+            f'枪口热量 {hud["heat"]:.1f}/{hud["max_heat"]:.1f}   俯仰 {hud["pitch_deg"]:.1f}°',
+            f'右键自瞄 {"锁定" if hud["auto_aim_locked"] else "待机"}   左键射击 {hud["fire_control_state"]}',
+            f'视角 {"第三人称" if self.player_camera_mode == "third_person" else "第一人称"}   V 切换   F3 碰撞箱',
+        ]
+        if hud['supply_zone']:
+            lines.append(f'补给区内 按 B 打开购买面板 当前数量 {self.player_purchase_amount} 发')
+        draw_y = panel_rect.y + 10
+        for line in lines:
+            text = self.small_font.render(line, True, self.colors['white'])
+            self.screen.blit(text, (panel_rect.x + 12, draw_y))
+            draw_y += 18
+        crosshair_center = (rect.centerx, rect.centery)
+        pygame.draw.line(self.screen, self.colors['white'], (crosshair_center[0] - 12, crosshair_center[1]), (crosshair_center[0] + 12, crosshair_center[1]), 1)
+        pygame.draw.line(self.screen, self.colors['white'], (crosshair_center[0], crosshair_center[1] - 12), (crosshair_center[0], crosshair_center[1] + 12), 1)
+
+    def _render_player_purchase_menu(self, game_engine, rect):
+        if not self.player_purchase_menu_open:
+            return
+        overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 96))
+        self.screen.blit(overlay, rect.topleft)
+        panel_rect = pygame.Rect(0, 0, 520, 238)
+        panel_rect.center = rect.center
+        pygame.draw.rect(self.screen, (24, 31, 38), panel_rect, border_radius=12)
+        pygame.draw.rect(self.screen, self.colors['panel_border'], panel_rect, 1, border_radius=12)
+        title = self.font.render('补给购买', True, self.colors['white'])
+        self.screen.blit(title, title.get_rect(center=(panel_rect.centerx, panel_rect.y + 28)))
+        amount_rect = pygame.Rect(panel_rect.centerx - 70, panel_rect.y + 66, 140, 42)
+        pygame.draw.rect(self.screen, (34, 40, 48), amount_rect, border_radius=10)
+        pygame.draw.rect(self.screen, self.colors['panel_border'], amount_rect, 1, border_radius=10)
+        amount_text = self.font.render(str(int(max(1, self.player_purchase_amount))), True, self.colors['white'])
+        self.screen.blit(amount_text, amount_text.get_rect(center=amount_rect.center))
+
+        left_deltas = (-1, -10, -50, -100)
+        right_deltas = (1, 10, 50, 100)
+        for index, delta in enumerate(left_deltas):
+            button_rect = pygame.Rect(panel_rect.x + 28, panel_rect.y + 56 + index * 36, 108, 28)
+            pygame.draw.rect(self.screen, self.colors['toolbar_button'], button_rect, border_radius=8)
+            label = self.small_font.render(str(delta), True, self.colors['white'])
+            self.screen.blit(label, label.get_rect(center=button_rect.center))
+            self.panel_actions.append((button_rect, f'player_purchase_delta:{delta}'))
+        for index, delta in enumerate(right_deltas):
+            button_rect = pygame.Rect(panel_rect.right - 136, panel_rect.y + 56 + index * 36, 108, 28)
+            pygame.draw.rect(self.screen, self.colors['toolbar_button'], button_rect, border_radius=8)
+            label = self.small_font.render(f'+{delta}', True, self.colors['white'])
+            self.screen.blit(label, label.get_rect(center=button_rect.center))
+            self.panel_actions.append((button_rect, f'player_purchase_delta:{delta}'))
+
+        confirm_rect = pygame.Rect(panel_rect.x + 54, panel_rect.bottom - 54, 168, 36)
+        cancel_rect = pygame.Rect(panel_rect.right - 222, panel_rect.bottom - 54, 168, 36)
+        pygame.draw.rect(self.screen, self.colors['toolbar_button_active'], confirm_rect, border_radius=10)
+        pygame.draw.rect(self.screen, (70, 76, 88), cancel_rect, border_radius=10)
+        self.screen.blit(self.small_font.render('确认买弹', True, self.colors['white']), self.small_font.render('确认买弹', True, self.colors['white']).get_rect(center=confirm_rect.center))
+        self.screen.blit(self.small_font.render('取消买弹', True, self.colors['white']), self.small_font.render('取消买弹', True, self.colors['white']).get_rect(center=cancel_rect.center))
+        hint = self.tiny_font.render('打开面板后仍可继续驾驶，购买数量通过按钮微调', True, self.colors['white'])
+        self.screen.blit(hint, hint.get_rect(center=(panel_rect.centerx, panel_rect.bottom - 82)))
+        self.panel_actions.append((confirm_rect, 'player_purchase_confirm'))
+        self.panel_actions.append((cancel_rect, 'player_purchase_cancel'))
+
+    def _render_player_settings_menu(self, game_engine, rect):
+        if not self.player_settings_menu_open:
+            return
+        overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 120))
+        self.screen.blit(overlay, rect.topleft)
+        panel_rect = pygame.Rect(0, 0, 420, 264)
+        panel_rect.center = rect.center
+        pygame.draw.rect(self.screen, (28, 34, 42), panel_rect, border_radius=16)
+        pygame.draw.rect(self.screen, self.colors['panel_border'], panel_rect, 1, border_radius=16)
+        title = self.font.render('控制设置', True, self.colors['white'])
+        self.screen.blit(title, title.get_rect(center=(panel_rect.centerx, panel_rect.y + 28)))
+        sensitivities = game_engine.get_player_sensitivity_settings()
+        rows = (
+            ('水平灵敏度', 'yaw', sensitivities['yaw']),
+            ('垂直灵敏度', 'pitch', sensitivities['pitch']),
+        )
+        for index, (label, axis, value) in enumerate(rows):
+            row_y = panel_rect.y + 64 + index * 56
+            self.screen.blit(self.small_font.render(label, True, self.colors['white']), (panel_rect.x + 34, row_y + 8))
+            minus_rect = pygame.Rect(panel_rect.x + 168, row_y, 36, 30)
+            value_rect = pygame.Rect(panel_rect.x + 214, row_y, 92, 30)
+            plus_rect = pygame.Rect(panel_rect.x + 316, row_y, 36, 30)
+            for draw_rect, text_value in ((minus_rect, '-'), (plus_rect, '+')):
+                pygame.draw.rect(self.screen, self.colors['toolbar_button'], draw_rect, border_radius=8)
+                rendered = self.small_font.render(text_value, True, self.colors['white'])
+                self.screen.blit(rendered, rendered.get_rect(center=draw_rect.center))
+            pygame.draw.rect(self.screen, (38, 44, 54), value_rect, border_radius=8)
+            pygame.draw.rect(self.screen, self.colors['panel_border'], value_rect, 1, border_radius=8)
+            value_text = self.small_font.render(f'{value:.2f}', True, self.colors['white'])
+            self.screen.blit(value_text, value_text.get_rect(center=value_rect.center))
+            self.panel_actions.append((minus_rect, f'player_sensitivity:{axis}:-0.01'))
+            self.panel_actions.append((plus_rect, f'player_sensitivity:{axis}:0.01'))
+        close_rect = pygame.Rect(panel_rect.centerx - 84, panel_rect.bottom - 48, 168, 34)
+        pygame.draw.rect(self.screen, self.colors['toolbar_button_active'], close_rect, border_radius=10)
+        self.screen.blit(self.small_font.render('关闭设置', True, self.colors['white']), self.small_font.render('关闭设置', True, self.colors['white']).get_rect(center=close_rect.center))
+        self.panel_actions.append((close_rect, 'toggle_player_settings'))
+
+    def _render_pre_match_prompt(self, game_engine, rect):
+        if not getattr(game_engine, 'pre_match_setup_required', False) and float(getattr(game_engine, 'pre_match_countdown_remaining', 0.0)) <= 0.0:
+            return
+        overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 88))
+        self.screen.blit(overlay, rect.topleft)
+        if float(getattr(game_engine, 'pre_match_countdown_remaining', 0.0)) > 0.0:
+            remaining = max(0, int(math.ceil(float(getattr(game_engine, 'pre_match_countdown_remaining', 0.0)))))
+            title = self.hud_big_font.render(str(remaining), True, self.colors['white'])
+            subtitle = self.hud_mid_font.render('比赛开始', True, self.colors['white'])
+            self.screen.blit(title, title.get_rect(center=(rect.centerx, rect.centery - 12)))
+            self.screen.blit(subtitle, subtitle.get_rect(center=(rect.centerx, rect.centery + 34)))
+            return
+        title = self.hud_mid_font.render('需要配置机器人参数：请按 P 设置', True, self.colors['white'])
+        self.screen.blit(title, title.get_rect(center=(rect.centerx, rect.centery - 18)))
+        hint = self.small_font.render('配置完成后进入 5 秒倒计时，期间所有机器人保持静止', True, (220, 225, 232))
+        self.screen.blit(hint, hint.get_rect(center=(rect.centerx, rect.centery + 18)))
+
+    def _render_pre_match_config_menu(self, game_engine, rect):
+        if not self.pre_match_config_menu_open:
+            return
+        entity = game_engine.get_player_controlled_entity() if hasattr(game_engine, 'get_player_controlled_entity') else None
+        if entity is None:
+            return
+        detail = game_engine.get_entity_detail_data(entity.id)
+        if detail is None:
+            return
+        overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 132))
+        self.screen.blit(overlay, rect.topleft)
+        panel_rect = pygame.Rect(0, 0, 560, 260)
+        panel_rect.center = rect.center
+        pygame.draw.rect(self.screen, (28, 34, 42), panel_rect, border_radius=16)
+        pygame.draw.rect(self.screen, self.colors['panel_border'], panel_rect, 1, border_radius=16)
+        title = self.font.render(f'赛前参数配置 | {detail.get("label", entity.id)} {detail.get("robot_type", "")}', True, self.colors['white'])
+        self.screen.blit(title, title.get_rect(center=(panel_rect.centerx, panel_rect.y + 28)))
+
+        mode_labels = detail.get('mode_labels', {})
+        left_title = mode_labels.get('left_title', '底盘模式')
+        right_title = mode_labels.get('right_title', '云台模式')
+        left_options = mode_labels.get('left_options', [('health_priority', '血量优先'), ('power_priority', '功率优先')])
+        right_options = mode_labels.get('right_options', [('cooling_priority', '冷却优先'), ('burst_priority', '爆发优先')])
+        left_y = panel_rect.y + 82
+        right_y = panel_rect.y + 154
+        self.screen.blit(self.small_font.render(left_title, True, self.colors['white']), (panel_rect.x + 42, left_y - 24))
+        self.screen.blit(self.small_font.render(right_title, True, self.colors['white']), (panel_rect.x + 42, right_y - 24))
+        button_w = 188
+        gap = 18
+        for index, (value, label) in enumerate(left_options[:2]):
+            button_rect = pygame.Rect(panel_rect.x + 42 + index * (button_w + gap), left_y, button_w, 40)
+            active = detail.get('chassis_mode') == value
+            pygame.draw.rect(self.screen, self.colors['toolbar_button_active'] if active else self.colors['toolbar_button'], button_rect, border_radius=10)
+            rendered = self.small_font.render(label, True, self.colors['white'])
+            self.screen.blit(rendered, rendered.get_rect(center=button_rect.center))
+            self.panel_actions.append((button_rect, f'entity_mode:{entity.id}:chassis_mode:{value}'))
+        for index, (value, label) in enumerate(right_options[:2]):
+            button_rect = pygame.Rect(panel_rect.x + 42 + index * (button_w + gap), right_y, button_w, 40)
+            active = detail.get('gimbal_mode') == value
+            pygame.draw.rect(self.screen, self.colors['toolbar_button_active'] if active else self.colors['toolbar_button'], button_rect, border_radius=10)
+            rendered = self.small_font.render(label, True, self.colors['white'])
+            self.screen.blit(rendered, rendered.get_rect(center=button_rect.center))
+            self.panel_actions.append((button_rect, f'entity_mode:{entity.id}:gimbal_mode:{value}'))
+
+        confirm_rect = pygame.Rect(panel_rect.x + 72, panel_rect.bottom - 54, 170, 36)
+        cancel_rect = pygame.Rect(panel_rect.right - 242, panel_rect.bottom - 54, 170, 36)
+        pygame.draw.rect(self.screen, self.colors['toolbar_button_active'], confirm_rect, border_radius=10)
+        pygame.draw.rect(self.screen, (70, 76, 88), cancel_rect, border_radius=10)
+        self.screen.blit(self.small_font.render('确认并开始倒计时', True, self.colors['white']), self.small_font.render('确认并开始倒计时', True, self.colors['white']).get_rect(center=confirm_rect.center))
+        self.screen.blit(self.small_font.render('取消', True, self.colors['white']), self.small_font.render('取消', True, self.colors['white']).get_rect(center=cancel_rect.center))
+        self.panel_actions.append((confirm_rect, 'pre_match_confirm'))
+        self.panel_actions.append((cancel_rect, 'pre_match_cancel'))
+
+    def _render_player_pause_overlay(self, game_engine, rect):
+        scene_snapshot = self.screen.subsurface(rect).copy()
+        rgb = pygame.surfarray.pixels3d(scene_snapshot)
+        luminance = (rgb[:, :, 0] * 0.299 + rgb[:, :, 1] * 0.587 + rgb[:, :, 2] * 0.114).astype(np.uint8)
+        rgb[:, :, 0] = luminance
+        rgb[:, :, 1] = luminance
+        rgb[:, :, 2] = luminance
+        del rgb
+        self.screen.blit(scene_snapshot, rect.topleft)
+
+        veil = pygame.Surface(rect.size, pygame.SRCALPHA)
+        veil.fill((18, 22, 28, 138))
+        self.screen.blit(veil, rect.topleft)
+
+        panel_rect = pygame.Rect(0, 0, 420, 214)
+        panel_rect.center = (rect.centerx, rect.centery + 24)
+        pygame.draw.rect(self.screen, (32, 38, 46), panel_rect, border_radius=20)
+        pygame.draw.rect(self.screen, self.colors['panel_border'], panel_rect, 1, border_radius=20)
+
+        title = self.hud_mid_font.render('比赛已暂停', True, self.colors['white'])
+        self.screen.blit(title, title.get_rect(center=(panel_rect.centerx, panel_rect.y + 34)))
+        hint = self.small_font.render('鼠标已释放，可选择继续比赛或重新开始', True, (208, 214, 220))
+        self.screen.blit(hint, hint.get_rect(center=(panel_rect.centerx, panel_rect.y + 66)))
+
+        settings_rect = pygame.Rect(panel_rect.x + 34, panel_rect.bottom - 132, panel_rect.width - 68, 34)
+        restart_rect = pygame.Rect(panel_rect.x + 34, panel_rect.bottom - 82, 156, 42)
+        resume_rect = pygame.Rect(panel_rect.right - 190, panel_rect.bottom - 82, 156, 42)
+        pygame.draw.rect(self.screen, (78, 86, 98), settings_rect, border_radius=10)
+        pygame.draw.rect(self.screen, (83, 92, 104), restart_rect, border_radius=12)
+        pygame.draw.rect(self.screen, self.colors['toolbar_button_active'], resume_rect, border_radius=12)
+        pygame.draw.rect(self.screen, self.colors['panel_border'], settings_rect, 1, border_radius=10)
+        pygame.draw.rect(self.screen, self.colors['panel_border'], restart_rect, 1, border_radius=12)
+        pygame.draw.rect(self.screen, self.colors['panel_border'], resume_rect, 1, border_radius=12)
+
+        settings_text = self.small_font.render('设置', True, self.colors['white'])
+        restart_text = self.small_font.render('重新开始', True, self.colors['white'])
+        resume_text = self.small_font.render('继续比赛', True, self.colors['white'])
+        self.screen.blit(settings_text, settings_text.get_rect(center=settings_rect.center))
+        self.screen.blit(restart_text, restart_text.get_rect(center=restart_rect.center))
+        self.screen.blit(resume_text, resume_text.get_rect(center=resume_rect.center))
+
+        esc_hint = self.tiny_font.render('也可以按 ESC 继续', True, (198, 204, 210))
+        self.screen.blit(esc_hint, esc_hint.get_rect(center=(panel_rect.centerx, panel_rect.bottom - 20)))
+
+        self.panel_actions.append((settings_rect, 'toggle_player_settings'))
+        self.panel_actions.append((restart_rect, 'start_match'))
+        self.panel_actions.append((resume_rect, 'toggle_pause'))
+
+    def render_player_simulator(self, game_engine, top_offset=None, hud_top=None, draw_match_hud=False):
+        rect_top = self.toolbar_height if top_offset is None else int(top_offset)
+        hud_offset = self.toolbar_height if hud_top is None else int(hud_top)
+        rect = pygame.Rect(0, rect_top, self.window_width, self.window_height - rect_top)
+        pygame.draw.rect(self.screen, (10, 14, 18), rect)
+        controlled_getter = getattr(game_engine, 'get_player_controlled_entity', None)
+        entity = controlled_getter() if callable(controlled_getter) else None
+        if entity is None:
+            self._sync_player_mouse_capture(False)
+            return
+        menus_active = self.player_purchase_menu_open or self.player_settings_menu_open or self.pre_match_config_menu_open
+        self._sync_player_mouse_capture((not game_engine.paused) and (not menus_active))
+        self.terrain_scene_camera_override = self._build_player_camera_override(game_engine, rect)
+        motion_metric_m = self._player_camera_motion_metric_m(game_engine.map_manager, self.terrain_scene_camera_override)
+        self._active_player_terrain_render_scale = self.player_motion_terrain_render_scale if motion_metric_m > self.player_camera_motion_threshold_m else self.player_terrain_render_scale
+        self.terrain_scene_force_dark_gray = False
+        terrain_surface = self._render_terrain_scene_surface(game_engine, rect, self._get_terrain_3d_map_rgb(game_engine.map_manager))
+        self.terrain_scene_force_dark_gray = False
+        self.screen.blit(terrain_surface, rect.topleft)
+        if self.terrain_scene_camera_override is not None:
+            camera_mode_setter = getattr(game_engine, 'set_player_camera_mode', None)
+            if callable(camera_mode_setter):
+                camera_mode_setter(self.player_camera_mode)
+            view_aim_state = self._resolve_player_view_aim_state(game_engine, self.terrain_scene_camera_override)
+            setter = getattr(game_engine, 'set_player_view_aim_state', None)
+            if callable(setter):
+                setter(view_aim_state)
+            self._render_player_models(game_engine, rect, self.terrain_scene_camera_override)
+            self._render_player_projectiles(game_engine, rect, self.terrain_scene_camera_override)
+            self._render_player_view_ray(rect, self.terrain_scene_camera_override, view_aim_state, game_engine.map_manager, self.terrain_scene_camera_override.get('sample_data') or {})
+            if self._collision_overlay_active():
+                self._render_player_collision_boxes(game_engine, rect, self.terrain_scene_camera_override)
+        self.terrain_scene_camera_override = None
+        self._active_player_terrain_render_scale = self.player_terrain_render_scale
+        if draw_match_hud:
+            self.render_match_hud(game_engine, top_offset=hud_offset)
+        self._render_player_status_hud(game_engine, rect)
+        self._render_player_purchase_menu(game_engine, rect)
+        self._render_pre_match_prompt(game_engine, rect)
+        self._render_pre_match_config_menu(game_engine, rect)
+        if game_engine.paused and not getattr(game_engine, 'pre_match_setup_required', False) and float(getattr(game_engine, 'pre_match_countdown_remaining', 0.0)) <= 0.0:
+            self._render_player_pause_overlay(game_engine, rect)
+        self._render_player_settings_menu(game_engine, rect)
 
     def _begin_numeric_input(self, input_type, facility_id, current_value):
         self.active_numeric_input = {
@@ -490,19 +1939,21 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             self.active_numeric_input = None
             return False
 
+        stored_value = self._terrain_editor_storage_height(value) if input_type in {'wall', 'terrain_brush', 'terrain'} else value
+
         if input_type == 'wall':
             self._record_undo_snapshot(game_engine, f'墙高 {facility_id}')
-            facility = game_engine.map_manager.update_wall_properties(facility_id, height_m=value)
+            facility = game_engine.map_manager.update_wall_properties(facility_id, height_m=stored_value)
             self.selected_wall_id = facility_id
             label = '墙高'
         elif input_type == 'terrain_brush':
-            self.terrain_brush['height_m'] = value
+            self.terrain_brush['height_m'] = stored_value
             self.active_numeric_input = None
             if announce:
                 game_engine.add_log(f'地形笔刷高度已设置为 {value:.2f}m', 'system')
             return True
         else:
-            facility = game_engine.map_manager.update_facility_height(facility_id, value)
+            facility = game_engine.map_manager.update_facility_height(facility_id, stored_value)
             self.selected_terrain_id = facility_id
             label = '地形高'
 
@@ -512,7 +1963,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
 
         game_engine.config.setdefault('map', {})['facilities'] = game_engine.map_manager.export_facilities_config()
         if announce:
-            game_engine.add_log(f'{facility_id} {label}已设置为 {facility.get("height_m", value):.2f}m', 'system')
+            game_engine.add_log(f'{facility_id} {label}已设置为 {self._terrain_editor_display_height(facility.get("height_m", stored_value)):.2f}m', 'system')
         return True
 
     def _handle_numeric_input_keydown(self, event, game_engine):
@@ -655,10 +2106,12 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         buttons = [
             ('开始/重开', 'start_match', False),
             ('暂停/继续', 'toggle_pause', game_engine.paused and not game_engine.rules_engine.game_over),
+            ('设置', 'toggle_player_settings', self.player_settings_menu_open),
             ('结束对局', 'end_match', game_engine.rules_engine.game_over),
             ('保存存档', 'save_match', False),
             ('载入存档', 'load_match', False),
             ('保存设置', 'save_settings', False),
+            ('主控视角', 'toggle_player_view', game_engine.player_control_enabled),
             ('设施显示', 'toggle_facilities', self.show_facilities),
             ('视场显示', 'toggle_aim_fov', self.show_aim_fov),
             ('浏览', 'mode:none', self.edit_mode == 'none'),
@@ -699,7 +2152,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             ])
             x = radius_plus_rect.right + 10
 
-            height_text_value = f'{self.terrain_brush.get("height_m", 0.0):.2f}m'
+            height_text_value = f'{self._terrain_editor_display_height(self.terrain_brush.get("height_m", 0.0)):.2f}m'
             height_minus_rect = pygame.Rect(x, 10, 28, self.toolbar_height - 20)
             height_value_rect = pygame.Rect(x + 34, 10, 92, self.toolbar_height - 20)
             height_plus_rect = pygame.Rect(height_value_rect.right + 6, 10, 28, self.toolbar_height - 20)
@@ -1102,7 +2555,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         overlay_key = (
             int(map_manager.map_width),
             int(map_manager.map_height),
-            int(getattr(map_manager, 'raster_version', 0)),
+            int(getattr(map_manager, 'facility_version', 0)),
             bool(self.show_facilities),
         )
         if self.facility_overlay_world_surface is None or self.facility_overlay_world_key != overlay_key:
@@ -1153,46 +2606,76 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             self.facility_overlay_world_key = overlay_key
         return self.facility_overlay_world_surface
 
+    def _draw_world_terrain_overlay_cell(self, surface, map_manager, cell_lookup, grid_x, grid_y, base_fill_alpha):
+        cell = cell_lookup.get(map_manager._terrain_cell_key(grid_x, grid_y))
+        x1, y1, x2, y2 = map_manager._grid_cell_bounds(grid_x, grid_y)
+        rect = pygame.Rect(x1, y1, max(1, x2 - x1 + 1), max(1, y2 - y1 + 1))
+        surface.fill((0, 0, 0, 0), rect)
+        if cell is None:
+            return
+        color = self._terrain_color_by_type(cell.get('type', 'flat'))
+        terrain_type = str(cell.get('type', 'flat'))
+        fill_alpha = base_fill_alpha if terrain_type != 'custom_terrain' else max(8, int(base_fill_alpha * 0.45))
+        pygame.draw.rect(surface, (*color, fill_alpha), rect)
+        signature = self._terrain_cell_border_signature(cell)
+        outline_color = self._terrain_outline_color(cell.get('type', 'flat'))
+        neighbors = {
+            'top': cell_lookup.get(map_manager._terrain_cell_key(grid_x, grid_y - 1)),
+            'right': cell_lookup.get(map_manager._terrain_cell_key(grid_x + 1, grid_y)),
+            'bottom': cell_lookup.get(map_manager._terrain_cell_key(grid_x, grid_y + 1)),
+            'left': cell_lookup.get(map_manager._terrain_cell_key(grid_x - 1, grid_y)),
+        }
+        if self._terrain_cell_border_signature(neighbors['top']) != signature:
+            pygame.draw.line(surface, outline_color, (x1, y1), (x2, y1), 2)
+        if self._terrain_cell_border_signature(neighbors['right']) != signature:
+            pygame.draw.line(surface, outline_color, (x2, y1), (x2, y2), 2)
+        if self._terrain_cell_border_signature(neighbors['bottom']) != signature:
+            pygame.draw.line(surface, outline_color, (x1, y2), (x2, y2), 2)
+        if self._terrain_cell_border_signature(neighbors['left']) != signature:
+            pygame.draw.line(surface, outline_color, (x1, y1), (x1, y2), 2)
+
     def _get_world_terrain_grid_overlay_surface(self, map_manager):
         overlay_key = (
             int(map_manager.map_width),
             int(map_manager.map_height),
-            int(getattr(map_manager, 'raster_version', 0)),
             int(self.terrain_overlay_alpha),
         )
-        if self.terrain_grid_overlay_world_surface is None or self.terrain_grid_overlay_world_key != overlay_key:
+        dirty_state = map_manager.consume_terrain_overlay_dirty_state()
+        base_fill_alpha = max(12, min(72, int(self.terrain_overlay_alpha * 0.32)))
+        if self.terrain_grid_overlay_world_surface is None or self.terrain_grid_overlay_world_key != overlay_key or dirty_state.get('reset'):
             surface = pygame.Surface((map_manager.map_width, map_manager.map_height), pygame.SRCALPHA).convert_alpha()
-            cell_lookup = map_manager.terrain_grid_overrides
-            base_fill_alpha = max(12, min(72, int(self.terrain_overlay_alpha * 0.32)))
+            with map_manager._edit_state_lock:
+                cell_lookup = {key: dict(cell) for key, cell in map_manager.terrain_grid_overrides.items()}
             for cell in cell_lookup.values():
-                x1, y1, x2, y2 = map_manager._grid_cell_bounds(cell['x'], cell['y'])
-                rect = pygame.Rect(x1, y1, max(1, x2 - x1 + 1), max(1, y2 - y1 + 1))
-                color = self._terrain_color_by_type(cell.get('type', 'flat'))
-                terrain_type = str(cell.get('type', 'flat'))
-                fill_alpha = base_fill_alpha if terrain_type != 'custom_terrain' else max(8, int(base_fill_alpha * 0.45))
-                pygame.draw.rect(surface, (*color, fill_alpha), rect)
-            for cell in cell_lookup.values():
-                grid_x = cell['x']
-                grid_y = cell['y']
-                signature = self._terrain_cell_border_signature(cell)
-                outline_color = self._terrain_outline_color(cell.get('type', 'flat'))
-                neighbors = {
-                    'top': cell_lookup.get(map_manager._terrain_cell_key(grid_x, grid_y - 1)),
-                    'right': cell_lookup.get(map_manager._terrain_cell_key(grid_x + 1, grid_y)),
-                    'bottom': cell_lookup.get(map_manager._terrain_cell_key(grid_x, grid_y + 1)),
-                    'left': cell_lookup.get(map_manager._terrain_cell_key(grid_x - 1, grid_y)),
-                }
-                x1, y1, x2, y2 = map_manager._grid_cell_bounds(grid_x, grid_y)
-                if self._terrain_cell_border_signature(neighbors['top']) != signature:
-                    pygame.draw.line(surface, outline_color, (x1, y1), (x2, y1), 2)
-                if self._terrain_cell_border_signature(neighbors['right']) != signature:
-                    pygame.draw.line(surface, outline_color, (x2, y1), (x2, y2), 2)
-                if self._terrain_cell_border_signature(neighbors['bottom']) != signature:
-                    pygame.draw.line(surface, outline_color, (x1, y2), (x2, y2), 2)
-                if self._terrain_cell_border_signature(neighbors['left']) != signature:
-                    pygame.draw.line(surface, outline_color, (x1, y1), (x1, y2), 2)
+                self._draw_world_terrain_overlay_cell(surface, map_manager, cell_lookup, int(cell['x']), int(cell['y']), base_fill_alpha)
             self.terrain_grid_overlay_world_surface = surface
             self.terrain_grid_overlay_world_key = overlay_key
+        elif dirty_state.get('keys'):
+            affected_keys = set()
+            for key in dirty_state.get('keys', ()): 
+                affected_keys.add(key)
+                grid_x, grid_y = map_manager._decode_terrain_cell_key(key)
+                for delta_x, delta_y in ((0, -1), (1, 0), (0, 1), (-1, 0)):
+                    affected_keys.add(map_manager._terrain_cell_key(grid_x + delta_x, grid_y + delta_y))
+            lookup_keys = set(affected_keys)
+            for key in tuple(affected_keys):
+                grid_x, grid_y = map_manager._decode_terrain_cell_key(key)
+                for delta_x, delta_y in ((0, -1), (1, 0), (0, 1), (-1, 0)):
+                    lookup_keys.add(map_manager._terrain_cell_key(grid_x + delta_x, grid_y + delta_y))
+            with map_manager._edit_state_lock:
+                cell_lookup = {
+                    key: dict(map_manager.terrain_grid_overrides[key])
+                    for key in lookup_keys
+                    if key in map_manager.terrain_grid_overrides
+                }
+            for key in affected_keys:
+                grid_x, grid_y = map_manager._decode_terrain_cell_key(key)
+                if grid_x < 0 or grid_y < 0:
+                    continue
+                max_x, max_y = map_manager._grid_dimensions()
+                if grid_x >= max_x or grid_y >= max_y:
+                    continue
+                self._draw_world_terrain_overlay_cell(self.terrain_grid_overlay_world_surface, map_manager, cell_lookup, grid_x, grid_y, base_fill_alpha)
         return self.terrain_grid_overlay_world_surface
 
     def render_facility_overlay(self, map_manager):
@@ -1371,6 +2854,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 entity.team,
                 round(float(entity.position['x']), 1),
                 round(float(entity.position['y']), 1),
+                round(float(getattr(entity, 'position', {}).get('z', 0.0)), 2),
                 round(float(getattr(entity, 'turret_angle', entity.angle)), 2),
             ))
 
@@ -1404,6 +2888,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 center_x, center_y = self.world_to_screen(entity.position['x'], entity.position['y'])
                 turret_center = (center_x, center_y - 2)
                 turret_angle = getattr(entity, 'turret_angle', entity.angle)
+                origin_height_m = float(getattr(entity, 'position', {}).get('z', game_engine.map_manager.get_terrain_height_m(entity.position['x'], entity.position['y']))) + float(getattr(entity, 'gimbal_height_m', 0.50)) * self._entity_vertical_scale(entity)
                 visibility = game_engine.map_manager.compute_fov_visibility(
                     (entity.position['x'], entity.position['y']),
                     turret_angle,
@@ -1411,6 +2896,10 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                     max_distance,
                     angle_step_deg=1.25,
                     include_mask=False,
+                    origin_height_m=origin_height_m,
+                    terrain_height_scale=1.0,
+                    max_pitch_up_deg=float(getattr(entity, 'max_pitch_up_deg', 40.0)),
+                    max_pitch_down_deg=float(getattr(entity, 'max_pitch_down_deg', 35.0)),
                 )
                 polygon_world = visibility.get('polygon_world', ())
                 polygon = [self.world_to_screen(point[0], point[1]) for point in polygon_world]
@@ -1487,28 +2976,26 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         overlay = self.projectile_overlay_surface
         overlay.fill((0, 0, 0, 0))
         for trace in traces:
-            start = trace.get('start')
-            end = trace.get('end')
-            if start is None or end is None:
+            trace_points = self._trace_path_points(trace, self.game_engine.map_manager)
+            if len(trace_points) < 2:
                 continue
             lifetime = max(1e-6, float(trace.get('lifetime', 0.12)))
             progress = max(0.0, min(1.0, float(trace.get('elapsed', 0.0)) / lifetime))
             tail_progress = max(0.0, progress - 0.16)
-            tip_world = (
-                float(start[0]) + (float(end[0]) - float(start[0])) * progress,
-                float(start[1]) + (float(end[1]) - float(start[1])) * progress,
-            )
-            tail_world = (
-                float(start[0]) + (float(end[0]) - float(start[0])) * tail_progress,
-                float(start[1]) + (float(end[1]) - float(start[1])) * tail_progress,
-            )
+            tip_world = self._trace_point_at_progress(trace_points, progress)
+            tail_world = self._trace_point_at_progress(trace_points, tail_progress)
+            if tip_world is None:
+                continue
+            polyline = [self.world_to_screen(point[0], point[1]) for point in trace_points]
             tip = self.world_to_screen(tip_world[0], tip_world[1])
-            tail = self.world_to_screen(tail_world[0], tail_world[1])
+            tail = self.world_to_screen(tail_world[0], tail_world[1]) if tail_world is not None else tip
             is_large = trace.get('ammo_type') == '42mm'
             color_rgb = (255, 184, 90) if is_large else (255, 244, 170)
             alpha = 220 if is_large else 170
             width = 4 if is_large else 2
             radius = 4 if is_large else 2
+            if len(polyline) >= 2:
+                pygame.draw.lines(overlay, (*color_rgb, min(120, alpha)), False, polyline, 1 if is_large else 1)
             pygame.draw.line(overlay, (*color_rgb, alpha), tail, tip, width)
             pygame.draw.circle(overlay, (*color_rgb, min(255, alpha + 20)), tip, radius)
         self.screen.blit(overlay, (0, 0))
@@ -2480,6 +3967,11 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             height = getattr(event, 'h', None) or getattr(event, 'y', None) or self.window_height
             self._handle_window_resize(width, height)
             return True
+        if self.standalone_3d_program and self.standalone_3d_state != 'in_match':
+            if self._handle_standalone_program_event(event, game_engine):
+                return True
+        if self._handle_player_simulator_event(event, game_engine):
+            return True
         if self._handle_terrain_overview_event(event, game_engine):
             return True
         if event.type == pygame.KEYDOWN:
@@ -2526,6 +4018,9 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 self.drag_start = None
                 self.drag_current = None
                 game_engine.add_log('已取消当前范围绘制', 'system')
+                return True
+            if event.key == pygame.K_ESCAPE:
+                game_engine.toggle_pause()
                 return True
             if event.key in {pygame.K_RETURN, pygame.K_KP_ENTER} and self.edit_mode == 'terrain':
                 if self._facility_edit_active() and self.facility_draw_shape == 'polygon':
@@ -2751,12 +4246,207 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 return action
         return None
 
+    def _handle_standalone_program_event(self, event, game_engine):
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                if self.standalone_3d_state == 'lobby':
+                    self.standalone_3d_state = 'main_menu'
+                else:
+                    game_engine.running = False
+                return True
+            if event.key in {pygame.K_RETURN, pygame.K_KP_ENTER} and self.standalone_3d_state == 'main_menu':
+                self.standalone_3d_state = 'lobby'
+                return True
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            action = self._resolve_click_action(event.pos)
+            if action:
+                self._execute_action(game_engine, action)
+            return True
+        return False
+
+    def _handle_player_simulator_event(self, event, game_engine):
+        controlled_getter = getattr(game_engine, 'get_player_controlled_entity', None)
+        if not callable(controlled_getter):
+            return False
+        entity = controlled_getter()
+        if entity is None:
+            if self.player_mouse_captured:
+                self._sync_player_mouse_capture(False)
+            return False
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                if self.pre_match_config_menu_open:
+                    self.pre_match_config_menu_open = False
+                elif self.player_settings_menu_open:
+                    self.player_settings_menu_open = False
+                elif self.player_purchase_menu_open:
+                    self.player_purchase_menu_open = False
+                else:
+                    game_engine.toggle_pause()
+                return True
+            if event.key == pygame.K_p and getattr(game_engine, 'pre_match_setup_required', False):
+                self.pre_match_config_menu_open = not self.pre_match_config_menu_open
+                self.player_settings_menu_open = False
+                return True
+            if game_engine.paused:
+                if event.key == pygame.K_b and game_engine.is_player_in_supply_zone():
+                    self.player_purchase_menu_open = not self.player_purchase_menu_open
+                    return True
+                return True
+            if event.key == pygame.K_b:
+                if game_engine.is_player_in_supply_zone():
+                    self.player_purchase_menu_open = not self.player_purchase_menu_open
+                else:
+                    self.player_purchase_menu_open = False
+                    game_engine.add_log('当前不在己方补给区，无法购买弹药', 'system')
+                return True
+            if event.key == pygame.K_v:
+                self.player_camera_mode = 'third_person' if self.player_camera_mode != 'third_person' else 'first_person'
+                camera_mode_setter = getattr(game_engine, 'set_player_camera_mode', None)
+                if callable(camera_mode_setter):
+                    camera_mode_setter(self.player_camera_mode)
+                game_engine.add_log('已切换到第三人称视角' if self.player_camera_mode == 'third_person' else '已切换到第一人称视角', 'system')
+                return True
+        if event.type == pygame.MOUSEMOTION:
+            if game_engine.paused:
+                return True
+            rel = getattr(event, 'rel', (0, 0))
+            game_engine.accumulate_player_look_delta(rel[0], -rel[1])
+            return True
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            action = self._resolve_click_action(event.pos)
+            if game_engine.paused:
+                if event.button == 1:
+                    if action:
+                        self._execute_action(game_engine, action)
+                    return True
+                return True
+            if event.button == 1 and action in {'player_purchase_confirm', 'player_purchase_cancel', 'toggle_player_settings', 'pre_match_confirm', 'pre_match_cancel'}:
+                self._execute_action(game_engine, action)
+                return True
+            if event.button == 1 and action and action.startswith('player_purchase_delta:'):
+                self._execute_action(game_engine, action)
+                return True
+            if event.button == 1:
+                game_engine.set_player_action_state(fire_pressed=True)
+                return True
+            if event.button == 3:
+                game_engine.set_player_action_state(autoaim_pressed=True)
+                return True
+        if event.type == pygame.MOUSEBUTTONUP:
+            if game_engine.paused:
+                return True
+            if event.button == 1:
+                game_engine.set_player_action_state(fire_pressed=False)
+                return True
+            if event.button == 3:
+                game_engine.set_player_action_state(autoaim_pressed=False)
+                return True
+        return False
+
     def _execute_action(self, game_engine, action):
+        if action == 'standalone_open_lobby':
+            self.standalone_3d_state = 'lobby'
+            return
+        if action == 'standalone_exit':
+            game_engine.running = False
+            return
+        if action == 'standalone_toggle_ricochet':
+            self.standalone_3d_ricochet_enabled = not self.standalone_3d_ricochet_enabled
+            game_engine.config.setdefault('simulator', {})['player_projectile_ricochet_enabled'] = self.standalone_3d_ricochet_enabled
+            return
+        if action == 'standalone_back_main':
+            self.standalone_3d_state = 'main_menu'
+            return
+        if action == 'standalone_confirm_start':
+            self._ensure_standalone_selection(game_engine)
+            game_engine.config.setdefault('simulator', {})['player_projectile_ricochet_enabled'] = self.standalone_3d_ricochet_enabled
+            game_engine.start_new_match()
+            if self.standalone_3d_selected_entity_id and game_engine.set_player_controlled_entity(self.standalone_3d_selected_entity_id):
+                self.selected_hud_entity_id = self.standalone_3d_selected_entity_id
+                self.player_purchase_menu_open = False
+                self.player_purchase_amount = 50
+                game_engine.begin_pre_match_setup()
+                self.standalone_3d_state = 'in_match'
+            else:
+                game_engine.add_log('所选机器人当前不可接管', 'system')
+            return
+        if action.startswith('standalone_team:'):
+            self.standalone_3d_selected_team = action.split(':', 1)[1]
+            self._ensure_standalone_selection(game_engine)
+            return
+        if action.startswith('standalone_pick:'):
+            self.standalone_3d_selected_entity_id = action.split(':', 1)[1]
+            if self.standalone_3d_selected_entity_id.startswith('red_'):
+                self.standalone_3d_selected_team = 'red'
+            elif self.standalone_3d_selected_entity_id.startswith('blue_'):
+                self.standalone_3d_selected_team = 'blue'
+            return
         if action == 'start_match':
             game_engine.start_new_match()
+            if self.standalone_3d_program and self.standalone_3d_state == 'in_match' and self.standalone_3d_selected_entity_id:
+                game_engine.set_player_controlled_entity(self.standalone_3d_selected_entity_id)
+                self.selected_hud_entity_id = self.standalone_3d_selected_entity_id
             return
         if action == 'toggle_pause':
             game_engine.toggle_pause()
+            return
+        if action == 'toggle_player_view':
+            if game_engine.player_control_enabled:
+                game_engine.clear_player_controlled_entity()
+                self.player_purchase_menu_open = False
+                self.pre_match_config_menu_open = False
+                self._sync_player_mouse_capture(False)
+            else:
+                candidate_id = self._player_control_candidate_id(game_engine)
+                if candidate_id and game_engine.set_player_controlled_entity(candidate_id):
+                    self.selected_hud_entity_id = candidate_id
+                    self.player_purchase_menu_open = False
+                    self.player_purchase_amount = 50
+                    self._sync_player_mouse_capture(True)
+                else:
+                    game_engine.add_log('没有可接管的机器人', 'system')
+            return
+        if action == 'toggle_player_settings':
+            self.player_settings_menu_open = not self.player_settings_menu_open
+            return
+        if action.startswith('player_sensitivity:'):
+            _, axis, delta_text = action.split(':', 2)
+            try:
+                delta = float(delta_text)
+            except ValueError:
+                return
+            values = game_engine.get_player_sensitivity_settings()
+            if axis == 'yaw':
+                game_engine.set_player_sensitivity_settings(yaw_sensitivity_deg=max(0.01, values['yaw'] + delta))
+            elif axis == 'pitch':
+                game_engine.set_player_sensitivity_settings(pitch_sensitivity_deg=max(0.01, values['pitch'] + delta))
+            return
+        if action.startswith('player_purchase_delta:'):
+            try:
+                delta = int(action.split(':', 1)[1])
+            except ValueError:
+                return
+            self.player_purchase_amount = max(1, min(999, int(self.player_purchase_amount) + delta))
+            return
+        if action == 'player_purchase_confirm':
+            result = game_engine.purchase_player_ammo(self.player_purchase_amount)
+            if result.get('ok'):
+                game_engine.add_log(f'已购买 {result.get("amount", 0)} 发弹药，剩余金币 {result.get("team_gold", 0.0):.1f}', 'system')
+            else:
+                game_engine.add_log(f'购买失败: {result.get("code", "UNKNOWN")}', 'system')
+            return
+        if action == 'player_purchase_cancel':
+            self.player_purchase_menu_open = False
+            return
+        if action == 'pre_match_confirm':
+            if game_engine.begin_pre_match_countdown(5.0):
+                self.pre_match_config_menu_open = False
+            else:
+                game_engine.add_log('当前没有可配置的主控机器人', 'system')
+            return
+        if action == 'pre_match_cancel':
+            self.pre_match_config_menu_open = False
             return
         if action == 'end_match':
             game_engine.end_match()
@@ -3030,12 +4720,12 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         if action.startswith('height_input:'):
             _, input_type, facility_id = action.split(':', 2)
             if input_type == 'terrain_brush':
-                current_value = self._selected_terrain_brush_def().get('height_m', 0.0)
+                current_value = self._terrain_editor_display_height(self._selected_terrain_brush_def().get('height_m', 0.0))
             else:
                 facility = game_engine.map_manager.get_facility_by_id(facility_id)
                 if facility is None:
                     return
-                current_value = facility.get('height_m', 1.0 if input_type == 'wall' else 0.0)
+                current_value = self._terrain_editor_display_height(facility.get('height_m', 1.0 if input_type == 'wall' else 0.0))
             self._begin_numeric_input(input_type, facility_id, current_value)
             return
         if action == 'noop':
@@ -3055,7 +4745,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             return
         if action.startswith('terrain_brush_height:'):
             delta = float(action.split(':', 1)[1])
-            self.terrain_brush['height_m'] = round(max(0.0, min(5.0, self.terrain_brush.get('height_m', 0.0) + delta)), 2)
+            display_value = self._terrain_editor_display_height(self.terrain_brush.get('height_m', 0.0))
+            self.terrain_brush['height_m'] = round(max(0.0, min(5.0, self._terrain_editor_storage_height(display_value + delta))), 2)
             return
         if action.startswith('entity:'):
             self.selected_entity_index = int(action.split(':', 1)[1])

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import json
+import os
+
 from entities.entity import Entity
 
 class EntityManager:
@@ -10,6 +13,105 @@ class EntityManager:
         self.entity_map = {}
         self.editable_entity_keys = ['robot_1', 'robot_2', 'robot_3', 'robot_4', 'robot_7']
         self.enable_entity_movement = config.get('simulator', {}).get('enable_entity_movement', True)
+        self.vertical_scale_m = 1.0
+        self.appearance_preset_path = self._resolve_appearance_preset_path()
+        self.appearance_presets = self._load_appearance_presets()
+
+    def _resolve_appearance_preset_path(self):
+        configured_path = str(self.config.get('entities', {}).get('appearance_preset_path', os.path.join('appearance_presets', 'latest_appearance.json')))
+        if os.path.isabs(configured_path):
+            return configured_path
+        config_path = str(self.config.get('_config_path', 'config.json'))
+        base_dir = os.path.dirname(os.path.abspath(config_path))
+        return os.path.join(base_dir, configured_path)
+
+    def _load_appearance_presets(self):
+        if not os.path.exists(self.appearance_preset_path):
+            return {'profiles': {}}
+        try:
+            with open(self.appearance_preset_path, 'r', encoding='utf-8') as file:
+                payload = json.load(file)
+        except Exception:
+            return {'profiles': {}}
+        if not isinstance(payload, dict):
+            return {'profiles': {}}
+        if not isinstance(payload.get('profiles'), dict):
+            payload['profiles'] = {}
+        return payload
+
+    def _normalize_color_tuple(self, value):
+        if not isinstance(value, (list, tuple)) or len(value) < 3:
+            return None
+        return tuple(max(0, min(255, int(round(float(channel))))) for channel in value[:3])
+
+    def _apply_appearance_profile(self, entity, entity_type, robot_type=None):
+        profiles = self.appearance_presets.get('profiles', {}) if isinstance(self.appearance_presets, dict) else {}
+        role_key = 'sentry' if entity_type == 'sentry' else self._robot_role_key(robot_type)
+        profile = profiles.get(role_key, {})
+        if not isinstance(profile, dict):
+            return
+
+        numeric_fields = (
+            'collision_radius',
+            'body_length_m',
+            'body_width_m',
+            'body_height_m',
+            'body_clearance_m',
+            'wheel_radius_m',
+            'gimbal_height_m',
+            'gimbal_length_m',
+            'gimbal_width_m',
+            'gimbal_body_height_m',
+            'gimbal_mount_gap_m',
+            'gimbal_mount_length_m',
+            'gimbal_mount_width_m',
+            'gimbal_mount_height_m',
+            'barrel_length_m',
+            'barrel_radius_m',
+            'gimbal_offset_x_m',
+            'gimbal_offset_y_m',
+            'armor_plate_width_m',
+            'armor_plate_length_m',
+            'armor_plate_height_m',
+            'armor_plate_gap_m',
+            'armor_light_length_m',
+            'armor_light_width_m',
+            'armor_light_height_m',
+            'barrel_light_length_m',
+            'barrel_light_width_m',
+            'barrel_light_height_m',
+            'body_render_width_scale',
+        )
+        for field_name in numeric_fields:
+            if field_name in profile:
+                setattr(entity, field_name, float(profile[field_name]))
+
+        for field_name in ('wheel_style', 'suspension_style', 'arm_style'):
+            if field_name in profile:
+                setattr(entity, field_name, str(profile[field_name]))
+
+        for field_name in ('body_color_rgb', 'turret_color_rgb', 'armor_color_rgb', 'wheel_color_rgb'):
+            if field_name in profile:
+                setattr(entity, field_name, self._normalize_color_tuple(profile.get(field_name)))
+
+        wheel_positions = profile.get('custom_wheel_positions_m')
+        if isinstance(wheel_positions, list):
+            normalized_positions = []
+            for position in wheel_positions:
+                if not isinstance(position, (list, tuple)) or len(position) < 2:
+                    continue
+                normalized_positions.append((float(position[0]), float(position[1])))
+            entity.custom_wheel_positions_m = tuple(normalized_positions)
+
+        if 'gimbal_height_m' not in profile:
+            entity.gimbal_height_m = entity.body_clearance_m + entity.body_height_m + entity.gimbal_mount_gap_m + entity.gimbal_body_height_m * 0.5
+        entity.armor_plate_size_m = max(
+            float(getattr(entity, 'armor_plate_width_m', 0.12)),
+            float(getattr(entity, 'armor_plate_length_m', 0.12)),
+            float(getattr(entity, 'armor_plate_height_m', 0.12)),
+        )
+        entity.body_size_m = max(float(getattr(entity, 'body_length_m', 0.42)), float(getattr(entity, 'body_width_m', 0.42)))
+        self._enforce_role_geometry_constraints(entity, entity_type, robot_type)
 
     def _rule_health(self, entity_type, fallback_max, fallback_initial):
         health_config = self.config.get('rules', {}).get('health', {}).get(entity_type, {})
@@ -34,6 +136,22 @@ class EntityManager:
     def _robot_profile(self, robot_type):
         profiles = self.config.get('rules', {}).get('robot_profiles', {})
         return profiles.get(self._robot_role_key(robot_type), {})
+
+    def _enforce_role_geometry_constraints(self, entity, entity_type, robot_type=None):
+        if entity_type == 'robot' and robot_type == '工程':
+            entity.gimbal_length_m = 0.0
+            entity.gimbal_width_m = 0.0
+            entity.gimbal_body_height_m = 0.0
+            entity.gimbal_mount_gap_m = 0.0
+            entity.gimbal_mount_length_m = 0.0
+            entity.gimbal_mount_width_m = 0.0
+            entity.gimbal_mount_height_m = 0.0
+            entity.barrel_length_m = 0.0
+            entity.barrel_radius_m = 0.0
+
+    def _sync_traversal_constraints(self, entity):
+        wheel_radius = max(0.01, float(getattr(entity, 'wheel_radius_m', 0.08)))
+        entity.max_terrain_step_height_m = wheel_radius
 
     def _performance_rules(self):
         return self.config.get('rules', {}).get('performance_profiles', {})
@@ -119,12 +237,63 @@ class EntityManager:
         self._sync_legacy_ammo(entity)
 
     def _configure_mobility_profile(self, entity, entity_type, robot_type=None):
+        entity.vertical_scale_m = self.vertical_scale_m
         entity.can_climb_steps = entity_type in {'robot', 'sentry'}
+        entity.body_clearance_m = 0.10
+        entity.wheel_radius_m = 0.08
+        entity.gimbal_height_m = 0.50
+        entity.gimbal_length_m = 0.30
+        entity.gimbal_width_m = 0.10
+        entity.gimbal_body_height_m = 0.10
+        entity.gimbal_mount_gap_m = 0.10
+        entity.gimbal_mount_length_m = 0.10
+        entity.gimbal_mount_width_m = 0.10
+        entity.gimbal_mount_height_m = 0.10
+        entity.barrel_length_m = 0.36
+        entity.barrel_radius_m = 0.015
+        entity.front_climb_assist_style = 'none'
+        entity.rear_climb_assist_style = 'none'
+        entity.wheel_style = 'standard'
+        entity.suspension_style = 'none'
+        entity.arm_style = 'none'
+        entity.armor_plate_size_m = 0.12
+        entity.armor_plate_width_m = 0.12
+        entity.armor_plate_length_m = 0.12
+        entity.armor_plate_height_m = 0.12
+        entity.armor_plate_gap_m = 0.02
+        entity.armor_light_length_m = 0.10
+        entity.armor_light_width_m = 0.02
+        entity.armor_light_height_m = 0.02
+        entity.barrel_light_length_m = 0.10
+        entity.barrel_light_width_m = 0.02
+        entity.barrel_light_height_m = 0.02
+        entity.body_render_width_scale = 0.82
+        entity.max_pitch_up_deg = 40.0
+        entity.max_pitch_down_deg = 35.0
         if entity_type == 'sentry':
             entity.step_climb_duration_sec = 1.0
             entity.max_terrain_step_height_m = 0.35
             entity.collision_radius = 24.0
             entity.wheel_count = 4
+            entity.body_size_m = 0.55
+            entity.body_length_m = 0.55
+            entity.body_width_m = 0.50
+            entity.body_height_m = 0.20
+            entity.body_clearance_m = 0.10
+            entity.wheel_radius_m = 0.08
+            entity.wheel_style = 'mecanum'
+            entity.front_climb_assist_style = 'belt_lift'
+            entity.rear_climb_assist_style = 'dog_leg'
+            entity.armor_plate_size_m = 0.16
+            entity.armor_plate_width_m = 0.16
+            entity.armor_plate_length_m = 0.16
+            entity.armor_plate_height_m = 0.16
+            entity.gimbal_mount_gap_m = 0.10
+            entity.gimbal_height_m = entity.body_clearance_m + entity.body_height_m + entity.gimbal_mount_gap_m + entity.gimbal_body_height_m * 0.5
+            entity.barrel_length_m = 0.36
+            entity.barrel_radius_m = 0.015
+            self._apply_appearance_profile(entity, entity_type, robot_type=robot_type)
+            self._sync_traversal_constraints(entity)
             return
         if entity_type != 'robot':
             entity.can_climb_steps = False
@@ -144,21 +313,105 @@ class EntityManager:
             entity.max_terrain_step_height_m = 0.35
             entity.collision_radius = 16.0
             entity.wheel_count = 2
+            entity.body_size_m = 0.50
+            entity.body_length_m = 0.50
+            entity.body_width_m = 0.45
+            entity.body_height_m = 0.20
+            entity.body_clearance_m = 0.20
+            entity.wheel_radius_m = 0.06
+            entity.wheel_style = 'legged'
+            entity.suspension_style = 'five_link'
+            entity.armor_plate_size_m = 0.16
+            entity.armor_plate_width_m = 0.16
+            entity.armor_plate_length_m = 0.16
+            entity.armor_plate_height_m = 0.16
+            entity.gimbal_length_m = 0.30
+            entity.gimbal_width_m = 0.10
+            entity.gimbal_body_height_m = 0.10
+            entity.gimbal_mount_gap_m = 0.10
+            entity.gimbal_height_m = entity.body_clearance_m + entity.body_height_m + entity.gimbal_mount_gap_m + entity.gimbal_body_height_m * 0.5
+            entity.barrel_length_m = 0.36
+            entity.barrel_radius_m = 0.015
         elif robot_type == '英雄':
             entity.step_climb_duration_sec = 1.0
             entity.max_terrain_step_height_m = 0.35
             entity.collision_radius = 20.0
             entity.wheel_count = 4
+            entity.body_size_m = 0.60
+            entity.body_length_m = 0.65
+            entity.body_width_m = 0.55
+            entity.body_height_m = 0.20
+            entity.body_clearance_m = 0.10
+            entity.wheel_radius_m = 0.08
+            entity.wheel_style = 'mecanum'
+            entity.front_climb_assist_style = 'belt_lift'
+            entity.rear_climb_assist_style = 'dog_leg'
+            entity.armor_plate_size_m = 0.24
+            entity.armor_plate_width_m = 0.24
+            entity.armor_plate_length_m = 0.24
+            entity.armor_plate_height_m = 0.24
+            entity.gimbal_length_m = 0.35
+            entity.gimbal_width_m = 0.15
+            entity.gimbal_body_height_m = 0.15
+            entity.gimbal_mount_gap_m = 0.10
+            entity.gimbal_height_m = entity.body_clearance_m + entity.body_height_m + entity.gimbal_mount_gap_m + entity.gimbal_body_height_m * 0.5
+            entity.barrel_length_m = 0.48
+            entity.barrel_radius_m = 0.020
         elif robot_type == '工程':
             entity.step_climb_duration_sec = 1.0
             entity.max_terrain_step_height_m = 0.35
             entity.collision_radius = 21.0
             entity.wheel_count = 4
+            entity.body_size_m = 0.55
+            entity.body_length_m = 0.55
+            entity.body_width_m = 0.50
+            entity.body_height_m = 0.20
+            entity.body_clearance_m = 0.10
+            entity.wheel_radius_m = 0.08
+            entity.wheel_style = 'mecanum'
+            entity.arm_style = 'fixed_7'
+            entity.front_climb_assist_style = 'belt_lift'
+            entity.rear_climb_assist_style = 'dog_leg'
+            entity.armor_plate_size_m = 0.16
+            entity.armor_plate_width_m = 0.16
+            entity.armor_plate_length_m = 0.16
+            entity.armor_plate_height_m = 0.16
+            entity.gimbal_length_m = 0.0
+            entity.gimbal_width_m = 0.0
+            entity.gimbal_body_height_m = 0.0
+            entity.gimbal_mount_gap_m = 0.0
+            entity.gimbal_mount_length_m = 0.0
+            entity.gimbal_mount_width_m = 0.0
+            entity.gimbal_mount_height_m = 0.0
+            entity.gimbal_height_m = entity.body_clearance_m + entity.body_height_m + 0.22
+            entity.barrel_length_m = 0.0
+            entity.barrel_radius_m = 0.0
         else:
             entity.step_climb_duration_sec = 1.0
             entity.max_terrain_step_height_m = 0.35
             entity.collision_radius = 18.0
             entity.wheel_count = 4
+            entity.body_size_m = 0.50
+            entity.body_length_m = 0.50
+            entity.body_width_m = 0.45
+            entity.body_height_m = 0.20
+            entity.body_clearance_m = 0.20
+            entity.wheel_radius_m = 0.06
+            entity.wheel_style = 'legged'
+            entity.suspension_style = 'five_link'
+            entity.armor_plate_size_m = 0.16
+            entity.armor_plate_width_m = 0.16
+            entity.armor_plate_length_m = 0.16
+            entity.armor_plate_height_m = 0.16
+            entity.gimbal_length_m = 0.30
+            entity.gimbal_width_m = 0.10
+            entity.gimbal_body_height_m = 0.10
+            entity.gimbal_mount_gap_m = 0.10
+            entity.gimbal_height_m = entity.body_clearance_m + entity.body_height_m + entity.gimbal_mount_gap_m + entity.gimbal_body_height_m * 0.5
+            entity.barrel_length_m = 0.36
+            entity.barrel_radius_m = 0.015
+        self._apply_appearance_profile(entity, entity_type, robot_type=robot_type)
+        self._sync_traversal_constraints(entity)
     
     def create_entity(self, entity_id, entity_type, team, position, angle=0, robot_type=None):
         """创建单个实体"""

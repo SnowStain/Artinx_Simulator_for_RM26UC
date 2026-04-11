@@ -33,16 +33,22 @@ def create_terrain_scene_backend(name):
 
 def _sample_terrain_scene_data(renderer, map_manager, map_rgb):
     full_grid_width, full_grid_height = map_manager._grid_dimensions()
-    max_scene_cells = max(12000, int(getattr(renderer, 'terrain_scene_max_cells', 90000)))
+    effective_max_cells_getter = getattr(renderer, '_effective_terrain_scene_max_cells', None)
+    if callable(effective_max_cells_getter):
+        max_scene_cells = max(6000, int(effective_max_cells_getter()))
+    else:
+        max_scene_cells = max(12000, int(getattr(renderer, 'terrain_scene_max_cells', 90000)))
     scene_step = max(1, int(math.ceil(math.sqrt(max((full_grid_width * full_grid_height) / max(max_scene_cells, 1), 1.0)))))
     cache_key = (
         int(getattr(map_manager, 'raster_version', 0)),
         float(map_manager.terrain_grid_cell_size),
         int(map_manager.map_width),
         int(map_manager.map_height),
+        int(max_scene_cells),
         int(scene_step),
         id(map_rgb) if map_rgb is not None else None,
         str(getattr(renderer, 'terrain_editor_tool', 'terrain')),
+        bool(getattr(renderer, 'terrain_scene_force_dark_gray', False)),
     )
     if getattr(renderer, 'terrain_scene_sample_cache_key', None) == cache_key:
         cached = getattr(renderer, 'terrain_scene_sample_cache', None)
@@ -76,7 +82,10 @@ def _sample_terrain_scene_data(renderer, map_manager, map_rgb):
     )
     sampled_heights = height_map[np.ix_(center_ys, center_xs)]
     sampled_codes = terrain_type_map[np.ix_(center_ys, center_xs)]
-    if map_rgb is not None:
+    force_dark_gray = bool(getattr(renderer, 'terrain_scene_force_dark_gray', False))
+    if force_dark_gray:
+        sampled_base_colors = np.full((grid_height, grid_width, 3), (124, 128, 134), dtype=np.uint8)
+    elif map_rgb is not None:
         sampled_base_colors = map_rgb[
             np.ix_(
                 np.clip(world_center_ys.astype(np.int32), 0, map_rgb.shape[0] - 1),
@@ -102,7 +111,10 @@ def _sample_terrain_scene_data(renderer, map_manager, map_rgb):
     if np.any(non_flat_mask):
         overlay_colors = color_lut[sampled_codes]
         source_colors = blended_colors.astype(np.float32)
-        blended = source_colors * 0.45 + overlay_colors.astype(np.float32) * 0.55
+        if force_dark_gray:
+            blended = source_colors * 0.88 + overlay_colors.astype(np.float32) * 0.12
+        else:
+            blended = source_colors * 0.45 + overlay_colors.astype(np.float32) * 0.55
         blended_colors[non_flat_mask] = np.clip(blended[non_flat_mask], 0, 255).astype(np.uint8)
 
     data = {
@@ -110,6 +122,7 @@ def _sample_terrain_scene_data(renderer, map_manager, map_rgb):
         'grid_height': grid_height,
         'cell_size': cell_size,
         'scene_step': scene_step,
+        'height_scene_scale': float(map_manager.meters_to_world_units(1.0)) / max(cell_size, 1e-6),
         'sampled_heights': sampled_heights,
         'sampled_codes': sampled_codes,
         'sampled_base_colors': sampled_base_colors,
@@ -254,12 +267,12 @@ class SoftwareTerrainSceneBackend:
         pitch = max(0.18, min(1.15, renderer.terrain_3d_camera_pitch))
         scene_zoom = max(1.0, float(getattr(renderer, 'terrain_scene_zoom', 1.0)))
         center_offset_x, center_offset_y = _terrain_scene_focus_grid(renderer, map_manager, grid_width, grid_height, scene_step=data['scene_step'])
-        exaggeration = max(1.0, float(getattr(renderer, 'terrain_scene_vertical_exaggeration', 5.0)))
-        base_thickness = 0.16 * max(1.0, exaggeration * 0.55)
+        height_scene_scale = float(data.get('height_scene_scale', 1.0))
+        base_thickness = 0.16 * height_scene_scale
 
         def build_entries(tile_width):
             depth_scale = max(3.0, tile_width * 0.95)
-            height_scale = max(10.0, tile_width * 4.4) * exaggeration
+            height_scale = max(6.0, depth_scale) * height_scene_scale
             half_w = max(2.0, tile_width * 0.50)
             half_d = max(2.0, tile_width * 0.28 * pitch)
             entries = []
@@ -419,15 +432,19 @@ class ModernGLTerrainSceneBackend:
         self._ensure_geometry(renderer, game_engine.map_manager, map_rgb)
 
         grid_width, grid_height, max_height, scene_step = self.scene_bounds
-        mvp = build_terrain_scene_camera_state(
-            renderer,
-            game_engine.map_manager,
-            size,
-            int(grid_width),
-            int(grid_height),
-            float(max_height),
-            scene_step=int(scene_step),
-        )['mvp']
+        camera_override = getattr(renderer, 'terrain_scene_camera_override', None)
+        if isinstance(camera_override, dict) and camera_override.get('mvp') is not None:
+            mvp = camera_override['mvp']
+        else:
+            mvp = build_terrain_scene_camera_state(
+                renderer,
+                game_engine.map_manager,
+                size,
+                int(grid_width),
+                int(grid_height),
+                float(max_height),
+                scene_step=int(scene_step),
+            )['mvp']
 
         self.framebuffer.use()
         self.framebuffer.clear(0.87, 0.90, 0.94, 1.0)
@@ -457,7 +474,15 @@ class ModernGLTerrainSceneBackend:
     def _ensure_geometry(self, renderer, map_manager, map_rgb):
         data = _sample_terrain_scene_data(renderer, map_manager, map_rgb)
         scene_step = int(data.get('scene_step', 1))
-        geometry_key = (map_manager.raster_version, map_manager.terrain_grid_cell_size, scene_step)
+        geometry_key = (
+            map_manager.raster_version,
+            map_manager.terrain_grid_cell_size,
+            int(data.get('grid_width', 0)),
+            int(data.get('grid_height', 0)),
+            scene_step,
+            round(float(data.get('height_scene_scale', 1.0)), 6),
+            bool(getattr(renderer, 'terrain_scene_force_dark_gray', False)),
+        )
         if self.geometry_key == geometry_key and self.vao is not None:
             return
 
@@ -467,9 +492,8 @@ class ModernGLTerrainSceneBackend:
         blended_colors = data['blended_colors']
         center_offset_x = grid_width / 2.0
         center_offset_y = grid_height / 2.0
-        exaggeration = max(1.0, float(getattr(renderer, 'terrain_scene_vertical_exaggeration', 5.0)))
-        vertical_scale = 0.82 * exaggeration
-        base_thickness = 0.16 * max(1.0, exaggeration * 0.55)
+        vertical_scale = float(data.get('height_scene_scale', 1.0))
+        base_thickness = 0.16 * vertical_scale
         vertices = []
 
         for grid_y in range(grid_height):
