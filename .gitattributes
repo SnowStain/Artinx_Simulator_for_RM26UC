@@ -1,0 +1,1 @@
+maps/basicMap/map.json filter=lfs diff=lfs merge=lfs -text
