@@ -61,9 +61,17 @@ class Entity:
         self.rear_climb_assist_mount_offset_x_m = 0.03
         self.rear_climb_assist_mount_height_m = 0.22
         self.rear_climb_assist_inner_offset_m = 0.03
+        self.chassis_subtype = 'balance_legged'
+        self.body_shape = 'box'
         self.wheel_style = 'standard'
         self.suspension_style = 'none'
         self.arm_style = 'none'
+        self.wheel_orbit_yaws_deg = ()
+        self.wheel_self_yaws_deg = ()
+        self.armor_orbit_yaws_deg = ()
+        self.armor_self_yaws_deg = ()
+        self.armor_light_orbit_yaws_deg = ()
+        self.armor_light_self_yaws_deg = ()
         self.armor_plate_size_m = 0.12
         self.armor_plate_width_m = 0.12
         self.armor_plate_length_m = 0.12
@@ -95,6 +103,16 @@ class Entity:
         self.max_power = 100
         self.power_recovery_rate = 1.0
         self.chassis_mode = 'health_priority'
+        self.chassis_supports_jump = True
+        self.chassis_speed_scale = 1.0
+        self.chassis_drive_power_limit_w = 180.0
+        self.chassis_drive_idle_draw_w = 16.0
+        self.chassis_drive_rpm_coeff = 0.00005
+        self.chassis_drive_accel_coeff = 0.012
+        self.chassis_power_draw_w = 0.0
+        self.chassis_rpm = 0.0
+        self.chassis_speed_limit_mps = 0.0
+        self.chassis_power_ratio = 1.0
         
         # 枪管热量系统
         self.heat = 0

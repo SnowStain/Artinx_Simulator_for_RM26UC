@@ -117,10 +117,13 @@ class RendererDetailPopupMixin:
 
         combat_lines = [
             f"姿态模式: {detail['posture']}",
+            f"底盘构型: {detail.get('chassis_subtype_label') or detail.get('chassis_subtype') or '标准'}",
             f"底盘模式: {dict(detail.get('mode_labels', {}).get('left_options', [('health_priority', '血量优先'), ('power_priority', '功率优先')])).get(detail.get('chassis_mode'), detail.get('chassis_mode'))}",
             f"冷却模式: {dict(detail.get('mode_labels', {}).get('right_options', [('cooling_priority', '冷却优先'), ('burst_priority', '爆发优先')])).get(detail.get('gimbal_mode'), detail.get('gimbal_mode'))}",
             f"脱战状态: {'是' if detail.get('out_of_combat') else '否'}",
             f"当前移速: {detail.get('movement_speed_mps', 0.0):.2f} m/s",
+            f"移速上限: {detail.get('movement_speed_cap_mps', 0.0):.2f} m/s",
+            f"底盘功率: {detail.get('chassis_power_draw_w', 0.0):.1f} W | {detail.get('chassis_rpm', 0.0):.0f} rpm",
             f"功率恢复: {detail['power_recovery_rate']:.2f}/s",
             f"当前冷却: {detail['current_cooling_rate']:.2f}/s",
             f"基础冷却: {detail['base_heat_dissipation_rate']:.2f}/s",

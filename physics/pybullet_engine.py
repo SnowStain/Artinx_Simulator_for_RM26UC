@@ -33,13 +33,16 @@ class PyBulletPhysicsEngine:
         self.airborne_ground_tolerance_m = float(physics_cfg.get('airborne_ground_tolerance_m', 0.035))
         self.fixed_time_step = float(physics_cfg.get('pybullet_fixed_time_step_sec', 1.0 / 120.0))
         self.max_substeps = int(max(1, physics_cfg.get('pybullet_max_substeps', 4)))
+        self.grounded_substeps = int(max(1, min(self.max_substeps, physics_cfg.get('pybullet_grounded_substeps', 1))))
+        self.pose_sync_yaw_epsilon_deg = float(physics_cfg.get('pybullet_pose_sync_yaw_epsilon_deg', 0.9))
         self.infantry_jump_launch_velocity_mps = math.sqrt(max(0.0, 2.0 * self.jump_gravity_mps2 * self.infantry_jump_height_m))
 
         self.client = p.connect(p.DIRECT)
         p.setGravity(0.0, 0.0, -self.jump_gravity_mps2, physicsClientId=self.client)
         p.setPhysicsEngineParameter(
             fixedTimeStep=self.fixed_time_step,
-            numSubSteps=self.max_substeps,
+            # 子步由 update 里的显式循环控制，避免和 Bullet 内部 numSubSteps 叠加放大开销。
+            numSubSteps=1,
             physicsClientId=self.client,
         )
         self._plane_shape = p.createCollisionShape(p.GEOM_PLANE, physicsClientId=self.client)
@@ -91,6 +94,9 @@ class PyBulletPhysicsEngine:
         pixels_per_meter_y = map_height / max(field_width_m, 1e-6)
         pixels_per_meter = max((pixels_per_meter_x + pixels_per_meter_y) * 0.5, 1e-6)
         return float(world_units) / pixels_per_meter
+
+    def _normalize_angle_diff_deg(self, angle_deg):
+        return ((float(angle_deg) + 180.0) % 360.0) - 180.0
 
     def _entity_uses_level_body_pose(self, entity):
         return getattr(entity, 'type', None) == 'robot' and getattr(entity, 'robot_type', '') == '步兵'
@@ -181,7 +187,7 @@ class PyBulletPhysicsEngine:
         link_joint_types = []
         link_joint_axes = []
 
-        if getattr(entity, 'rear_climb_assist_style', 'none') != 'none':
+        if getattr(entity, 'rear_climb_assist_style', 'none') not in {'none', 'balance_leg'}:
             mount_x = -float(getattr(entity, 'body_length_m', getattr(entity, 'body_size_m', 0.42))) * 0.5 + float(getattr(entity, 'rear_climb_assist_mount_offset_x_m', 0.03))
             mount_z = float(getattr(entity, 'rear_climb_assist_mount_height_m', 0.20)) - float(getattr(entity, 'body_clearance_m', 0.0)) - float(getattr(entity, 'body_height_m', 0.18)) * 0.5
             for side_index, side_sign in enumerate(side_offsets):
@@ -210,7 +216,7 @@ class PyBulletPhysicsEngine:
                 link_joint_axes.append([0.0, 1.0, 0.0])
                 joint_pairs.append((upper_joint_index, lower_joint_index, 'rear'))
 
-        if getattr(entity, 'wheel_style', 'standard') == 'legged':
+        if getattr(entity, 'wheel_style', 'standard') == 'legged' and getattr(entity, 'chassis_subtype', '') not in {'balance_legged'}:
             mount_x = float(getattr(entity, 'body_length_m', getattr(entity, 'body_size_m', 0.42))) * 0.22
             mount_z = -float(getattr(entity, 'body_height_m', 0.18)) * 0.12
             for side_index, side_sign in enumerate(side_offsets):
@@ -360,11 +366,51 @@ class PyBulletPhysicsEngine:
     def _can_entity_jump(self, entity, body_position_z_m, map_manager):
         if getattr(entity, 'type', None) != 'robot' or getattr(entity, 'robot_type', '') != '步兵':
             return False
+        if not bool(getattr(entity, 'chassis_supports_jump', True)):
+            return False
         if map_manager is None:
             return False
         terrain_height = float(map_manager.get_terrain_height_m(entity.position['x'], entity.position['y']))
         grounded_center = self._entity_center_z_m(entity, terrain_height)
         return abs(float(body_position_z_m) - grounded_center) <= self.airborne_ground_tolerance_m
+
+    def _resolved_entity_speed_limit_mps(self, entity):
+        base_speed_mps = self.max_speed * max(0.35, float(getattr(entity, 'chassis_speed_scale', 1.0)))
+        effective_capacity = max(1e-6, float(getattr(entity, 'max_power', 0.0)) * float(getattr(entity, 'dynamic_power_capacity_mult', 1.0)))
+        power_ratio = max(0.0, min(1.0, float(getattr(entity, 'power', 0.0)) / effective_capacity))
+        floor_ratio = 0.46 if bool(getattr(entity, 'chassis_supports_jump', True)) else 0.54
+        return base_speed_mps * (floor_ratio + (1.0 - floor_ratio) * power_ratio)
+
+    def _apply_chassis_power_model(self, entity, desired_speed_mps, current_speed_mps, dt):
+        effective_capacity = max(1e-6, float(getattr(entity, 'max_power', 0.0)) * float(getattr(entity, 'dynamic_power_capacity_mult', 1.0)))
+        power_ratio = max(0.0, min(1.0, float(getattr(entity, 'power', 0.0)) / effective_capacity))
+        idle_draw_w = max(0.0, float(getattr(entity, 'chassis_drive_idle_draw_w', 16.0)))
+        if abs(float(desired_speed_mps)) <= 1e-5:
+            entity.chassis_power_draw_w = idle_draw_w * 0.22
+            entity.chassis_rpm = 0.0
+            entity.chassis_speed_limit_mps = self._resolved_entity_speed_limit_mps(entity)
+            entity.chassis_power_ratio = power_ratio
+            return entity.chassis_speed_limit_mps
+
+        wheel_radius_m = max(0.02, float(getattr(entity, 'wheel_radius_m', 0.08)))
+        wheel_count = max(1, int(getattr(entity, 'wheel_count', 4) or 4))
+        desired_rpm = abs(float(desired_speed_mps)) / max(2.0 * math.pi * wheel_radius_m, 1e-6) * 60.0
+        current_rpm = abs(float(current_speed_mps)) / max(2.0 * math.pi * wheel_radius_m, 1e-6) * 60.0
+        rpm_delta_per_sec = abs(desired_rpm - current_rpm) / max(float(dt), 1e-6)
+        rpm_coeff = max(0.0, float(getattr(entity, 'chassis_drive_rpm_coeff', 0.00005)))
+        accel_coeff = max(0.0, float(getattr(entity, 'chassis_drive_accel_coeff', 0.012)))
+        requested_power_w = idle_draw_w + wheel_count * rpm_coeff * desired_rpm * desired_rpm + accel_coeff * min(rpm_delta_per_sec, 6000.0)
+        transient_limit_w = max(24.0, float(getattr(entity, 'chassis_drive_power_limit_w', 180.0)) * (0.42 + power_ratio * 0.58))
+        power_scale = 1.0 if requested_power_w <= transient_limit_w else max(0.25, math.sqrt(transient_limit_w / max(requested_power_w, 1e-6)))
+        speed_limit_mps = self._resolved_entity_speed_limit_mps(entity)
+        allowed_speed_mps = min(speed_limit_mps, abs(float(desired_speed_mps)) * power_scale)
+        movement_draw_w = max(0.0, requested_power_w * power_scale - idle_draw_w * 0.30)
+        entity.power = max(0.0, min(effective_capacity, float(getattr(entity, 'power', 0.0)) - movement_draw_w * float(dt) * 0.018))
+        entity.chassis_power_draw_w = requested_power_w * power_scale
+        entity.chassis_rpm = desired_rpm * power_scale
+        entity.chassis_speed_limit_mps = speed_limit_mps
+        entity.chassis_power_ratio = power_ratio
+        return allowed_speed_mps
 
     def _apply_jump_request(self, entity, body_id, map_manager):
         if not bool(getattr(entity, 'jump_requested', False)):
@@ -383,6 +429,19 @@ class PyBulletPhysicsEngine:
             self.infantry_jump_launch_velocity_mps,
         )
         p.resetBaseVelocity(body_id, linearVelocity=jump_velocity, physicsClientId=self.client)
+
+    def _recommended_substep_count(self, tracked, sim_dt):
+        base_count = max(1, min(self.max_substeps, int(math.ceil(sim_dt / max(self.fixed_time_step, 1e-6)))))
+        if base_count <= 1 or not tracked:
+            return base_count
+        for entity, _body_id in tracked:
+            if bool(getattr(entity, 'jump_requested', False)):
+                return base_count
+            if self._current_jump_pose_height_m(entity) > 1e-3 or float(getattr(entity, 'jump_airborne_height_m', 0.0)) > 1e-3:
+                return base_count
+            if getattr(entity, 'step_climb_state', None):
+                return base_count
+        return min(base_count, self.grounded_substeps)
 
     def _evaluate_target_motion(self, entity, body_id, map_manager, dt):
         body_position, _ = p.getBasePositionAndOrientation(body_id, physicsClientId=self.client)
@@ -452,7 +511,7 @@ class PyBulletPhysicsEngine:
         return current_world_x, current_world_y, current_ground, False, False
 
     def _apply_entity_drive(self, entity, body_id, map_manager, dt):
-        body_position, _ = p.getBasePositionAndOrientation(body_id, physicsClientId=self.client)
+        body_position, body_orientation = p.getBasePositionAndOrientation(body_id, physicsClientId=self.client)
         linear_velocity, _ = p.getBaseVelocity(body_id, physicsClientId=self.client)
         target_world_x, target_world_y, target_ground, stepped, force_xy_sync = self._evaluate_target_motion(entity, body_id, map_manager, dt)
         target_x_m = self._world_units_to_meters(target_world_x)
@@ -460,21 +519,34 @@ class PyBulletPhysicsEngine:
         planar_vx = (target_x_m - body_position[0]) / max(float(dt), 1e-6)
         planar_vy = (target_y_m - body_position[1]) / max(float(dt), 1e-6)
         planar_speed = math.hypot(planar_vx, planar_vy)
-        max_speed_mps = self.max_speed
-        if planar_speed > max_speed_mps:
+        current_planar_speed_mps = math.hypot(float(linear_velocity[0]), float(linear_velocity[1]))
+        max_speed_mps = self._apply_chassis_power_model(entity, planar_speed, current_planar_speed_mps, dt)
+        if planar_speed > max_speed_mps > 1e-6:
             planar_vx *= max_speed_mps / planar_speed
             planar_vy *= max_speed_mps / planar_speed
+            planar_speed = max_speed_mps
         vertical_velocity = float(linear_velocity[2]) * max(0.0, 1.0 - self.linear_drag * float(dt))
         target_center_z = self._entity_center_z_m(entity, target_ground)
         reset_z = max(body_position[2], target_center_z)
         if stepped:
             reset_z = target_center_z
         yaw_quat = p.getQuaternionFromEuler([0.0, 0.0, math.radians(float(getattr(entity, 'angle', 0.0)))])
-        reset_x = target_x_m
-        reset_y = target_y_m
         self._entity_commanded_planar_velocity_mps[entity.id] = (planar_vx, planar_vy)
-        p.resetBasePositionAndOrientation(body_id, [reset_x, reset_y, reset_z], yaw_quat, physicsClientId=self.client)
-        p.resetBaseVelocity(body_id, linearVelocity=[0.0, 0.0, vertical_velocity], angularVelocity=[0.0, 0.0, math.radians(float(getattr(entity, 'angular_velocity', 0.0)))], physicsClientId=self.client)
+        snap_xy = bool(force_xy_sync or stepped)
+        snap_z = abs(float(reset_z) - float(body_position[2])) > 0.025
+        current_yaw_deg = math.degrees(p.getEulerFromQuaternion(body_orientation)[2])
+        snap_yaw = abs(self._normalize_angle_diff_deg(float(getattr(entity, 'angle', 0.0)) - current_yaw_deg)) > self.pose_sync_yaw_epsilon_deg
+        reset_x = target_x_m if snap_xy else body_position[0]
+        reset_y = target_y_m if snap_xy else body_position[1]
+        reset_body_z = reset_z if snap_xy or snap_z else body_position[2]
+        if snap_xy or snap_z or snap_yaw:
+            p.resetBasePositionAndOrientation(body_id, [reset_x, reset_y, reset_body_z], yaw_quat, physicsClientId=self.client)
+        p.resetBaseVelocity(
+            body_id,
+            linearVelocity=[0.0 if snap_xy else planar_vx, 0.0 if snap_xy else planar_vy, vertical_velocity],
+            angularVelocity=[0.0, 0.0, math.radians(float(getattr(entity, 'angular_velocity', 0.0)))],
+            physicsClientId=self.client,
+        )
         self._apply_jump_request(entity, body_id, map_manager)
         self._sync_joint_targets(entity)
 
@@ -674,7 +746,7 @@ class PyBulletPhysicsEngine:
                 continue
             self._apply_entity_drive(entity, body_id, map_manager, sim_dt)
 
-        substep_count = max(1, int(math.ceil(sim_dt / max(self.fixed_time_step, 1e-6))))
+        substep_count = self._recommended_substep_count(tracked, sim_dt)
         for _ in range(substep_count):
             p.stepSimulation(physicsClientId=self.client)
 

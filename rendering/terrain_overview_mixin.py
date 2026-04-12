@@ -136,7 +136,16 @@ class TerrainOverviewMixin:
                     self.player_terrain_surface_cache = surface
                     self.player_terrain_surface_key = cache_key
                 return surface
-            return backend.render_scene(self, game_engine, scene_rect.size, map_rgb)
+            cache_key_getter = getattr(self, '_terrain_scene_surface_cache_key', None)
+            cache_key = cache_key_getter(game_engine, scene_rect, map_rgb) if callable(cache_key_getter) else None
+            cached_surface = getattr(self, 'terrain_scene_surface_cache', None)
+            if cache_key is not None and getattr(self, 'terrain_scene_surface_key', None) == cache_key and cached_surface is not None:
+                return cached_surface
+            surface = backend.render_scene(self, game_engine, scene_rect.size, map_rgb)
+            if cache_key is not None:
+                self.terrain_scene_surface_cache = surface
+                self.terrain_scene_surface_key = cache_key
+            return surface
         except Exception:
             if getattr(backend, 'name', 'software') == 'software':
                 raise
@@ -148,6 +157,8 @@ class TerrainOverviewMixin:
         self.terrain_3d_render_key = None
         self.player_terrain_surface_cache = None
         self.player_terrain_surface_key = None
+        self.terrain_scene_surface_cache = None
+        self.terrain_scene_surface_key = None
 
     def _draw_terrain_scene_hover_panel(self, surface, rect, map_manager, world_pos):
         metrics = self._hover_grid_metrics(map_manager, world_pos)
@@ -654,6 +665,9 @@ class TerrainOverviewMixin:
         pygame.draw.rect(surface, self.colors['panel_border'], badge_rect, 1, border_radius=6)
         badge_render = self.tiny_font.render(badge_text, True, self.colors['panel_text'])
         surface.blit(badge_render, badge_render.get_rect(center=badge_rect.center))
+        mini_fps = getattr(self, '_render_mini_fps_label', None)
+        if callable(mini_fps):
+            mini_fps(surface, game_engine, anchor='bottom_left', inset=10)
 
         editor_top = footer_y + 28
         editor_rect = pygame.Rect(18, editor_top, width - 36, max(220, height - editor_top - bottom_margin))

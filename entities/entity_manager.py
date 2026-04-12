@@ -4,6 +4,7 @@
 import json
 import os
 
+from entities.chassis_profiles import INFANTRY_CHASSIS_SUBTYPE_DEFAULT, infantry_chassis_preset, normalize_infantry_chassis_subtype, resolve_infantry_subtype_profile
 from entities.entity import Entity
 
 class EntityManager:
@@ -44,12 +45,21 @@ class EntityManager:
             return None
         return tuple(max(0, min(255, int(round(float(channel))))) for channel in value[:3])
 
+    def _resolve_robot_subtype(self, robot_type, robot_subtype=None):
+        if robot_type != '步兵':
+            return ''
+        return normalize_infantry_chassis_subtype(robot_subtype or INFANTRY_CHASSIS_SUBTYPE_DEFAULT)
+
     def _apply_appearance_profile(self, entity, entity_type, robot_type=None):
         profiles = self.appearance_presets.get('profiles', {}) if isinstance(self.appearance_presets, dict) else {}
         role_key = 'sentry' if entity_type == 'sentry' else self._robot_role_key(robot_type)
         profile = profiles.get(role_key, {})
         if not isinstance(profile, dict):
             return
+        if role_key == 'infantry':
+            profile = resolve_infantry_subtype_profile(profile, getattr(entity, 'chassis_subtype', None))
+        else:
+            profile = dict(profile)
 
         numeric_fields = (
             'collision_radius',
@@ -96,14 +106,24 @@ class EntityManager:
             'rear_climb_assist_mount_offset_x_m',
             'rear_climb_assist_mount_height_m',
             'rear_climb_assist_inner_offset_m',
+            'chassis_speed_scale',
+            'chassis_drive_power_limit_w',
+            'chassis_drive_idle_draw_w',
+            'chassis_drive_rpm_coeff',
+            'chassis_drive_accel_coeff',
         )
         for field_name in numeric_fields:
             if field_name in profile:
                 setattr(entity, field_name, float(profile[field_name]))
 
-        for field_name in ('front_climb_assist_style', 'rear_climb_assist_style', 'wheel_style', 'suspension_style', 'arm_style'):
+        for field_name in ('front_climb_assist_style', 'rear_climb_assist_style', 'wheel_style', 'suspension_style', 'arm_style', 'body_shape'):
             if field_name in profile:
                 setattr(entity, field_name, str(profile[field_name]))
+
+        if 'chassis_subtype' in profile:
+            entity.chassis_subtype = self._resolve_robot_subtype(robot_type, profile.get('chassis_subtype'))
+        if 'chassis_supports_jump' in profile:
+            entity.chassis_supports_jump = bool(profile.get('chassis_supports_jump'))
 
         for field_name in ('body_color_rgb', 'turret_color_rgb', 'armor_color_rgb', 'wheel_color_rgb'):
             if field_name in profile:
@@ -117,6 +137,13 @@ class EntityManager:
                     continue
                 normalized_positions.append((float(position[0]), float(position[1])))
             entity.custom_wheel_positions_m = tuple(normalized_positions)
+            if normalized_positions:
+                entity.wheel_count = len(normalized_positions)
+
+        for field_name in ('wheel_orbit_yaws_deg', 'wheel_self_yaws_deg', 'armor_orbit_yaws_deg', 'armor_self_yaws_deg', 'armor_light_orbit_yaws_deg', 'armor_light_self_yaws_deg'):
+            values = profile.get(field_name)
+            if isinstance(values, list):
+                setattr(entity, field_name, tuple(round(float(value), 3) for value in values))
 
         if 'gimbal_height_m' not in profile:
             entity.gimbal_height_m = entity.body_clearance_m + entity.body_height_m + entity.gimbal_mount_gap_m + entity.gimbal_body_height_m * 0.5
@@ -258,6 +285,13 @@ class EntityManager:
     def _configure_mobility_profile(self, entity, entity_type, robot_type=None):
         entity.vertical_scale_m = self.vertical_scale_m
         entity.can_climb_steps = entity_type in {'robot', 'sentry'}
+        entity.chassis_supports_jump = False
+        entity.chassis_speed_scale = 1.0
+        entity.chassis_drive_power_limit_w = 180.0
+        entity.chassis_drive_idle_draw_w = 16.0
+        entity.chassis_drive_rpm_coeff = 0.00005
+        entity.chassis_drive_accel_coeff = 0.012
+        entity.body_shape = 'box'
         entity.body_clearance_m = 0.10
         entity.wheel_radius_m = 0.08
         entity.gimbal_height_m = 0.50
@@ -307,6 +341,7 @@ class EntityManager:
         entity.direct_terrain_step_height_m = 0.06
         entity.max_step_climb_height_m = 0.06
         if entity_type == 'sentry':
+            entity.chassis_subtype = ''
             entity.step_climb_duration_sec = 1.0
             entity.max_step_climb_height_m = 0.35
             entity.collision_radius = 24.0
@@ -332,6 +367,7 @@ class EntityManager:
             self._sync_traversal_constraints(entity)
             return
         if entity_type != 'robot':
+            entity.chassis_subtype = ''
             entity.can_climb_steps = False
             entity.step_climb_duration_sec = 0.0
             static_radius = {
@@ -345,18 +381,38 @@ class EntityManager:
             entity.wheel_count = 0
             return
         if robot_type == '步兵':
-            entity.step_climb_duration_sec = 1.0
-            entity.max_step_climb_height_m = 0.35
-            entity.collision_radius = 16.0
-            entity.wheel_count = 2
-            entity.body_size_m = 0.50
-            entity.body_length_m = 0.50
-            entity.body_width_m = 0.45
-            entity.body_height_m = 0.20
-            entity.body_clearance_m = 0.20
-            entity.wheel_radius_m = 0.06
-            entity.wheel_style = 'legged'
-            entity.suspension_style = 'five_link'
+            entity.chassis_subtype = self._resolve_robot_subtype(robot_type, getattr(entity, 'chassis_subtype', None))
+            subtype_preset = infantry_chassis_preset(entity.chassis_subtype)
+            entity.step_climb_duration_sec = 0.75 if entity.chassis_subtype == 'omni_wheel' else 1.0
+            entity.direct_terrain_step_height_m = 0.08 if entity.chassis_subtype == 'omni_wheel' else 0.06
+            entity.max_step_climb_height_m = 0.14 if entity.chassis_subtype == 'omni_wheel' else 0.35
+            entity.collision_radius = 18.0 if entity.chassis_subtype == 'omni_wheel' else 16.0
+            entity.wheel_count = int(subtype_preset.get('wheel_count', 2))
+            entity.body_size_m = max(float(subtype_preset.get('body_length_m', 0.50)), float(subtype_preset.get('body_width_m', 0.45)))
+            entity.body_length_m = float(subtype_preset.get('body_length_m', 0.50))
+            entity.body_width_m = float(subtype_preset.get('body_width_m', 0.45))
+            entity.body_height_m = float(subtype_preset.get('body_height_m', 0.20))
+            entity.body_clearance_m = float(subtype_preset.get('body_clearance_m', 0.20))
+            entity.wheel_radius_m = float(subtype_preset.get('wheel_radius_m', 0.06))
+            entity.body_render_width_scale = float(subtype_preset.get('body_render_width_scale', 0.73))
+            entity.body_shape = str(subtype_preset.get('body_shape', 'box'))
+            entity.wheel_style = str(subtype_preset.get('wheel_style', 'legged'))
+            entity.suspension_style = str(subtype_preset.get('suspension_style', 'five_link'))
+            entity.front_climb_assist_style = str(subtype_preset.get('front_climb_assist_style', 'none'))
+            entity.rear_climb_assist_style = str(subtype_preset.get('rear_climb_assist_style', 'balance_leg'))
+            entity.custom_wheel_positions_m = tuple((float(position[0]), float(position[1])) for position in subtype_preset.get('custom_wheel_positions_m', ()))
+            entity.wheel_orbit_yaws_deg = tuple(float(value) for value in subtype_preset.get('wheel_orbit_yaws_deg', ()))
+            entity.wheel_self_yaws_deg = tuple(float(value) for value in subtype_preset.get('wheel_self_yaws_deg', ()))
+            entity.armor_orbit_yaws_deg = tuple(float(value) for value in subtype_preset.get('armor_orbit_yaws_deg', (0.0, 180.0, 90.0, 270.0)))
+            entity.armor_self_yaws_deg = tuple(float(value) for value in subtype_preset.get('armor_self_yaws_deg', (0.0, 180.0, 90.0, 270.0)))
+            entity.armor_light_orbit_yaws_deg = tuple(float(value) for value in subtype_preset.get('armor_light_orbit_yaws_deg', entity.armor_orbit_yaws_deg))
+            entity.armor_light_self_yaws_deg = tuple(float(value) for value in subtype_preset.get('armor_light_self_yaws_deg', entity.armor_self_yaws_deg))
+            entity.chassis_supports_jump = bool(subtype_preset.get('chassis_supports_jump', True))
+            entity.chassis_speed_scale = float(subtype_preset.get('chassis_speed_scale', 1.0))
+            entity.chassis_drive_power_limit_w = float(subtype_preset.get('chassis_drive_power_limit_w', 150.0))
+            entity.chassis_drive_idle_draw_w = float(subtype_preset.get('chassis_drive_idle_draw_w', 16.0))
+            entity.chassis_drive_rpm_coeff = float(subtype_preset.get('chassis_drive_rpm_coeff', 0.00005))
+            entity.chassis_drive_accel_coeff = float(subtype_preset.get('chassis_drive_accel_coeff', 0.012))
             entity.armor_plate_size_m = 0.16
             entity.armor_plate_width_m = 0.16
             entity.armor_plate_length_m = 0.16
@@ -369,6 +425,7 @@ class EntityManager:
             entity.barrel_length_m = 0.36
             entity.barrel_radius_m = 0.015
         elif robot_type == '英雄':
+            entity.chassis_subtype = ''
             entity.step_climb_duration_sec = 1.0
             entity.max_step_climb_height_m = 0.35
             entity.collision_radius = 20.0
@@ -394,6 +451,7 @@ class EntityManager:
             entity.barrel_length_m = 0.48
             entity.barrel_radius_m = 0.020
         elif robot_type == '工程':
+            entity.chassis_subtype = ''
             entity.step_climb_duration_sec = 1.0
             entity.max_step_climb_height_m = 0.35
             entity.collision_radius = 21.0
@@ -423,6 +481,7 @@ class EntityManager:
             entity.barrel_length_m = 0.0
             entity.barrel_radius_m = 0.0
         else:
+            entity.chassis_subtype = ''
             entity.step_climb_duration_sec = 1.0
             entity.max_step_climb_height_m = 0.35
             entity.collision_radius = 18.0
@@ -449,9 +508,10 @@ class EntityManager:
         self._apply_appearance_profile(entity, entity_type, robot_type=robot_type)
         self._sync_traversal_constraints(entity)
     
-    def create_entity(self, entity_id, entity_type, team, position, angle=0, robot_type=None):
+    def create_entity(self, entity_id, entity_type, team, position, angle=0, robot_type=None, robot_subtype=None):
         """创建单个实体"""
         entity = Entity(entity_id, entity_type, team, position, angle, robot_type)
+        entity.chassis_subtype = self._resolve_robot_subtype(robot_type, robot_subtype)
         self.entities.append(entity)
         self.entity_map[entity_id] = entity
 
@@ -527,6 +587,7 @@ class EntityManager:
         """根据配置创建所有实体"""
         initial_positions = self.config.get('entities', {}).get('initial_positions', {})
         robot_types = self.config.get('entities', {}).get('robot_types', {})
+        robot_subtypes = self.config.get('entities', {}).get('robot_subtypes', {})
         
         # 创建红方实体
         red_positions = initial_positions.get('red', {})
@@ -535,12 +596,13 @@ class EntityManager:
                 entity_id = f"red_{name}"
                 entity_type = "sentry" if name == 'robot_7' else "robot"
                 robot_type = robot_types.get(name, "步兵")
+                robot_subtype = robot_subtypes.get(name)
             else:
                 continue
             
             position = {'x': pos['x'], 'y': pos['y'], 'z': pos.get('height', 0)}
             angle = pos.get('angle', 0)
-            self.create_entity(entity_id, entity_type, "red", position, angle, robot_type)
+            self.create_entity(entity_id, entity_type, "red", position, angle, robot_type, robot_subtype)
         
         # 创建蓝方实体
         blue_positions = initial_positions.get('blue', {})
@@ -549,12 +611,13 @@ class EntityManager:
                 entity_id = f"blue_{name}"
                 entity_type = "sentry" if name == 'robot_7' else "robot"
                 robot_type = robot_types.get(name, "步兵")
+                robot_subtype = robot_subtypes.get(name)
             else:
                 continue
             
             position = {'x': pos['x'], 'y': pos['y'], 'z': pos.get('height', 0)}
             angle = pos.get('angle', 0)
-            self.create_entity(entity_id, entity_type, "blue", position, angle, robot_type)
+            self.create_entity(entity_id, entity_type, "blue", position, angle, robot_type, robot_subtype)
 
         self._create_structure_entities()
 
@@ -619,6 +682,28 @@ class EntityManager:
             team_positions[key] = payload
         return initial_positions
 
+    def export_robot_subtypes(self):
+        robot_subtypes = {}
+        for entity in self.entities:
+            if entity.type != 'robot' or entity.robot_type != '步兵':
+                continue
+            key = entity.id.replace(f"{entity.team}_", "")
+            if key not in self.editable_entity_keys:
+                continue
+            robot_subtypes[key] = self._resolve_robot_subtype(entity.robot_type, getattr(entity, 'chassis_subtype', None))
+        return robot_subtypes
+
+    def set_entity_chassis_subtype(self, entity, chassis_subtype, preserve_state=True):
+        if entity is None or getattr(entity, 'type', None) != 'robot' or getattr(entity, 'robot_type', '') != '步兵':
+            return False
+        resolved_subtype = self._resolve_robot_subtype(entity.robot_type, chassis_subtype)
+        if resolved_subtype == getattr(entity, 'chassis_subtype', None):
+            return True
+        entity.chassis_subtype = resolved_subtype
+        self._configure_mobility_profile(entity, entity.type, entity.robot_type)
+        self.refresh_entity_performance_profile(entity, preserve_state=preserve_state)
+        return True
+
     def export_entity_states(self):
         """导出对局快照。"""
         states = []
@@ -628,6 +713,7 @@ class EntityManager:
                 'type': entity.type,
                 'team': entity.team,
                 'robot_type': entity.robot_type,
+                'chassis_subtype': getattr(entity, 'chassis_subtype', ''),
                 'position': dict(entity.position),
                 'spawn_position': dict(entity.spawn_position),
                 'angle': entity.angle,
@@ -715,6 +801,10 @@ class EntityManager:
             if entity.id not in state_map:
                 continue
             state = state_map[entity.id]
+            restored_robot_type = state.get('robot_type', entity.robot_type)
+            entity.robot_type = restored_robot_type
+            entity.chassis_subtype = self._resolve_robot_subtype(restored_robot_type, state.get('chassis_subtype', getattr(entity, 'chassis_subtype', None)))
+            self._configure_mobility_profile(entity, entity.type, entity.robot_type)
             entity.position = dict(state.get('position', entity.position))
             entity.spawn_position = dict(state.get('spawn_position', entity.spawn_position))
             entity.angle = state.get('angle', entity.angle)

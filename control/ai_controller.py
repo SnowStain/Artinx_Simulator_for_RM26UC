@@ -5590,7 +5590,7 @@ class AIController:
             return 0.0, 0.0
         return (dx / distance) * speed, (dy / distance) * speed
 
-    def _max_speed_world_units(self):
+    def _max_speed_world_units(self, entity=None):
         physics = self.config.get('physics', {})
         map_config = self.config.get('map', {})
         field_length_m = float(map_config.get('field_length_m', 28.0))
@@ -5599,12 +5599,18 @@ class AIController:
         map_height = float(map_config.get('height', 873.0))
         pixels_per_meter_x = map_width / max(field_length_m, 1e-6)
         pixels_per_meter_y = map_height / max(field_width_m, 1e-6)
-        return float(physics.get('max_speed', 3.5)) * ((pixels_per_meter_x + pixels_per_meter_y) / 2.0)
+        max_speed = float(physics.get('max_speed', 3.5)) * ((pixels_per_meter_x + pixels_per_meter_y) / 2.0)
+        if entity is None:
+            return max_speed
+        speed_scale = max(0.35, float(getattr(entity, 'chassis_speed_scale', 1.0)))
+        effective_capacity = max(1e-6, float(getattr(entity, 'max_power', 0.0)) * float(getattr(entity, 'dynamic_power_capacity_mult', 1.0)))
+        power_ratio = max(0.0, min(1.0, float(getattr(entity, 'power', 0.0)) / effective_capacity))
+        return max_speed * speed_scale * (0.58 + power_ratio * 0.42)
 
     def _resolved_navigation_speed(self, entity, requested_speed, target_point, map_manager):
         if target_point is None:
             return requested_speed
-        max_speed = self._max_speed_world_units() * 0.96
+        max_speed = self._max_speed_world_units(entity) * 0.96
         friction = float(self.config.get('physics', {}).get('friction', 0.1))
         corrected_speed = requested_speed / max(0.45, 1.0 - friction)
         distance = math.hypot(float(target_point[0]) - float(entity.position['x']), float(target_point[1]) - float(entity.position['y']))
@@ -5801,7 +5807,24 @@ class AIController:
         effective_replan_interval = self._effective_path_replan_interval(entity, map_manager=map_manager, frame_view=frame_view)
         effective_goal_hysteresis = self._effective_path_goal_hysteresis_world(entity, map_manager=map_manager, frame_view=frame_view) if remote_from_player_focus else 0.0
         current_game_time = float(getattr(self, '_current_game_time', 0.0))
+        step_limit = float(getattr(entity, 'max_terrain_step_height_m', 0.05))
+        traversal_profile = self._traversal_profile(entity)
+        request_signature = (target_signature, int(raster_version), round(step_limit, 4))
         state = self._entity_path_state.get(entity.id)
+        if state is not None:
+            resolved_pending_path, _ = self._consume_pending_navigation_search(entity, normalized_target, map_manager, state, request_signature)
+            if resolved_pending_path is not None:
+                path = tuple(resolved_pending_path)
+                if not path:
+                    path = (current_position, normalized_target)
+                if path[-1] != normalized_target:
+                    path = tuple(path) + (normalized_target,)
+                state['goal_point'] = target_signature
+                state['goal_world'] = normalized_target
+                state['raster_version'] = raster_version
+                state['path'] = tuple(path)
+                state['index'] = self._path_waypoint_index(path, state.get('index', 1))
+                state['last_path_build_time'] = current_game_time
         needs_rebuild = state is None or state.get('raster_version') != raster_version
         if not needs_rebuild and state is not None:
             path = tuple(state.get('path', self.EMPTY_PATH_PREVIEW))
@@ -5828,32 +5851,16 @@ class AIController:
                             if (not remote_from_player_focus) or path_exhausted or current_game_time - last_path_build_time >= effective_replan_interval:
                                 needs_rebuild = True
         if needs_rebuild:
-            step_limit = float(getattr(entity, 'max_terrain_step_height_m', 0.05))
-            traversal_profile = self._traversal_profile(entity)
-            raw_path = map_manager.find_path(
-                current_position,
-                normalized_target,
-                max_height_delta_m=step_limit,
-                traversal_profile=traversal_profile,
-                max_iterations=self._pathfinder_max_iterations,
-                max_runtime_sec=self._pathfinder_total_budget_sec,
-            )
-            if raw_path:
-                path = tuple(self._segment_path_points(raw_path, map_manager, entity=entity))
-            else:
-                path = (current_position, normalized_target)
-            if not path:
-                path = (current_position, normalized_target)
-            if path[-1] != normalized_target:
-                path = tuple(path) + (normalized_target,)
-            state = {
-                'goal_point': target_signature,
-                'goal_world': normalized_target,
-                'raster_version': raster_version,
-                'path': tuple(path),
-                'index': self._path_waypoint_index(path, 1),
-                'last_path_build_time': current_game_time,
-            }
+            if state is None:
+                state = {}
+            self._submit_navigation_search(entity, normalized_target, map_manager, step_limit, traversal_profile, state, request_signature)
+            if not state.get('path'):
+                state['path'] = (current_position, normalized_target)
+                state['index'] = self._path_waypoint_index(state['path'], 1)
+            state['goal_point'] = target_signature
+            state['goal_world'] = normalized_target
+            state['raster_version'] = raster_version
+            state.setdefault('last_path_build_time', current_game_time)
             self._entity_path_state[entity.id] = state
 
         path = tuple(state.get('path', self.EMPTY_PATH_PREVIEW))

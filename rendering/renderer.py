@@ -6,6 +6,7 @@ import os
 
 import numpy as np
 
+from entities.chassis_profiles import infantry_chassis_label
 from pygame_compat import pygame
 
 from rendering.renderer_detail_popup_mixin import RendererDetailPopupMixin
@@ -203,6 +204,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.terrain_3d_render_key = None
         self.player_terrain_surface_cache = None
         self.player_terrain_surface_key = None
+        self.terrain_scene_surface_cache = None
+        self.terrain_scene_surface_key = None
         self.terrain_3d_last_build_ms = 0
         self.terrain_scene_backend_requested = config.get('simulator', {}).get('terrain_scene_backend', 'auto')
         self.terrain_scene_backend = None
@@ -475,6 +478,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.render_sidebar(game_engine)
         self.render_robot_detail_popup(game_engine)
         self.render_perf_overlay(game_engine)
+        self._render_mini_fps_label(self.screen, game_engine, anchor='bottom_left', inset=12)
         self.render_terrain_3d_window(game_engine)
         pygame.display.flip()
 
@@ -578,7 +582,10 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             pygame.draw.rect(self.screen, (42, 48, 58), card_rect, border_radius=14)
             pygame.draw.rect(self.screen, self.colors['yellow'] if active else self.colors['panel_border'], card_rect, 2 if active else 1, border_radius=14)
             title = self.small_font.render(entity.display_name, True, self.colors['white'])
-            subtitle = self.tiny_font.render(f'{"红方" if entity.team == "red" else "蓝方"} {getattr(entity, "robot_type", "")}', True, (198, 204, 212))
+            subtype_text = ''
+            if getattr(entity, 'robot_type', '') == '步兵':
+                subtype_text = f' | {infantry_chassis_label(getattr(entity, "chassis_subtype", ""))}'
+            subtitle = self.tiny_font.render(f'{"红方" if entity.team == "red" else "蓝方"} {getattr(entity, "robot_type", "")}{subtype_text}', True, (198, 204, 212))
             self.screen.blit(title, (card_rect.x + 14, card_rect.y + 14))
             self.screen.blit(subtitle, (card_rect.x + 14, card_rect.y + 40))
             self.panel_actions.append((card_rect, f'standalone_pick:{entity.id}'))
@@ -771,8 +778,21 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         if not isinstance(camera_state, dict):
             return None
         map_manager = game_engine.map_manager
-        world_eye = tuple(round(float(value), 2) for value in camera_state.get('world_eye', (0.0, 0.0, 0.0)))
-        world_target = tuple(round(float(value), 2) for value in camera_state.get('world_target', (0.0, 0.0, 0.0)))
+        meters_per_world_unit = 1.0 / max(float(map_manager.meters_to_world_units(1.0)), 1e-6)
+
+        def quantize_point(point, xy_step_m=0.18, z_step_m=0.08):
+            if point is None:
+                return (0.0, 0.0, 0.0)
+            xy_units = max(xy_step_m / meters_per_world_unit, 1e-6)
+            z_units = max(z_step_m, 1e-6)
+            return (
+                round(float(point[0]) / xy_units) * xy_units,
+                round(float(point[1]) / xy_units) * xy_units,
+                round(float(point[2]) / z_units) * z_units,
+            )
+
+        world_eye = quantize_point(camera_state.get('world_eye'))
+        world_target = quantize_point(camera_state.get('world_target'), xy_step_m=0.24, z_step_m=0.10)
         return (
             'player_view',
             getattr(self._get_terrain_scene_backend(), 'name', 'software'),
@@ -785,6 +805,42 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             world_eye,
             world_target,
         )
+
+    def _terrain_scene_surface_cache_key(self, game_engine, scene_rect, map_rgb=None):
+        if getattr(self, 'terrain_scene_camera_override', None) is not None:
+            return None
+        map_manager = game_engine.map_manager
+        focus_world = getattr(self, 'terrain_scene_focus_world', None) or (map_manager.map_width * 0.5, map_manager.map_height * 0.5)
+        return (
+            'terrain_scene',
+            getattr(self._get_terrain_scene_backend(), 'name', 'software'),
+            int(getattr(map_manager, 'raster_version', 0)),
+            int(scene_rect.width),
+            int(scene_rect.height),
+            round(float(getattr(self, 'terrain_scene_zoom', 1.0)), 3),
+            tuple(round(float(value), 1) for value in focus_world),
+            round(float(getattr(self, 'terrain_3d_camera_yaw', 0.0)), 3),
+            round(float(getattr(self, 'terrain_3d_camera_pitch', 0.0)), 3),
+            round(float(getattr(self, 'terrain_3d_camera_focus_height', 0.0)), 3),
+            bool(getattr(self, 'terrain_scene_force_dark_gray', False)),
+            id(map_rgb) if map_rgb is not None else None,
+        )
+
+    def _render_mini_fps_label(self, surface, game_engine, anchor='bottom_left', inset=10):
+        current_fps = float(getattr(game_engine, 'current_fps', 0.0))
+        current_frame_ms = float(getattr(game_engine, 'current_frame_ms', 0.0))
+        stats = getattr(game_engine, 'get_perf_overlay_stats', lambda: None)()
+        render_avg_ms = float(stats.get('render_avg_ms', 0.0)) if isinstance(stats, dict) else 0.0
+        label = f'FPS {current_fps:.1f} | {current_frame_ms:.1f}ms | R {render_avg_ms:.1f}ms'
+        text = self.tiny_font.render(label, True, self.colors['white'])
+        panel_rect = pygame.Rect(0, 0, text.get_width() + 12, text.get_height() + 6)
+        if anchor == 'bottom_left':
+            panel_rect.bottomleft = (inset, surface.get_height() - inset)
+        else:
+            panel_rect.topleft = (inset, inset)
+        pygame.draw.rect(surface, self.colors['overlay_bg'], panel_rect, border_radius=6)
+        pygame.draw.rect(surface, self.colors['panel_border'], panel_rect, 1, border_radius=6)
+        surface.blit(text, (panel_rect.x + 6, panel_rect.y + 3))
 
     def _collision_overlay_active(self):
         try:
@@ -1182,16 +1238,18 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             faces.append((depth, polygon, face_color, face_height_ratio))
 
     def _append_prism_faces(self, faces, corners, color):
-        face_indices = (
-            (4, 5, 6, 7),
-            (3, 2, 1, 0),
-            (0, 1, 5, 4),
-            (1, 2, 6, 5),
-            (2, 3, 7, 6),
-            (3, 0, 4, 7),
-        )
-        shades = (0.95, 0.50, 0.72, 0.82, 0.68, 0.60)
-        for indices, shade in zip(face_indices, shades):
+        side_count = len(corners) // 2
+        if side_count < 3 or len(corners) != side_count * 2:
+            return
+        face_groups = [
+            (tuple(range(side_count, len(corners))), 0.95),
+            (tuple(reversed(range(0, side_count))), 0.50),
+        ]
+        for index in range(side_count):
+            next_index = (index + 1) % side_count
+            shade = 0.60 + 0.22 * (((index % 4) + 1) / 4.0)
+            face_groups.append(((index, next_index, side_count + next_index, side_count + index), shade))
+        for indices, shade in face_groups:
             pts = [corners[index] for index in indices]
             if any(point is None for point in pts):
                 continue
@@ -1492,39 +1550,107 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             ]
             return [self._project_scene_point(local_to_scene(local_x, local_y, height, yaw_rad), camera_state, rect) for local_x, local_y, height in points]
 
+        def rotate_planar(local_x, local_y, angle_rad):
+            cos_a = math.cos(angle_rad)
+            sin_a = math.sin(angle_rad)
+            return (local_x * cos_a - local_y * sin_a, local_x * sin_a + local_y * cos_a)
+
+        def body_outline_points_local(scale=1.0):
+            half_x = body_length_half * scale
+            half_y = body_width_half * scale
+            if str(getattr(entity, 'body_shape', 'box')) != 'octagon':
+                return [(-half_x, -half_y), (half_x, -half_y), (half_x, half_y), (-half_x, half_y)]
+            chamfer = min(half_x, half_y) * 0.34
+            return [
+                (-half_x + chamfer, -half_y),
+                (half_x - chamfer, -half_y),
+                (half_x, -half_y + chamfer),
+                (half_x, half_y - chamfer),
+                (half_x - chamfer, half_y),
+                (-half_x + chamfer, half_y),
+                (-half_x, half_y - chamfer),
+                (-half_x, -half_y + chamfer),
+            ]
+
+        def prism_corners(outline_points, low_h, high_h, angle_rad):
+            projected = []
+            for local_x, local_y in outline_points:
+                projected.append(self._project_scene_point(local_to_scene(local_x, local_y, low_h, angle_rad), camera_state, rect))
+            for local_x, local_y in outline_points:
+                projected.append(self._project_scene_point(local_to_scene(local_x, local_y, high_h, angle_rad), camera_state, rect))
+            return projected
+
+        def resolved_wheel_positions_local(custom_positions):
+            if isinstance(custom_positions, (list, tuple)) and custom_positions:
+                base_positions = [
+                    (
+                        self._meters_to_world_units(map_manager, float(position[0])),
+                        self._meters_to_world_units(map_manager, float(position[1]) * render_width_scale),
+                    )
+                    for position in custom_positions
+                    if isinstance(position, (list, tuple)) and len(position) >= 2
+                ]
+            elif int(getattr(entity, 'wheel_count', 4)) <= 2:
+                base_positions = [(0.0, -wheel_offset_y), (0.0, wheel_offset_y)]
+            else:
+                base_positions = [(-wheel_offset_x, -wheel_offset_y), (wheel_offset_x, -wheel_offset_y), (-wheel_offset_x, wheel_offset_y), (wheel_offset_x, wheel_offset_y)]
+            orbit_yaws = tuple(getattr(entity, 'wheel_orbit_yaws_deg', ()) or ())
+            resolved = []
+            for index, (local_x, local_y) in enumerate(base_positions):
+                orbit_rad = math.radians(float(orbit_yaws[index])) if index < len(orbit_yaws) else 0.0
+                resolved.append(rotate_planar(local_x, local_y, orbit_rad))
+            return tuple(resolved)
+
+        def resolved_armor_components_local():
+            orbit_yaws = tuple(getattr(entity, 'armor_orbit_yaws_deg', ()) or (0.0, 180.0, 90.0, 270.0))
+            self_yaws = tuple(getattr(entity, 'armor_self_yaws_deg', ()) or orbit_yaws)
+            radius_x = body_length_half + armor_thickness * 1.35
+            radius_y = body_width_half + armor_thickness * 1.35
+            components = []
+            for index in range(4):
+                orbit_deg = float(orbit_yaws[index]) if index < len(orbit_yaws) else 0.0
+                self_deg = float(self_yaws[index]) if index < len(self_yaws) else orbit_deg
+                orbit_rad = math.radians(orbit_deg)
+                components.append((math.cos(orbit_rad) * radius_x, math.sin(orbit_rad) * radius_y, math.radians(self_deg)))
+            return tuple(components)
+
+        def resolved_armor_light_components_local():
+            light_offset = armor_plate_half_width + light_half_width
+            light_components = []
+            for local_x, local_y, part_yaw in resolved_armor_components_local():
+                delta_x, delta_y = rotate_planar(0.0, light_offset, part_yaw)
+                light_components.append((local_x + delta_x, local_y + delta_y, part_yaw))
+                light_components.append((local_x - delta_x, local_y - delta_y, part_yaw))
+            return tuple(light_components)
+
         team_color = self.colors['red'] if entity.team == 'red' else self.colors['blue']
         body_base_color = tuple(getattr(entity, 'body_color_rgb', ()) or team_color)
         turret_base_color = tuple(getattr(entity, 'turret_color_rgb', ()) or (232, 232, 236))
         armor_color = tuple(getattr(entity, 'armor_color_rgb', ()) or (224, 229, 234))
         wheel_color = tuple(getattr(entity, 'wheel_color_rgb', ()) or (44, 44, 44))
         body_color = tuple(max(48, min(255, int(channel * 0.78 + 34))) for channel in body_base_color)
-        self._append_box_faces(faces, box_corners(0.0, 0.0, body_length_half, body_width_half, body_bottom, body_top, yaw_rad), body_color)
-        self._append_box_faces(
-            faces,
-            box_corners(0.0, 0.0, body_length_half * 0.82, body_width_half * 0.82, body_top - 0.02, body_top + 0.03, yaw_rad),
-            tuple(max(52, min(255, int(channel * 0.58 + 56))) for channel in body_base_color),
-        )
+        if str(getattr(entity, 'body_shape', 'box')) == 'octagon':
+            self._append_prism_faces(faces, prism_corners(body_outline_points_local(), body_bottom, body_top, yaw_rad), body_color)
+            self._append_prism_faces(
+                faces,
+                prism_corners(body_outline_points_local(scale=0.78), body_top - 0.02, body_top + 0.03, yaw_rad),
+                tuple(max(52, min(255, int(channel * 0.58 + 56))) for channel in body_base_color),
+            )
+        else:
+            self._append_box_faces(faces, box_corners(0.0, 0.0, body_length_half, body_width_half, body_bottom, body_top, yaw_rad), body_color)
+            self._append_box_faces(
+                faces,
+                box_corners(0.0, 0.0, body_length_half * 0.82, body_width_half * 0.82, body_top - 0.02, body_top + 0.03, yaw_rad),
+                tuple(max(52, min(255, int(channel * 0.58 + 56))) for channel in body_base_color),
+            )
 
         wheel_offset_x = max(0.10, body_length_half * (0.72 if wheel_style == 'legged' else 0.78))
         wheel_offset_y = max(1.0, body_width_half + wheel_radius_world * 0.55)
         wheel_bottom = base_height
         wheel_top = wheel_bottom + wheel_radius_height * 2.0
         custom_wheel_positions_raw = getattr(entity, 'custom_wheel_positions_m', None)
-        if isinstance(custom_wheel_positions_raw, (list, tuple)) and custom_wheel_positions_raw:
-            wheel_positions = tuple(
-                (
-                    self._meters_to_world_units(map_manager, float(position[0])),
-                    self._meters_to_world_units(map_manager, float(position[1]) * render_width_scale),
-                )
-                for position in custom_wheel_positions_raw
-                if isinstance(position, (list, tuple)) and len(position) >= 2
-            )
-        else:
-            if int(getattr(entity, 'wheel_count', 4)) <= 2:
-                wheel_positions = ((0.0, -wheel_offset_y), (0.0, wheel_offset_y))
-            else:
-                wheel_positions = ((-wheel_offset_x, -wheel_offset_y), (wheel_offset_x, -wheel_offset_y), (-wheel_offset_x, wheel_offset_y), (wheel_offset_x, wheel_offset_y))
-        wheel_half_width = max(0.8, self._meters_to_world_units(map_manager, float(getattr(entity, 'wheel_radius_m', 0.08)) * 0.32))
+        wheel_positions = resolved_wheel_positions_local(custom_wheel_positions_raw)
+        wheel_half_width = max(0.8, self._meters_to_world_units(map_manager, float(getattr(entity, 'wheel_radius_m', 0.08)) * (0.22 if wheel_style == 'omni' else 0.32)))
         for local_x, local_y in wheel_positions:
             self._append_box_faces(
                 faces,
@@ -1670,26 +1796,22 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         armor_center_h = body_bottom + (body_top - body_bottom) * 0.54
         armor_low = armor_center_h - armor_plate_half_height
         armor_high = armor_center_h + armor_plate_half_height
-        armor_offset_x = body_length_half + armor_thickness * 1.35
-        armor_offset_y = body_width_half + armor_thickness * 1.35
         light_half_len = max(0.4, self._meters_to_world_units(map_manager, float(getattr(entity, 'armor_light_length_m', 0.10)) * 0.5))
         light_half_width = max(0.2, self._meters_to_world_units(map_manager, float(getattr(entity, 'armor_light_width_m', 0.02)) * 0.5))
         light_half_height = max(0.01, float(getattr(entity, 'armor_light_height_m', 0.02)) * 0.5 * vertical_scale)
         light_color = tuple(max(96, min(255, int(channel * 0.95 + 22))) for channel in team_color)
-        armor_specs = (
-            (armor_offset_x, 0.0, armor_thickness, armor_plate_half_width),
-            (-armor_offset_x, 0.0, armor_thickness, armor_plate_half_width),
-            (0.0, armor_offset_y, armor_plate_half_length, armor_thickness),
-            (0.0, -armor_offset_y, armor_plate_half_length, armor_thickness),
-        )
-        for local_x, local_y, half_x, half_y in armor_specs:
-            self._append_box_faces(faces, box_corners(local_x, local_y, half_x, half_y, armor_low, armor_high, yaw_rad), armor_color)
-            if abs(local_x) > abs(local_y):
-                self._append_box_faces(faces, box_corners(local_x, local_y + armor_plate_half_width + light_half_width, light_half_len, light_half_width, armor_center_h - light_half_height, armor_center_h + light_half_height, yaw_rad), light_color)
-                self._append_box_faces(faces, box_corners(local_x, local_y - armor_plate_half_width - light_half_width, light_half_len, light_half_width, armor_center_h - light_half_height, armor_center_h + light_half_height, yaw_rad), light_color)
-            else:
-                self._append_box_faces(faces, box_corners(local_x + armor_plate_half_length + light_half_width, local_y, light_half_width, light_half_len, armor_center_h - light_half_height, armor_center_h + light_half_height, yaw_rad), light_color)
-                self._append_box_faces(faces, box_corners(local_x - armor_plate_half_length - light_half_width, local_y, light_half_width, light_half_len, armor_center_h - light_half_height, armor_center_h + light_half_height, yaw_rad), light_color)
+        for local_x, local_y, part_yaw in resolved_armor_components_local():
+            self._append_box_faces(
+                faces,
+                box_corners(local_x, local_y, armor_thickness, armor_plate_half_width, armor_low, armor_high, yaw_rad + part_yaw),
+                armor_color,
+            )
+        for local_x, local_y, part_yaw in resolved_armor_light_components_local():
+            self._append_box_faces(
+                faces,
+                box_corners(local_x, local_y, light_half_width, light_half_len, armor_center_h - light_half_height, armor_center_h + light_half_height, yaw_rad + part_yaw),
+                light_color,
+            )
 
         barrel_start = None
         barrel_end = None
@@ -2015,7 +2137,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 132))
         self.screen.blit(overlay, rect.topleft)
-        panel_rect = pygame.Rect(0, 0, 560, 260)
+        subtype_options = detail.get('chassis_subtype_options', []) if detail.get('robot_type') == '步兵' else []
+        panel_rect = pygame.Rect(0, 0, 560, 332 if subtype_options else 260)
         panel_rect.center = rect.center
         pygame.draw.rect(self.screen, (28, 34, 42), panel_rect, border_radius=16)
         pygame.draw.rect(self.screen, self.colors['panel_border'], panel_rect, 1, border_radius=16)
@@ -2027,8 +2150,20 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         right_title = mode_labels.get('right_title', '云台模式')
         left_options = mode_labels.get('left_options', [('health_priority', '血量优先'), ('power_priority', '功率优先')])
         right_options = mode_labels.get('right_options', [('cooling_priority', '冷却优先'), ('burst_priority', '爆发优先')])
-        left_y = panel_rect.y + 82
-        right_y = panel_rect.y + 154
+        subtype_y = panel_rect.y + 78
+        left_y = panel_rect.y + (154 if subtype_options else 82)
+        right_y = panel_rect.y + (226 if subtype_options else 154)
+        if subtype_options:
+            self.screen.blit(self.small_font.render('步兵构型', True, self.colors['white']), (panel_rect.x + 42, subtype_y - 24))
+            subtype_button_w = 188
+            subtype_gap = 18
+            for index, (value, label) in enumerate(subtype_options[:2]):
+                button_rect = pygame.Rect(panel_rect.x + 42 + index * (subtype_button_w + subtype_gap), subtype_y, subtype_button_w, 40)
+                active = detail.get('chassis_subtype') == value
+                pygame.draw.rect(self.screen, self.colors['toolbar_button_active'] if active else self.colors['toolbar_button'], button_rect, border_radius=10)
+                rendered = self.small_font.render(label, True, self.colors['white'])
+                self.screen.blit(rendered, rendered.get_rect(center=button_rect.center))
+                self.panel_actions.append((button_rect, f'entity_mode:{entity.id}:chassis_subtype:{value}'))
         self.screen.blit(self.small_font.render(left_title, True, self.colors['white']), (panel_rect.x + 42, left_y - 24))
         self.screen.blit(self.small_font.render(right_title, True, self.colors['white']), (panel_rect.x + 42, right_y - 24))
         button_w = 188
@@ -2150,6 +2285,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         if game_engine.paused and not getattr(game_engine, 'pre_match_setup_required', False) and float(getattr(game_engine, 'pre_match_countdown_remaining', 0.0)) <= 0.0:
             self._render_player_pause_overlay(game_engine, rect)
         self._render_player_settings_menu(game_engine, rect)
+        self._render_mini_fps_label(self.screen, game_engine, anchor='bottom_left', inset=12)
 
     def _begin_numeric_input(self, input_type, facility_id, current_value):
         self.active_numeric_input = {
@@ -4931,6 +5067,12 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             _, entity_id, field_name, value = action.split(':', 3)
             entity = game_engine.entity_manager.get_entity(entity_id)
             if entity is None:
+                return
+            if field_name == 'chassis_subtype':
+                if game_engine.entity_manager.set_entity_chassis_subtype(entity, value, preserve_state=True):
+                    robot_subtypes = game_engine.config.setdefault('entities', {}).setdefault('robot_subtypes', {})
+                    robot_subtypes[entity_id.replace(f'{entity.team}_', '')] = value
+                    game_engine.add_log(f'{entity_id} 已切换底盘构型为 {infantry_chassis_label(value)}', 'system')
                 return
             setattr(entity, field_name, value)
             game_engine.entity_manager.refresh_entity_performance_profile(entity, preserve_state=True)

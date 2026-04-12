@@ -129,23 +129,7 @@ def _sample_terrain_scene_data(renderer, map_manager, map_rgb):
         sampled_heights = np.zeros_like(sampled_heights)
         sampled_codes = np.zeros_like(sampled_codes)
 
-    color_lut = getattr(renderer, 'terrain_scene_color_lut', None)
-    if color_lut is None:
-        color_lut = np.zeros((256, 3), dtype=np.uint8)
-        for terrain_code in range(256):
-            color_lut[terrain_code] = renderer._terrain_color_by_code(terrain_code)
-        renderer.terrain_scene_color_lut = color_lut
-
-    blended_colors = sampled_base_colors.copy()
-    non_flat_mask = sampled_codes != 0
-    if np.any(non_flat_mask):
-        overlay_colors = color_lut[sampled_codes]
-        source_colors = blended_colors.astype(np.float32)
-        if force_dark_gray:
-            blended = source_colors * 0.88 + overlay_colors.astype(np.float32) * 0.12
-        else:
-            blended = source_colors * 0.45 + overlay_colors.astype(np.float32) * 0.55
-        blended_colors[non_flat_mask] = np.clip(blended[non_flat_mask], 0, 255).astype(np.uint8)
+    cell_colors = sampled_base_colors.copy()
 
     data = {
         'grid_width': grid_width,
@@ -156,7 +140,8 @@ def _sample_terrain_scene_data(renderer, map_manager, map_rgb):
         'sampled_heights': sampled_heights,
         'sampled_codes': sampled_codes,
         'sampled_base_colors': sampled_base_colors,
-        'blended_colors': blended_colors,
+        'blended_colors': cell_colors,
+        'cell_colors': cell_colors,
     }
     renderer.terrain_scene_sample_cache_key = cache_key
     renderer.terrain_scene_sample_cache = data
@@ -289,7 +274,7 @@ class SoftwareTerrainSceneBackend:
         grid_width = data['grid_width']
         grid_height = data['grid_height']
         sampled_heights = data['sampled_heights']
-        blended_colors = data['blended_colors']
+        cell_colors = data.get('cell_colors', data['blended_colors'])
 
         padding = 20
         yaw_cos = math.cos(renderer.terrain_3d_camera_yaw)
@@ -314,7 +299,7 @@ class SoftwareTerrainSceneBackend:
             for grid_y in range(grid_height):
                 for grid_x in range(grid_width):
                     height_m = float(sampled_heights[grid_y, grid_x])
-                    top_color = tuple(int(channel) for channel in blended_colors[grid_y, grid_x])
+                    top_color = tuple(int(channel) for channel in cell_colors[grid_y, grid_x])
                     local_x = grid_x - center_offset_x
                     local_y = grid_y - center_offset_y
                     rotated_x = local_x * yaw_cos - local_y * yaw_sin
@@ -521,6 +506,7 @@ class ModernGLTerrainSceneBackend:
             scene_step,
             round(float(data.get('height_scene_scale', 1.0)), 6),
             bool(getattr(renderer, 'terrain_scene_force_dark_gray', False)),
+            id(map_rgb) if map_rgb is not None else None,
         )
         if self.geometry_key == geometry_key and self.vao is not None:
             return
@@ -528,7 +514,7 @@ class ModernGLTerrainSceneBackend:
         grid_width = data['grid_width']
         grid_height = data['grid_height']
         sampled_heights = data['sampled_heights']
-        blended_colors = data['blended_colors']
+        cell_colors = data.get('cell_colors', data['blended_colors'])
         center_offset_x = grid_width / 2.0
         center_offset_y = grid_height / 2.0
         vertical_scale = float(data.get('height_scene_scale', 1.0))
@@ -537,7 +523,7 @@ class ModernGLTerrainSceneBackend:
 
         for grid_y in range(grid_height):
             for grid_x in range(grid_width):
-                top_color = [channel / 255.0 for channel in blended_colors[grid_y, grid_x]]
+                top_color = [channel / 255.0 for channel in cell_colors[grid_y, grid_x]]
                 top_y = float(sampled_heights[grid_y, grid_x]) * vertical_scale
                 bottom_y = -base_thickness
                 x0 = grid_x - center_offset_x

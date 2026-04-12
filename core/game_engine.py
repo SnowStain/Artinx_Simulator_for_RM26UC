@@ -14,6 +14,7 @@ import statistics
 from collections import deque
 from datetime import datetime
 from map.map_manager import MapManager
+from entities.chassis_profiles import infantry_chassis_label, infantry_chassis_options
 from entities.entity_manager import EntityManager
 from physics.pybullet_engine import PyBulletPhysicsEngine
 from rules.rules_engine import RulesEngine
@@ -96,6 +97,8 @@ class GameEngine:
         self._perf_overlay_cache = {'ts': 0.0, 'stats': None}
         self._last_update_breakdown = None
         self._last_event_ms = 0.0
+        self.current_fps = float(self.fps)
+        self.current_frame_ms = 1000.0 / max(float(self.fps), 1.0)
         self._perf_log_session_id = None
         self._restart_auto_aim_executor(wait=False)
 
@@ -733,6 +736,7 @@ class GameEngine:
         self.config['map']['function_grid'] = self.map_manager.export_function_grid_config()
         self.config['map']['runtime_grid'] = self.map_manager.export_runtime_grid_config()
         self.config['entities']['initial_positions'] = self.entity_manager.export_initial_positions()
+        self.config['entities']['robot_subtypes'] = self.entity_manager.export_robot_subtypes()
         self._configured_initial_positions = deepcopy(self.config['entities']['initial_positions'])
         self.config['rules'] = RulesEngine.build_rule_config(self.config.get('rules', {}))
         if self.config_manager is not None:
@@ -1380,6 +1384,9 @@ class GameEngine:
                 self.dt = self.target_dt
             else:
                 self.dt = max(0.001, min(0.10, float(elapsed_ms) / 1000.0))
+            instantaneous_fps = 1.0 / max(float(self.dt), 1e-6)
+            self.current_fps = float(self.current_fps) + (instantaneous_fps - float(self.current_fps)) * 0.18
+            self.current_frame_ms = float(self.dt) * 1000.0
             frame_start = time.perf_counter()
             # 处理事件
             event_start = time.perf_counter()
@@ -1633,6 +1640,9 @@ class GameEngine:
             pixels_per_meter = 1.0
         current_speed_mps = current_speed / max(pixels_per_meter, 1e-6)
         movement_power_ratio = 0.0 if max_speed_world <= 1e-6 else max(0.0, min(1.0, current_speed / max_speed_world))
+        speed_cap_mps = float(getattr(entity, 'chassis_speed_limit_mps', 0.0) or 0.0)
+        if speed_cap_mps <= 1e-6 and hasattr(self.physics_engine, '_resolved_entity_speed_limit_mps'):
+            speed_cap_mps = float(self.physics_engine._resolved_entity_speed_limit_mps(entity))
         target = None
         if isinstance(getattr(entity, 'target', None), dict):
             target_id = entity.target.get('id')
@@ -1680,6 +1690,9 @@ class GameEngine:
             'out_of_combat': self.rules_engine.is_out_of_combat(entity),
             'supports_drive_modes': self.entity_supports_drive_modes(entity),
             'mode_labels': mode_labels,
+            'chassis_subtype': getattr(entity, 'chassis_subtype', ''),
+            'chassis_subtype_label': infantry_chassis_label(getattr(entity, 'chassis_subtype', '')) if getattr(entity, 'robot_type', '') == '步兵' else '',
+            'chassis_subtype_options': list(infantry_chassis_options()) if getattr(entity, 'robot_type', '') == '步兵' else [],
             'target_id': target.id if target is not None else None,
             'chassis_state': getattr(entity, 'chassis_state', 'normal'),
             'decision_summary': getattr(entity, 'ai_decision', ''),
@@ -1705,6 +1718,10 @@ class GameEngine:
             'movement_speed_world': float(current_speed),
             'movement_speed_mps': float(current_speed_mps),
             'movement_speed_ratio': float(movement_power_ratio),
+            'movement_speed_cap_mps': float(speed_cap_mps),
+            'chassis_power_draw_w': float(getattr(entity, 'chassis_power_draw_w', 0.0)),
+            'chassis_rpm': float(getattr(entity, 'chassis_rpm', 0.0)),
+            'chassis_power_ratio': float(getattr(entity, 'chassis_power_ratio', 1.0)),
             'chassis_mode': getattr(entity, 'chassis_mode', 'health_priority'),
             'heat': float(getattr(entity, 'heat', 0.0)),
             'max_heat': float(getattr(entity, 'max_heat', heat_rule.get('max_heat', 0.0))),

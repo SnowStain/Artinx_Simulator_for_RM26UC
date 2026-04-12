@@ -13,6 +13,7 @@ from pygame_compat import pygame
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core.config_manager import ConfigManager
+from entities.chassis_profiles import build_infantry_profile_payload, infantry_chassis_options, infantry_chassis_preset, normalize_infantry_chassis_subtype, normalize_infantry_component_profile, resolve_infantry_subtype_profile
 
 try:
     import moderngl
@@ -115,6 +116,8 @@ _BASE_PROFILE_TEMPLATES = {
         'rear_climb_assist_style': 'dog_leg',
     },
     'infantry': {
+        'chassis_subtype': 'balance_legged',
+        'body_shape': 'box',
         'body_length_m': 0.49,
         'body_width_m': 0.42,
         'body_height_m': 0.16,
@@ -226,6 +229,10 @@ def _build_default_wheel_positions(profile):
     wheel_y = round(float(profile['body_width_m']) * 0.5 + float(profile['wheel_radius_m']) * 0.58, 3)
     if str(profile.get('wheel_style', 'mecanum')) == 'legged':
         return [[0.0, -wheel_y], [0.0, wheel_y]]
+    if str(profile.get('wheel_style', 'mecanum')) == 'omni':
+        wheel_x = round(float(profile['body_length_m']) * 0.36, 3)
+        wheel_y = round(float(profile['body_width_m']) * 0.36, 3)
+        return [[wheel_x, 0.0], [0.0, wheel_y], [-wheel_x, 0.0], [0.0, -wheel_y]]
     wheel_x = round(float(profile['body_length_m']) * 0.39, 3)
     return [[-wheel_x, -wheel_y], [wheel_x, -wheel_y], [-wheel_x, wheel_y], [wheel_x, wheel_y]]
 
@@ -241,7 +248,7 @@ def _apply_climb_assist_defaults(role_key, profile):
         profile.setdefault('rear_climb_assist_style', 'none')
 
 
-def _normalize_profile_constraints(role_key, profile):
+def _normalize_profile_constraints(role_key, profile, forced_subtype=None):
     normalized = deepcopy(_BASE_PROFILE_TEMPLATES.get(role_key, _BASE_PROFILE_TEMPLATES['infantry']))
     if isinstance(profile, dict):
         normalized.update(deepcopy(profile))
@@ -287,6 +294,8 @@ def _normalize_profile_constraints(role_key, profile):
         ]
         if len(normalized['custom_wheel_positions_m']) != expected_count:
             normalized['custom_wheel_positions_m'] = _build_default_wheel_positions(normalized)
+    if role_key == 'infantry':
+        normalized = normalize_infantry_component_profile(normalized, forced_subtype or normalized.get('chassis_subtype'))
     return normalized
 
 
@@ -351,6 +360,10 @@ def _rear_climb_points(profile, render_width_scale=1.0):
 def _append_preview_face(vertices, p0, p1, p2, p3, color, normal):
     vertices.extend((*p0, *color, *normal, *p1, *color, *normal, *p2, *color, *normal))
     vertices.extend((*p0, *color, *normal, *p2, *color, *normal, *p3, *color, *normal))
+
+
+def _append_preview_triangle(vertices, p0, p1, p2, color, normal):
+    vertices.extend((*p0, *color, *normal, *p1, *color, *normal, *p2, *color, *normal))
 
 
 def _append_preview_box(vertices, center, half_extents, color_rgb, yaw_rad=0.0):
@@ -419,6 +432,8 @@ def _preview_face_normal(p0, p1, p2):
 
 
 def _append_preview_prism(vertices, bottom_points, top_points, color_rgb, yaw_rad=0.0):
+    if len(bottom_points) != len(top_points) or len(bottom_points) < 3:
+        return
     color = tuple(float(channel) / 255.0 for channel in color_rgb)
     cos_yaw = math.cos(yaw_rad)
     sin_yaw = math.sin(yaw_rad)
@@ -435,11 +450,14 @@ def _append_preview_prism(vertices, bottom_points, top_points, color_rgb, yaw_ra
     rotated_top = [rotate_point(point) for point in top_points]
     top_normal = _preview_face_normal(rotated_top[0], rotated_top[1], rotated_top[2])
     bottom_normal = _preview_face_normal(rotated_bottom[2], rotated_bottom[1], rotated_bottom[0])
-    _append_preview_face(vertices, rotated_top[0], rotated_top[1], rotated_top[2], rotated_top[3], color, top_normal)
-    _append_preview_face(vertices, rotated_bottom[3], rotated_bottom[2], rotated_bottom[1], rotated_bottom[0], tuple(max(0.0, channel * 0.42) for channel in color), bottom_normal)
-    side_shades = (0.76, 0.70, 0.82, 0.60)
-    for index, shade in enumerate(side_shades):
-        next_index = (index + 1) % 4
+    for index in range(1, len(rotated_top) - 1):
+        _append_preview_triangle(vertices, rotated_top[0], rotated_top[index], rotated_top[index + 1], color, top_normal)
+    bottom_color = tuple(max(0.0, channel * 0.42) for channel in color)
+    for index in range(1, len(rotated_bottom) - 1):
+        _append_preview_triangle(vertices, rotated_bottom[0], rotated_bottom[index + 1], rotated_bottom[index], bottom_color, bottom_normal)
+    for index in range(len(rotated_bottom)):
+        next_index = (index + 1) % len(rotated_bottom)
+        shade = 0.60 + 0.22 * (((index % 4) + 1) / 4.0)
         p0 = rotated_bottom[index]
         p1 = rotated_bottom[next_index]
         p2 = rotated_top[next_index]
@@ -525,6 +543,87 @@ def _append_preview_cylinder(vertices, center, radius, half_width, color_rgb, se
         _append_preview_face(vertices, back_center, back_ring[index], back_ring[next_index], back_center, tuple(max(0.0, channel * 0.94) for channel in color), (0.0, 0.0, 1.0))
 
 
+def _rotate_xz(point_x, point_z, yaw_rad):
+    cos_yaw = math.cos(yaw_rad)
+    sin_yaw = math.sin(yaw_rad)
+    return (
+        point_x * cos_yaw - point_z * sin_yaw,
+        point_x * sin_yaw + point_z * cos_yaw,
+    )
+
+
+def _body_outline_points(profile):
+    render_width_scale = float(profile.get('body_render_width_scale', 0.82))
+    half_x = float(profile['body_length_m']) * 0.5
+    half_z = float(profile['body_width_m']) * 0.5 * render_width_scale
+    if str(profile.get('body_shape', 'box')) != 'octagon':
+        return [(-half_x, -half_z), (half_x, -half_z), (half_x, half_z), (-half_x, half_z)]
+    chamfer = min(half_x, half_z) * 0.34
+    return [
+        (-half_x + chamfer, -half_z),
+        (half_x - chamfer, -half_z),
+        (half_x, -half_z + chamfer),
+        (half_x, half_z - chamfer),
+        (half_x - chamfer, half_z),
+        (-half_x + chamfer, half_z),
+        (-half_x, half_z - chamfer),
+        (-half_x, -half_z + chamfer),
+    ]
+
+
+def _resolved_wheel_centers(profile):
+    render_width_scale = float(profile.get('body_render_width_scale', 0.82))
+    orbit_values = list(profile.get('wheel_orbit_yaws_deg', []))
+    centers = []
+    for index, position in enumerate(profile.get('custom_wheel_positions_m', [])):
+        if not isinstance(position, (list, tuple)) or len(position) < 2:
+            continue
+        orbit_rad = math.radians(float(orbit_values[index])) if index < len(orbit_values) else 0.0
+        center_x, center_z = _rotate_xz(float(position[0]), float(position[1]) * render_width_scale, orbit_rad)
+        centers.append((center_x, center_z))
+    return centers
+
+
+def _resolved_armor_components(profile):
+    render_width_scale = float(profile.get('body_render_width_scale', 0.82))
+    body_half_x = float(profile['body_length_m']) * 0.5
+    body_half_z = float(profile['body_width_m']) * 0.5 * render_width_scale
+    armor_gap = float(profile.get('armor_plate_gap_m', 0.005))
+    armor_thickness = max(0.012, armor_gap * 0.75)
+    armor_center_y = float(profile['body_clearance_m']) + float(profile['body_height_m']) * 0.55
+    radius_x = body_half_x + armor_gap + armor_thickness * 1.35
+    radius_z = body_half_z + armor_gap + armor_thickness * 1.35
+    orbit_values = list(profile.get('armor_orbit_yaws_deg', [0.0, 180.0, 90.0, 270.0]))
+    self_values = list(profile.get('armor_self_yaws_deg', orbit_values))
+    components = []
+    for index in range(4):
+        orbit_deg = float(orbit_values[index]) if index < len(orbit_values) else 0.0
+        self_deg = float(self_values[index]) if index < len(self_values) else orbit_deg
+        orbit_rad = math.radians(orbit_deg)
+        components.append({
+            'center': (math.cos(orbit_rad) * radius_x, armor_center_y, math.sin(orbit_rad) * radius_z),
+            'yaw_rad': math.radians(self_deg),
+        })
+    return components
+
+
+def _resolved_armor_light_components(profile):
+    armor_components = _resolved_armor_components(profile)
+    armor_half_width = float(profile.get('armor_plate_width_m', 0.16)) * 0.5
+    light_half_width = max(0.005, float(profile.get('armor_light_width_m', 0.02)) * 0.5)
+    light_offset = armor_half_width + light_half_width + max(0.004, float(profile.get('armor_plate_gap_m', 0.005)) * 0.15)
+    light_components = []
+    for component in armor_components:
+        offset_x, offset_z = _rotate_xz(0.0, light_offset, float(component['yaw_rad']))
+        center_x, center_y, center_z = component['center']
+        light_components.append({
+            'center_a': (center_x + offset_x, center_y, center_z + offset_z),
+            'center_b': (center_x - offset_x, center_y, center_z - offset_z),
+            'yaw_rad': float(component['yaw_rad']),
+        })
+    return light_components
+
+
 class ModernGLAppearancePreview:
     def __init__(self):
         self.ctx = None
@@ -593,25 +692,45 @@ class ModernGLAppearancePreview:
         has_front_climb = str(profile.get('front_climb_assist_style', 'none')) != 'none'
         has_rear_climb = str(profile.get('rear_climb_assist_style', 'none')) != 'none'
         body_y = float(profile['body_clearance_m']) + float(profile['body_height_m']) * 0.5
-        _append_preview_box(
-            vertices,
-            (0.0, body_y, 0.0),
-            (float(profile['body_length_m']) * 0.5, float(profile['body_height_m']) * 0.5, float(profile['body_width_m']) * 0.5 * render_width_scale),
-            profile['body_color_rgb'],
-        )
-        _append_preview_box(
-            vertices,
-            (0.0, body_y + float(profile['body_height_m']) * 0.36, 0.0),
-            (float(profile['body_length_m']) * 0.40, max(0.015, float(profile['body_height_m']) * 0.12), float(profile['body_width_m']) * 0.40 * render_width_scale),
-            [max(0, min(255, int(channel * 0.82 + 20))) for channel in profile['body_color_rgb']],
-        )
+        body_half_height = float(profile['body_height_m']) * 0.5
+        body_outline = _body_outline_points(profile)
+        if str(profile.get('body_shape', 'box')) == 'octagon':
+            _append_preview_prism(
+                vertices,
+                [(point_x, body_y - body_half_height, point_z) for point_x, point_z in body_outline],
+                [(point_x, body_y + body_half_height, point_z) for point_x, point_z in body_outline],
+                profile['body_color_rgb'],
+            )
+            top_scale = 0.78
+            top_outline = [(point_x * top_scale, point_z * top_scale) for point_x, point_z in body_outline]
+            cap_half_height = max(0.015, float(profile['body_height_m']) * 0.12)
+            cap_center_y = body_y + float(profile['body_height_m']) * 0.36
+            _append_preview_prism(
+                vertices,
+                [(point_x, cap_center_y - cap_half_height, point_z) for point_x, point_z in top_outline],
+                [(point_x, cap_center_y + cap_half_height, point_z) for point_x, point_z in top_outline],
+                [max(0, min(255, int(channel * 0.82 + 20))) for channel in profile['body_color_rgb']],
+            )
+        else:
+            _append_preview_box(
+                vertices,
+                (0.0, body_y, 0.0),
+                (float(profile['body_length_m']) * 0.5, body_half_height, float(profile['body_width_m']) * 0.5 * render_width_scale),
+                profile['body_color_rgb'],
+            )
+            _append_preview_box(
+                vertices,
+                (0.0, body_y + float(profile['body_height_m']) * 0.36, 0.0),
+                (float(profile['body_length_m']) * 0.40, max(0.015, float(profile['body_height_m']) * 0.12), float(profile['body_width_m']) * 0.40 * render_width_scale),
+                [max(0, min(255, int(channel * 0.82 + 20))) for channel in profile['body_color_rgb']],
+            )
 
         wheel_radius = max(0.018, float(profile['wheel_radius_m']))
-        wheel_half_z = max(0.018, float(profile['wheel_radius_m']) * 0.32)
-        for wheel_x, wheel_y in profile['custom_wheel_positions_m']:
+        wheel_half_z = max(0.018, float(profile['wheel_radius_m']) * (0.22 if str(profile.get('wheel_style', 'standard')) == 'omni' else 0.32))
+        for wheel_x, wheel_z in _resolved_wheel_centers(profile):
             _append_preview_cylinder(
                 vertices,
-                (float(wheel_x), wheel_radius, float(wheel_y) * render_width_scale),
+                (float(wheel_x), wheel_radius, float(wheel_z)),
                 wheel_radius,
                 wheel_half_z,
                 profile['wheel_color_rgb'],
@@ -645,27 +764,25 @@ class ModernGLAppearancePreview:
                 _append_preview_beam(vertices, (rear_points['joint'][0], rear_points['joint'][1], side_z), (rear_points['foot'][0], rear_points['foot'][1], side_z), lower_height, lower_width, [92, 96, 108])
                 _append_preview_box(vertices, (rear_points['joint'][0], rear_points['joint'][1], side_z), (max(upper_height, lower_height) * 0.75, max(upper_height, lower_height) * 0.75, max(upper_width, lower_width) * 0.55), [116, 120, 132])
 
-        armor_gap = float(profile['armor_plate_gap_m'])
         armor_half_h = float(profile['armor_plate_height_m']) * 0.5
-        armor_center_y = float(profile['body_clearance_m']) + float(profile['body_height_m']) * 0.55
-        armor_thickness = max(0.012, armor_gap * 0.75)
         armor_color = profile['armor_color_rgb']
-        _append_preview_box(vertices, (body_half_x + armor_gap + armor_thickness * 0.5, armor_center_y, 0.0), (armor_thickness * 0.5, armor_half_h, float(profile['armor_plate_width_m']) * 0.5), armor_color)
-        _append_preview_box(vertices, (-(body_half_x + armor_gap + armor_thickness * 0.5), armor_center_y, 0.0), (armor_thickness * 0.5, armor_half_h, float(profile['armor_plate_width_m']) * 0.5), armor_color)
-        _append_preview_box(vertices, (0.0, armor_center_y, body_half_z + armor_gap + armor_thickness * 0.5), (float(profile['armor_plate_length_m']) * 0.5, armor_half_h, armor_thickness * 0.5), armor_color)
-        _append_preview_box(vertices, (0.0, armor_center_y, -(body_half_z + armor_gap + armor_thickness * 0.5)), (float(profile['armor_plate_length_m']) * 0.5, armor_half_h, armor_thickness * 0.5), armor_color)
+        armor_thickness = max(0.012, float(profile.get('armor_plate_gap_m', 0.005)) * 0.75)
+        armor_half_width = float(profile['armor_plate_width_m']) * 0.5
+        for component in _resolved_armor_components(profile):
+            _append_preview_box(
+                vertices,
+                component['center'],
+                (armor_thickness * 0.5, armor_half_h, armor_half_width),
+                armor_color,
+                yaw_rad=float(component['yaw_rad']),
+            )
         armor_light_color = [110, 168, 255]
         armor_light_half_x = float(profile.get('armor_light_length_m', 0.10)) * 0.5
         armor_light_half_y = max(0.005, float(profile.get('armor_light_height_m', 0.02)) * 0.5)
         armor_light_half_z = max(0.005, float(profile.get('armor_light_width_m', 0.02)) * 0.5)
-        _append_preview_box(vertices, (body_half_x + armor_gap + armor_thickness, armor_center_y, float(profile['armor_plate_width_m']) * 0.5 + armor_light_half_z), (armor_light_half_z, armor_light_half_y, armor_light_half_x), armor_light_color)
-        _append_preview_box(vertices, (body_half_x + armor_gap + armor_thickness, armor_center_y, -(float(profile['armor_plate_width_m']) * 0.5 + armor_light_half_z)), (armor_light_half_z, armor_light_half_y, armor_light_half_x), armor_light_color)
-        _append_preview_box(vertices, (-(body_half_x + armor_gap + armor_thickness), armor_center_y, float(profile['armor_plate_width_m']) * 0.5 + armor_light_half_z), (armor_light_half_z, armor_light_half_y, armor_light_half_x), armor_light_color)
-        _append_preview_box(vertices, (-(body_half_x + armor_gap + armor_thickness), armor_center_y, -(float(profile['armor_plate_width_m']) * 0.5 + armor_light_half_z)), (armor_light_half_z, armor_light_half_y, armor_light_half_x), armor_light_color)
-        _append_preview_box(vertices, (float(profile['armor_plate_length_m']) * 0.5 + armor_light_half_z, armor_center_y, body_half_z + armor_gap + armor_thickness), (armor_light_half_x, armor_light_half_y, armor_light_half_z), armor_light_color)
-        _append_preview_box(vertices, (-(float(profile['armor_plate_length_m']) * 0.5 + armor_light_half_z), armor_center_y, body_half_z + armor_gap + armor_thickness), (armor_light_half_x, armor_light_half_y, armor_light_half_z), armor_light_color)
-        _append_preview_box(vertices, (float(profile['armor_plate_length_m']) * 0.5 + armor_light_half_z, armor_center_y, -(body_half_z + armor_gap + armor_thickness)), (armor_light_half_x, armor_light_half_y, armor_light_half_z), armor_light_color)
-        _append_preview_box(vertices, (-(float(profile['armor_plate_length_m']) * 0.5 + armor_light_half_z), armor_center_y, -(body_half_z + armor_gap + armor_thickness)), (armor_light_half_x, armor_light_half_y, armor_light_half_z), armor_light_color)
+        for component in _resolved_armor_light_components(profile):
+            _append_preview_box(vertices, component['center_a'], (armor_light_half_z, armor_light_half_y, armor_light_half_x), armor_light_color, yaw_rad=float(component['yaw_rad']))
+            _append_preview_box(vertices, component['center_b'], (armor_light_half_z, armor_light_half_y, armor_light_half_x), armor_light_color, yaw_rad=float(component['yaw_rad']))
 
         if has_turret:
             turret_offset_x = float(profile['gimbal_offset_x_m'])
@@ -764,9 +881,12 @@ class AppearanceEditorApp:
         self.preset_path = self._resolve_preset_path()
         self.profiles = self._load_profiles()
         self.current_role = ROLE_ORDER[0][0]
+        self.current_infantry_subtype = normalize_infantry_chassis_subtype(self.profiles.get('infantry', {}).get('default_chassis_subtype'))
         self.selected_part = None
         self.selected_field_index = 0
-        self.status_text = '右侧预览点击部件后编辑，左右方向键调整，Shift 加速，Ctrl+S 保存，Tab 切换车型，R 重置当前车型'
+        self.selected_component_scope = 'single'
+        self.selected_component_index = 0
+        self.status_text = '右侧预览点击部件后编辑，左右方向键调整，直接键入数字可精确输入，Ctrl+S 保存，Tab 切换车型'
         self.running = True
         self.preview_mode = 'split'
         self.preview_3d_yaw = 0.72
@@ -775,14 +895,18 @@ class AppearanceEditorApp:
         self.field_scroll_drag_active = False
         self.preview_drag_active = False
         self.preview_mode_tabs = []
+        self.infantry_subtype_tabs = []
         self.preview_part_hitboxes = []
+        self.component_control_actions = []
         self.field_scrollbar_thumb_rect = None
         self.field_scrollbar_track_rect = None
         self.field_panel_rect = None
         self.preview_panel_rect = None
         self.preview_content_rect = None
+        self.active_numeric_input = None
 
         pygame.init()
+        pygame.key.set_repeat(240, 40)
         pygame.display.set_caption('车辆外貌编辑器')
         self.window_width = 1460
         self.window_height = 900
@@ -833,12 +957,73 @@ class AppearanceEditorApp:
         return profiles
 
     def _save_profiles(self):
+        payload_profiles = {}
         for role_key in list(self.profiles.keys()):
-            self.profiles[role_key] = _normalize_profile_constraints(role_key, self.profiles[role_key])
+            if role_key == 'infantry':
+                store = self._ensure_infantry_profile_store()
+                payload_profiles[role_key] = build_infantry_profile_payload(store.get('subtype_profiles', {}), self.current_infantry_subtype)
+                self.profiles[role_key] = deepcopy(payload_profiles[role_key])
+            else:
+                normalized = _normalize_profile_constraints(role_key, self.profiles[role_key])
+                payload_profiles[role_key] = normalized
+                self.profiles[role_key] = deepcopy(normalized)
         os.makedirs(os.path.dirname(self.preset_path), exist_ok=True)
         with open(self.preset_path, 'w', encoding='utf-8') as file:
-            json.dump({'profiles': self.profiles}, file, ensure_ascii=False, indent=2)
+            json.dump({'profiles': payload_profiles}, file, ensure_ascii=False, indent=2)
         self.status_text = f'已保存到 {self.preset_path}'
+
+    def _ensure_infantry_profile_store(self):
+        container = self.profiles.setdefault('infantry', _default_profile('infantry'))
+        default_subtype = normalize_infantry_chassis_subtype(container.get('default_chassis_subtype', container.get('chassis_subtype')))
+        current_subtype = normalize_infantry_chassis_subtype(getattr(self, 'current_infantry_subtype', default_subtype) or default_subtype)
+        resolved_root = resolve_infantry_subtype_profile(container, default_subtype)
+        raw_subtype_profiles = container.get('subtype_profiles')
+        subtype_profiles = raw_subtype_profiles if isinstance(raw_subtype_profiles, dict) else {}
+        normalized_subprofiles = {}
+        for subtype, _label in infantry_chassis_options():
+            seed = subtype_profiles.get(subtype)
+            if not isinstance(seed, dict):
+                seed = resolved_root if subtype == default_subtype else infantry_chassis_preset(subtype)
+            merged_seed = deepcopy(seed)
+            for color_key, fallback in _default_color_profile().items():
+                merged_seed.setdefault(color_key, deepcopy(resolved_root.get(color_key, fallback)))
+            normalized_subprofiles[subtype] = _normalize_profile_constraints('infantry', merged_seed, forced_subtype=subtype)
+        container = deepcopy(container)
+        container['default_chassis_subtype'] = current_subtype
+        container['subtype_profiles'] = normalized_subprofiles
+        self.profiles['infantry'] = container
+        self.current_infantry_subtype = current_subtype
+        return container
+
+    def _component_part_count(self, profile, part):
+        if part == 'wheel':
+            return len(profile.get('custom_wheel_positions_m', []))
+        if part in {'armor', 'armor_light'}:
+            return 4
+        return 0
+
+    def _part_supports_component_selection(self, part):
+        return part in {'wheel', 'armor', 'armor_light'}
+
+    def _clamp_selected_component_index(self, profile=None):
+        if profile is None:
+            profile = self._current_profile()
+        count = self._component_part_count(profile, self.selected_part)
+        if count <= 0:
+            self.selected_component_index = 0
+            return 0
+        self.selected_component_index = max(0, min(int(self.selected_component_index), count - 1))
+        return count
+
+    def _current_component_angle_keys(self):
+        mapping = {
+            'wheel': ('wheel_orbit_yaws_deg', 'wheel_self_yaws_deg'),
+            'armor': ('armor_orbit_yaws_deg', 'armor_self_yaws_deg'),
+            'armor_light': ('armor_light_orbit_yaws_deg', 'armor_light_self_yaws_deg'),
+        }
+        if self.selected_part is None:
+            return (None, None)
+        return mapping.get(self.selected_part, (None, None))
 
     def _build_field_specs(self):
         fields = [
@@ -913,6 +1098,7 @@ class AppearanceEditorApp:
         if self.selected_part is None:
             return []
         profile = self._current_profile()
+        self._clamp_selected_component_index(profile)
         if self.selected_part == 'turret' and not self._profile_has_turret(profile):
             return []
         if self.selected_part == 'mount' and not self._profile_has_mount(profile):
@@ -925,20 +1111,36 @@ class AppearanceEditorApp:
             return []
         fields = [spec for spec in self.field_specs if spec.get('part') == self.selected_part]
         if self.selected_part == 'wheel':
-            for index, _ in enumerate(profile.get('custom_wheel_positions_m', [])):
-                fields.append({'part': 'wheel', 'label': f'轮 {index + 1} X', 'kind': 'wheel', 'wheel_index': index, 'axis': 0, 'min': -0.80, 'max': 2.00, 'step': 0.01})
-                fields.append({'part': 'wheel', 'label': f'轮 {index + 1} Y', 'kind': 'wheel', 'wheel_index': index, 'axis': 1, 'min': -0.80, 'max': 2.00, 'step': 0.01})
+            if self.selected_component_scope == 'single' and profile.get('custom_wheel_positions_m'):
+                fields.append({'part': 'wheel', 'label': f'轮 {self.selected_component_index + 1} X', 'kind': 'wheel_component', 'component_index': self.selected_component_index, 'axis': 0, 'min': -0.80, 'max': 2.00, 'step': 0.01})
+                fields.append({'part': 'wheel', 'label': f'轮 {self.selected_component_index + 1} Y', 'kind': 'wheel_component', 'component_index': self.selected_component_index, 'axis': 1, 'min': -0.80, 'max': 2.00, 'step': 0.01})
+        orbit_key, self_key = self._current_component_angle_keys()
+        if orbit_key is not None:
+            fields.append({'part': self.selected_part, 'label': '相对机器人轴心 Yaw', 'kind': 'component_angle', 'angle_key': orbit_key, 'min': -180.0, 'max': 180.0, 'step': 1.0})
+            fields.append({'part': self.selected_part, 'label': '相对自身轴心 Yaw', 'kind': 'component_angle', 'angle_key': self_key, 'min': -180.0, 'max': 180.0, 'step': 1.0})
         return fields
 
     def _current_profile(self):
-        return self.profiles[self.current_role]
+        if self.current_role != 'infantry':
+            return self.profiles[self.current_role]
+        store = self._ensure_infantry_profile_store()
+        subtype_profiles = store.get('subtype_profiles', {})
+        current_subtype = normalize_infantry_chassis_subtype(self.current_infantry_subtype)
+        self.current_infantry_subtype = current_subtype
+        return subtype_profiles[current_subtype]
 
     def _field_value(self, spec):
         profile = self._current_profile()
         if spec['kind'] == 'number':
             return float(profile.get(spec['key'], 0.0))
-        if spec['kind'] == 'wheel':
-            return float(profile['custom_wheel_positions_m'][spec['wheel_index']][spec['axis']])
+        if spec['kind'] == 'wheel_component':
+            return float(profile['custom_wheel_positions_m'][spec['component_index']][spec['axis']])
+        if spec['kind'] == 'component_angle':
+            values = profile.get(spec['angle_key'], [])
+            if self.selected_component_scope == 'all':
+                return float(values[0]) if values else 0.0
+            index = max(0, min(self.selected_component_index, len(values) - 1)) if values else 0
+            return float(values[index]) if values else 0.0
         return int(profile[spec['color_key']][spec['channel']])
 
     def _set_field_value(self, spec, value):
@@ -948,23 +1150,48 @@ class AppearanceEditorApp:
             profile[spec['key']] = round(float(clamped), 3)
             if spec['key'] in {'body_length_m', 'body_width_m', 'wheel_radius_m'}:
                 self._rebuild_default_wheel_layout_if_needed(profile)
-            self.profiles[self.current_role] = _normalize_profile_constraints(self.current_role, profile)
+            if self.current_role == 'infantry':
+                store = self._ensure_infantry_profile_store()
+                store['subtype_profiles'][self.current_infantry_subtype] = _normalize_profile_constraints(self.current_role, profile, forced_subtype=self.current_infantry_subtype)
+                store['default_chassis_subtype'] = self.current_infantry_subtype
+                self.profiles[self.current_role] = store
+            else:
+                self.profiles[self.current_role] = _normalize_profile_constraints(self.current_role, profile)
             return
-        if spec['kind'] == 'wheel':
-            profile['custom_wheel_positions_m'][spec['wheel_index']][spec['axis']] = round(float(clamped), 3)
+        if spec['kind'] == 'wheel_component':
+            profile['custom_wheel_positions_m'][spec['component_index']][spec['axis']] = round(float(clamped), 3)
+            return
+        if spec['kind'] == 'component_angle':
+            values = list(profile.get(spec['angle_key'], []))
+            if self.selected_component_scope == 'all':
+                values = [round(float(clamped), 3) for _ in values]
+            elif values:
+                index = max(0, min(self.selected_component_index, len(values) - 1))
+                values[index] = round(float(clamped), 3)
+            profile[spec['angle_key']] = values
             return
         profile[spec['color_key']][spec['channel']] = int(round(clamped))
 
     def _rebuild_default_wheel_layout_if_needed(self, profile):
         current = profile.get('custom_wheel_positions_m', [])
-        wheel_count = 2 if str(profile.get('wheel_style', 'standard')) == 'legged' else 4
+        wheel_style = str(profile.get('wheel_style', 'standard'))
+        wheel_count = 2 if wheel_style == 'legged' else 4
         if not isinstance(current, list) or len(current) != wheel_count:
             current = []
         wheel_y = round(float(profile['body_width_m']) * 0.5 + float(profile['wheel_radius_m']) * 0.55, 3)
-        if wheel_count == 2:
+        if wheel_style == 'legged':
             defaults = [
                 [0.0, -wheel_y],
                 [0.0, wheel_y],
+            ]
+        elif wheel_style == 'omni':
+            wheel_x = round(float(profile['body_length_m']) * 0.36, 3)
+            wheel_y = round(float(profile['body_width_m']) * 0.36, 3)
+            defaults = [
+                [wheel_x, 0.0],
+                [0.0, wheel_y],
+                [-wheel_x, 0.0],
+                [0.0, -wheel_y],
             ]
         else:
             wheel_x = round(float(profile['body_length_m']) * 0.39, 3)
@@ -986,6 +1213,89 @@ class AppearanceEditorApp:
         step = spec['step'] * (5 if fast else 1)
         self._set_field_value(spec, self._field_value(spec) + direction * step)
 
+    def _change_selected_component(self, delta):
+        profile = self._current_profile()
+        count = self._component_part_count(profile, self.selected_part)
+        if count <= 0:
+            return
+        self.selected_component_index = (self.selected_component_index + int(delta)) % count
+        self.active_numeric_input = None
+
+    def _field_content_top_inset(self):
+        return 88 if self._part_supports_component_selection(self.selected_part) else 52
+
+    def _infantry_subtype_tab_rects(self):
+        if self.current_role != 'infantry':
+            return []
+        tabs = []
+        start_x = 28 + len(ROLE_ORDER) * 122 + 18
+        for index, (subtype, label) in enumerate(infantry_chassis_options()):
+            tabs.append((subtype, label, pygame.Rect(start_x + index * 160, 72, 148, 40)))
+        return tabs
+
+    def _begin_numeric_input(self, initial_text=''):
+        visible_fields = self._visible_field_specs()
+        if not visible_fields:
+            return False
+        self.selected_field_index = max(0, min(self.selected_field_index, len(visible_fields) - 1))
+        current_spec = visible_fields[self.selected_field_index]
+        existing = self.active_numeric_input if isinstance(self.active_numeric_input, dict) else None
+        if existing is not None and existing.get('field_index') == self.selected_field_index:
+            buffer_text = str(existing.get('buffer', ''))
+        else:
+            current_value = self._field_value(current_spec)
+            buffer_text = str(int(current_value)) if current_spec['kind'] == 'color' else f'{float(current_value):.3f}'.rstrip('0').rstrip('.')
+        if initial_text:
+            buffer_text = initial_text
+        self.active_numeric_input = {'field_index': self.selected_field_index, 'buffer': buffer_text}
+        return True
+
+    def _commit_numeric_input(self):
+        if not isinstance(self.active_numeric_input, dict):
+            return False
+        visible_fields = self._visible_field_specs()
+        field_index = int(self.active_numeric_input.get('field_index', -1))
+        if not (0 <= field_index < len(visible_fields)):
+            self.active_numeric_input = None
+            return False
+        spec = visible_fields[field_index]
+        buffer_text = str(self.active_numeric_input.get('buffer', '')).strip()
+        if not buffer_text or buffer_text in {'-', '.', '-.'}:
+            self.active_numeric_input = None
+            return False
+        try:
+            parsed_value = int(buffer_text) if spec['kind'] == 'color' else float(buffer_text)
+        except ValueError:
+            self.status_text = f'输入无效: {buffer_text}'
+            self.active_numeric_input = None
+            return False
+        self._set_field_value(spec, parsed_value)
+        self.active_numeric_input = None
+        return True
+
+    def _handle_numeric_input_keydown(self, event):
+        if not isinstance(self.active_numeric_input, dict):
+            return False
+        if event.key in {pygame.K_RETURN, pygame.K_KP_ENTER}:
+            self._commit_numeric_input()
+            return True
+        if event.key == pygame.K_ESCAPE:
+            self.active_numeric_input = None
+            return True
+        if event.key == pygame.K_BACKSPACE:
+            self.active_numeric_input['buffer'] = str(self.active_numeric_input.get('buffer', ''))[:-1]
+            return True
+        text = str(getattr(event, 'unicode', '') or '')
+        if text and text in '0123456789.-':
+            buffer_text = str(self.active_numeric_input.get('buffer', ''))
+            if text == '-' and buffer_text:
+                return True
+            if text == '.' and '.' in buffer_text:
+                return True
+            self.active_numeric_input['buffer'] = buffer_text + text
+            return True
+        return False
+
     def _role_tabs(self):
         tabs = []
         start_x = 28
@@ -1006,7 +1316,7 @@ class AppearanceEditorApp:
     def _field_rows(self, rect, scroll_offset=0):
         rows = []
         row_height = 28
-        y = 52 - int(scroll_offset)
+        y = self._field_content_top_inset() - int(scroll_offset)
         row_width = rect.width - 30
         visible_fields = self._visible_field_specs()
         for index, spec in enumerate(visible_fields):
@@ -1026,7 +1336,7 @@ class AppearanceEditorApp:
     def _ensure_selected_field_visible(self, rect):
         rows, _ = self._field_rows(rect, scroll_offset=self.field_scroll)
         target_rect = next((row_rect for row_type, _, row_rect, field_index in rows if row_type == 'field' and field_index == self.selected_field_index), None)
-        content_top = rect.y + 44
+        content_top = rect.y + self._field_content_top_inset() - 8
         content_bottom = rect.bottom - 12
         if target_rect is None:
             return
@@ -1060,9 +1370,9 @@ class AppearanceEditorApp:
         yield ('body', (0.0, body_y, 0.0), (float(profile['body_length_m']) * 0.5, float(profile['body_height_m']) * 0.5, float(profile['body_width_m']) * 0.5 * render_width_scale))
 
         wheel_radius = max(0.018, float(profile['wheel_radius_m']))
-        wheel_half_z = max(0.018, float(profile['wheel_radius_m']) * 0.32)
-        for wheel_x, wheel_y in profile['custom_wheel_positions_m']:
-            yield ('wheel', (float(wheel_x), wheel_radius, float(wheel_y) * render_width_scale), (wheel_radius, wheel_radius, wheel_half_z))
+        wheel_half_z = max(0.018, float(profile['wheel_radius_m']) * (0.22 if str(profile.get('wheel_style', 'standard')) == 'omni' else 0.32))
+        for wheel_x, wheel_z in _resolved_wheel_centers(profile):
+            yield ('wheel', (float(wheel_x), wheel_radius, float(wheel_z)), (wheel_radius, wheel_radius, wheel_half_z))
 
         body_half_x = float(profile['body_length_m']) * 0.5
         body_half_z = float(profile['body_width_m']) * 0.5 * render_width_scale
@@ -1081,35 +1391,18 @@ class AppearanceEditorApp:
                 yield ('front_climb', (plate_center_x, plate_center_y, plate_center_z * side_sign), (span_length * 0.5, plate_height * 0.5, plate_width * 0.5))
                 yield ('front_climb', (body_half_x * 0.78, body_y + float(profile['body_height_m']) * 0.22, plate_center_z * side_sign), (plate_top_length * 0.28, max(0.012, plate_height * 0.18), plate_width * 0.6))
 
-        armor_gap = float(profile['armor_plate_gap_m'])
         armor_half_h = float(profile['armor_plate_height_m']) * 0.5
-        armor_center_y = float(profile['body_clearance_m']) + float(profile['body_height_m']) * 0.55
-        armor_thickness = max(0.012, armor_gap * 0.75)
+        armor_thickness = max(0.012, float(profile.get('armor_plate_gap_m', 0.005)) * 0.75)
         armor_half_width = float(profile['armor_plate_width_m']) * 0.5
-        armor_half_length = float(profile['armor_plate_length_m']) * 0.5
-        for center, extents in (
-            ((body_half_x + armor_gap + armor_thickness * 0.5, armor_center_y, 0.0), (armor_thickness * 0.5, armor_half_h, armor_half_width)),
-            ((-(body_half_x + armor_gap + armor_thickness * 0.5), armor_center_y, 0.0), (armor_thickness * 0.5, armor_half_h, armor_half_width)),
-            ((0.0, armor_center_y, body_half_z + armor_gap + armor_thickness * 0.5), (armor_half_length, armor_half_h, armor_thickness * 0.5)),
-            ((0.0, armor_center_y, -(body_half_z + armor_gap + armor_thickness * 0.5)), (armor_half_length, armor_half_h, armor_thickness * 0.5)),
-        ):
-            yield ('armor', center, extents)
+        for component in _resolved_armor_components(profile):
+            yield ('armor', component['center'], (armor_thickness * 0.5, armor_half_h, armor_half_width))
 
         armor_light_half_x = float(profile.get('armor_light_length_m', 0.10)) * 0.5
         armor_light_half_y = max(0.005, float(profile.get('armor_light_height_m', 0.02)) * 0.5)
         armor_light_half_z = max(0.005, float(profile.get('armor_light_width_m', 0.02)) * 0.5)
-        armor_light_centers = (
-            (body_half_x + armor_gap + armor_thickness, armor_center_y, float(profile['armor_plate_width_m']) * 0.5 + armor_light_half_z),
-            (body_half_x + armor_gap + armor_thickness, armor_center_y, -(float(profile['armor_plate_width_m']) * 0.5 + armor_light_half_z)),
-            (-(body_half_x + armor_gap + armor_thickness), armor_center_y, float(profile['armor_plate_width_m']) * 0.5 + armor_light_half_z),
-            (-(body_half_x + armor_gap + armor_thickness), armor_center_y, -(float(profile['armor_plate_width_m']) * 0.5 + armor_light_half_z)),
-            (float(profile['armor_plate_length_m']) * 0.5 + armor_light_half_z, armor_center_y, body_half_z + armor_gap + armor_thickness),
-            (-(float(profile['armor_plate_length_m']) * 0.5 + armor_light_half_z), armor_center_y, body_half_z + armor_gap + armor_thickness),
-            (float(profile['armor_plate_length_m']) * 0.5 + armor_light_half_z, armor_center_y, -(body_half_z + armor_gap + armor_thickness)),
-            (-(float(profile['armor_plate_length_m']) * 0.5 + armor_light_half_z), armor_center_y, -(body_half_z + armor_gap + armor_thickness)),
-        )
-        for center in armor_light_centers:
-            yield ('armor_light', center, (armor_light_half_x, armor_light_half_y, armor_light_half_z))
+        for component in _resolved_armor_light_components(profile):
+            yield ('armor_light', component['center_a'], (armor_light_half_z, armor_light_half_y, armor_light_half_x))
+            yield ('armor_light', component['center_b'], (armor_light_half_z, armor_light_half_y, armor_light_half_x))
 
         if has_rear_climb:
             rear_points = _rear_climb_points(profile, render_width_scale)
@@ -1533,7 +1826,45 @@ class AppearanceEditorApp:
         pygame.draw.rect(self.screen, self.colors['panel_border'], rect, 1, border_radius=12)
         title = f'{PART_LABELS.get(self.selected_part, "可调参数")}参数' if self.selected_part is not None else '选择部件'
         self._draw_text(title, self.font, self.colors['text'], (rect.x + 14, rect.y + 12))
-        content_rect = pygame.Rect(rect.x + 8, rect.y + 42, rect.width - 20, rect.height - 54)
+        self.component_control_actions = []
+        if self._part_supports_component_selection(self.selected_part):
+            profile = self._current_profile()
+            count = self._clamp_selected_component_index(profile)
+            control_y = rect.y + 44
+            single_rect = pygame.Rect(rect.x + 12, control_y, 66, 28)
+            all_rect = pygame.Rect(rect.x + 86, control_y, 66, 28)
+            prev_rect = pygame.Rect(rect.x + 176, control_y, 28, 28)
+            next_rect = pygame.Rect(rect.x + 312, control_y, 28, 28)
+            label_rect = pygame.Rect(rect.x + 212, control_y, 92, 28)
+            for action, button_rect, label in (
+                ('component_scope:single', single_rect, '单个'),
+                ('component_scope:all', all_rect, '全部'),
+            ):
+                active = self.selected_component_scope == action.split(':', 1)[1]
+                pygame.draw.rect(self.screen, self.colors['accent'] if active else self.colors['panel_alt'], button_rect, border_radius=7)
+                pygame.draw.rect(self.screen, self.colors['panel_border'], button_rect, 1, border_radius=7)
+                text_color = (20, 22, 24) if active else self.colors['text']
+                rendered = self.small_font.render(label, True, text_color)
+                self.screen.blit(rendered, rendered.get_rect(center=button_rect.center))
+                self.component_control_actions.append((button_rect, action))
+            pygame.draw.rect(self.screen, self.colors['panel_alt'], label_rect, border_radius=7)
+            pygame.draw.rect(self.screen, self.colors['panel_border'], label_rect, 1, border_radius=7)
+            unit_text = '全部' if self.selected_component_scope == 'all' else f'单位体 {self.selected_component_index + 1}/{max(1, count)}'
+            rendered = self.small_font.render(unit_text, True, self.colors['text'])
+            self.screen.blit(rendered, rendered.get_rect(center=label_rect.center))
+            for action, button_rect, label in (
+                ('component_cycle:-1', prev_rect, '<'),
+                ('component_cycle:1', next_rect, '>'),
+            ):
+                enabled = self.selected_component_scope != 'all' and count > 1
+                pygame.draw.rect(self.screen, self.colors['panel_alt'] if enabled else (42, 46, 52), button_rect, border_radius=7)
+                pygame.draw.rect(self.screen, self.colors['panel_border'], button_rect, 1, border_radius=7)
+                rendered = self.small_font.render(label, True, self.colors['text'] if enabled else self.colors['muted'])
+                self.screen.blit(rendered, rendered.get_rect(center=button_rect.center))
+                if enabled:
+                    self.component_control_actions.append((button_rect, action))
+        content_top_inset = self._field_content_top_inset()
+        content_rect = pygame.Rect(rect.x + 8, rect.y + content_top_inset, rect.width - 20, rect.height - content_top_inset - 12)
         pygame.draw.rect(self.screen, self.colors['panel_alt'], content_rect, border_radius=8)
         if self.selected_part is None:
             hint_lines = [
@@ -1558,9 +1889,14 @@ class AppearanceEditorApp:
             pygame.draw.rect(self.screen, self.colors['panel_alt'] if active else (31, 36, 42), row_rect, border_radius=6)
             pygame.draw.rect(self.screen, self.colors['accent'] if active else self.colors['panel_border'], row_rect, 1, border_radius=6)
             value = self._field_value(spec)
-            value_text = f'{value:.3f}' if spec['kind'] != 'color' else f'{int(value)}'
+            if isinstance(self.active_numeric_input, dict) and int(self.active_numeric_input.get('field_index', -1)) == field_index:
+                value_text = str(self.active_numeric_input.get('buffer', ''))
+                value_color = self.colors['accent']
+            else:
+                value_text = f'{value:.3f}' if spec['kind'] != 'color' else f'{int(value)}'
+                value_color = self.colors['muted']
             self._draw_text(spec['label'], self.small_font, self.colors['text'], (row_rect.x + 10, row_rect.y + 5))
-            value_surface = self.small_font.render(value_text, True, self.colors['muted'])
+            value_surface = self.small_font.render(value_text, True, value_color)
             self.screen.blit(value_surface, value_surface.get_rect(right=row_rect.right - 10, centery=row_rect.centery))
         self.screen.set_clip(old_clip)
 
@@ -1584,6 +1920,13 @@ class AppearanceEditorApp:
             pygame.draw.rect(self.screen, self.colors['panel_border'], rect, 1, border_radius=8)
             text_surface = self.font.render(label, True, (20, 22, 24) if active else self.colors['text'])
             self.screen.blit(text_surface, text_surface.get_rect(center=rect.center))
+        self.infantry_subtype_tabs = self._infantry_subtype_tab_rects()
+        for subtype, label, rect in self.infantry_subtype_tabs:
+            active = subtype == self.current_infantry_subtype
+            pygame.draw.rect(self.screen, self.colors['accent'] if active else self.colors['panel_alt'], rect, border_radius=8)
+            pygame.draw.rect(self.screen, self.colors['panel_border'], rect, 1, border_radius=8)
+            text_surface = self.small_font.render(label, True, (20, 22, 24) if active else self.colors['text'])
+            self.screen.blit(text_surface, text_surface.get_rect(center=rect.center))
 
     def _draw_footer(self):
         footer_rect = pygame.Rect(24, self.window_height - 44, self.window_width - 48, 24)
@@ -1593,10 +1936,28 @@ class AppearanceEditorApp:
         for mode_key, _, rect in self.preview_mode_tabs:
             if rect.collidepoint(pos):
                 self.preview_mode = mode_key
+                self.active_numeric_input = None
                 return
         for role_key, _, rect in self._role_tabs():
             if rect.collidepoint(pos):
                 self.current_role = role_key
+                self.active_numeric_input = None
+                return
+        for subtype, _, rect in self.infantry_subtype_tabs:
+            if rect.collidepoint(pos):
+                self.current_infantry_subtype = subtype
+                self.selected_component_index = 0
+                self.active_numeric_input = None
+                store = self._ensure_infantry_profile_store()
+                store['default_chassis_subtype'] = subtype
+                return
+        for action_rect, action in self.component_control_actions:
+            if action_rect.collidepoint(pos):
+                if action.startswith('component_scope:'):
+                    self.selected_component_scope = action.split(':', 1)[1]
+                elif action.startswith('component_cycle:'):
+                    self._change_selected_component(int(action.split(':', 1)[1]))
+                self.active_numeric_input = None
                 return
         field_panel, _ = self._layout_panels()
         if self.field_scrollbar_thumb_rect is not None and self.field_scrollbar_thumb_rect.collidepoint(pos):
@@ -1613,19 +1974,31 @@ class AppearanceEditorApp:
                 self.selected_part = part
                 self.selected_field_index = 0
                 self.field_scroll = 0
+                self.selected_component_index = 0
+                self.active_numeric_input = None
                 return
         if self.preview_content_rect is not None and self.preview_content_rect.collidepoint(pos) and self.preview_mode != '3d':
             self.selected_part = None
+            self.active_numeric_input = None
             return
         rows, _ = self._field_rows(field_panel, scroll_offset=self.field_scroll)
         for row_type, _, row_rect, field_index in rows:
             if row_type == 'field' and row_rect.collidepoint(pos):
                 self.selected_field_index = field_index
                 self._ensure_selected_field_visible(field_panel)
+                self.active_numeric_input = None
                 return
     def _reset_current_role(self):
-        self.profiles[self.current_role] = _default_profile(self.current_role)
+        if self.current_role == 'infantry':
+            store = self._ensure_infantry_profile_store()
+            store['subtype_profiles'][self.current_infantry_subtype] = _normalize_profile_constraints('infantry', infantry_chassis_preset(self.current_infantry_subtype), forced_subtype=self.current_infantry_subtype)
+            store['default_chassis_subtype'] = self.current_infantry_subtype
+            self.profiles[self.current_role] = store
+        else:
+            self.profiles[self.current_role] = _default_profile(self.current_role)
         self.selected_part = None
+        self.selected_component_index = 0
+        self.active_numeric_input = None
         self.status_text = f'已重置 {dict(ROLE_ORDER)[self.current_role]} 默认外观'
 
     def handle_event(self, event):
@@ -1671,6 +2044,8 @@ class AppearanceEditorApp:
             return
         if event.type != pygame.KEYDOWN:
             return
+        if self.active_numeric_input is not None and self._handle_numeric_input_keydown(event):
+            return
         modifiers = pygame.key.get_mods()
         if event.key == pygame.K_ESCAPE:
             self.running = False
@@ -1681,13 +2056,29 @@ class AppearanceEditorApp:
             self.current_role = role_keys[(current_index + 1) % len(role_keys)]
             self.selected_part = None
             self.selected_field_index = 0
+            self.active_numeric_input = None
             return
+        if self._part_supports_component_selection(self.selected_part):
+            if event.key == pygame.K_a:
+                self.selected_component_scope = 'all' if self.selected_component_scope == 'single' else 'single'
+                self.active_numeric_input = None
+                return
+            if event.key == pygame.K_LEFTBRACKET:
+                self._change_selected_component(-1)
+                return
+            if event.key == pygame.K_RIGHTBRACKET:
+                self._change_selected_component(1)
+                return
         if event.key == pygame.K_r:
             self._reset_current_role()
             return
         if event.key == pygame.K_s and modifiers & pygame.KMOD_CTRL:
             self._save_profiles()
             return
+        numeric_text = str(getattr(event, 'unicode', '') or '')
+        if numeric_text and not (modifiers & (pygame.KMOD_CTRL | pygame.KMOD_ALT)) and numeric_text in '0123456789.-':
+            if self._begin_numeric_input(numeric_text):
+                return
         if event.key == pygame.K_UP:
             visible_fields = self._visible_field_specs()
             if not visible_fields:
