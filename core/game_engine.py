@@ -15,22 +15,12 @@ from collections import deque
 from datetime import datetime
 from map.map_manager import MapManager
 from entities.entity_manager import EntityManager
-from physics.physics_engine import PhysicsEngine
+from physics.pybullet_engine import PyBulletPhysicsEngine
 from rules.rules_engine import RulesEngine
 from control.controller import Controller
 from control.player_look import clamp_entity_pitch, get_player_mouse_input_settings, scale_player_mouse_motion, set_player_mouse_input_settings
-# Try relative import if the file exists in the same project
-try:
-    from state_machine.sentry_state_machine import SentryStateMachine
-except ModuleNotFoundError:
-    # Fallback: try importing from current directory or adjust as needed
-    try:
-        from .sentry_state_machine import SentryStateMachine
-    except ModuleNotFoundError:
-        # As a last resort, define a dummy class to avoid runtime errors
-        class SentryStateMachine:
-            def update(self, entity):
-                pass
+from core.message_bus import MessageBus
+from state_machine.sentry_state_machine import SentryStateMachine
 
 
 class GameEngine:
@@ -127,6 +117,18 @@ class GameEngine:
         self.player_autoaim_pressed = False
         self.player_look_delta = [0.0, 0.0]
         self.player_view_aim_state = None
+        self.player_step_climb_mode_active = False
+        self.player_movement_input = {
+            'forward': False,
+            'backward': False,
+            'left': False,
+            'right': False,
+            'jump': False,
+            'small_gyro': False,
+        }
+        self.player_input_timing = {}
+        self.recent_bus_messages = deque(maxlen=64)
+        self.message_bus = MessageBus()
         self.player_camera_mode = str(simulator_config.get('player_camera_mode', 'first_person') or 'first_person')
         if self.player_camera_mode not in {'first_person', 'third_person'}:
             self.player_camera_mode = 'first_person'
@@ -253,6 +255,11 @@ class GameEngine:
         entity = self.entity_manager.get_entity(entity_id) if entity_id else None
         for candidate in getattr(self.entity_manager, 'entities', ()):
             candidate.player_controlled = False
+            candidate.step_climb_mode_active = False
+            candidate.step_climb_lock_heading_deg = None
+        self.player_step_climb_mode_active = False
+        for key in self.player_movement_input:
+            self.player_movement_input[key] = False
         if entity is None or not entity.is_alive() or getattr(entity, 'type', None) not in {'robot', 'sentry'}:
             self.player_control_enabled = False
             self.player_controlled_entity_id = None
@@ -265,27 +272,118 @@ class GameEngine:
     def clear_player_controlled_entity(self):
         for candidate in getattr(self.entity_manager, 'entities', ()):
             candidate.player_controlled = False
+            candidate.step_climb_mode_active = False
+            candidate.step_climb_lock_heading_deg = None
         self.player_control_enabled = False
         self.player_controlled_entity_id = None
         self.player_fire_pressed = False
         self.player_autoaim_pressed = False
         self.player_look_delta = [0.0, 0.0]
         self.player_view_aim_state = None
+        self.player_step_climb_mode_active = False
+        for key in self.player_movement_input:
+            self.player_movement_input[key] = False
+        self.player_input_timing = {}
+
+    def _record_player_input_event(self, input_id, is_down=None, payload=None):
+        input_key = str(input_id or '').strip()
+        if not input_key:
+            return None
+        now_sec = float(self.game_time)
+        previous = self.player_input_timing.get(input_key, {}) if isinstance(self.player_input_timing.get(input_key), dict) else {}
+        was_down = bool(previous.get('is_down', False))
+        next_state = dict(previous)
+        if is_down is not None:
+            next_state['is_down'] = bool(is_down)
+            next_state['just_pressed'] = bool(is_down and not was_down)
+            next_state['just_released'] = bool((not is_down) and was_down)
+            if next_state['just_pressed']:
+                next_state['last_pressed_at'] = now_sec
+                next_state['press_count'] = int(previous.get('press_count', 0)) + 1
+            else:
+                next_state.setdefault('press_count', int(previous.get('press_count', 0)))
+            if next_state['just_released']:
+                next_state['last_released_at'] = now_sec
+        if payload is not None:
+            next_state['payload'] = deepcopy(payload)
+        self.player_input_timing[input_key] = next_state
+        self.message_bus.publish(
+            'player_input',
+            {
+                'input_id': input_key,
+                'is_down': next_state.get('is_down'),
+                'time_sec': now_sec,
+                'payload': deepcopy(payload) if payload is not None else None,
+            },
+        )
+        return deepcopy(next_state)
+
+    def _consume_player_input_timing_snapshot(self):
+        snapshot = deepcopy(self.player_input_timing)
+        for state in self.player_input_timing.values():
+            if isinstance(state, dict):
+                state['just_pressed'] = False
+                state['just_released'] = False
+        return snapshot
 
     def set_player_action_state(self, fire_pressed=None, autoaim_pressed=None):
         if fire_pressed is not None:
             self.player_fire_pressed = bool(fire_pressed)
+            self._record_player_input_event('fire', is_down=self.player_fire_pressed)
         if autoaim_pressed is not None:
             self.player_autoaim_pressed = bool(autoaim_pressed)
+            self._record_player_input_event('autoaim', is_down=self.player_autoaim_pressed)
+
+    def set_player_movement_state(self, forward=None, backward=None, left=None, right=None, jump=None, small_gyro=None):
+        state_map = {
+            'forward': forward,
+            'backward': backward,
+            'left': left,
+            'right': right,
+            'jump': jump,
+            'small_gyro': small_gyro,
+        }
+        event_names = {
+            'forward': 'move_forward',
+            'backward': 'move_backward',
+            'left': 'move_left',
+            'right': 'move_right',
+            'jump': 'jump',
+            'small_gyro': 'small_gyro',
+        }
+        for key, value in state_map.items():
+            if value is None:
+                continue
+            normalized = bool(value)
+            if self.player_movement_input.get(key) == normalized:
+                continue
+            self.player_movement_input[key] = normalized
+            self._record_player_input_event(event_names[key], is_down=normalized)
 
     def set_player_view_aim_state(self, aim_state=None):
         self.player_view_aim_state = deepcopy(aim_state) if isinstance(aim_state, dict) else None
+
+    def set_player_step_climb_mode(self, active):
+        self.player_step_climb_mode_active = bool(active)
+        self._record_player_input_event('step_climb_mode', is_down=self.player_step_climb_mode_active)
+        entity = self.get_player_controlled_entity()
+        if entity is not None:
+            entity.step_climb_mode_active = self.player_step_climb_mode_active
+            if self.player_step_climb_mode_active:
+                entity.step_climb_lock_heading_deg = float(getattr(entity, 'angle', 0.0))
+            else:
+                entity.step_climb_lock_heading_deg = None
+        return self.player_step_climb_mode_active
+
+    def toggle_player_step_climb_mode(self):
+        return self.set_player_step_climb_mode(not bool(getattr(self, 'player_step_climb_mode_active', False)))
 
     def set_player_camera_mode(self, mode):
         normalized = str(mode or 'first_person')
         if normalized not in {'first_person', 'third_person'}:
             normalized = 'first_person'
         self.player_camera_mode = normalized
+        self._record_player_input_event('camera_mode', payload={'mode': self.player_camera_mode})
 
     def get_player_sensitivity_settings(self):
         settings = get_player_mouse_input_settings(self.config)
@@ -332,13 +430,26 @@ class GameEngine:
         yaw_delta_deg, pitch_delta_deg = scale_player_mouse_motion(self.config, delta_x, delta_y)
         self.player_look_delta[0] += float(yaw_delta_deg)
         self.player_look_delta[1] += float(pitch_delta_deg)
+        self.message_bus.publish(
+            'player_look',
+            {
+                'yaw_delta_deg': float(yaw_delta_deg),
+                'pitch_delta_deg': float(pitch_delta_deg),
+                'time_sec': float(self.game_time),
+            },
+        )
 
     def consume_player_input_state(self):
         state = {
+            'input_time_sec': float(self.game_time),
+            'frame_dt': float(self.dt),
             'look_dx': float(self.player_look_delta[0]),
             'look_dy': float(self.player_look_delta[1]),
             'fire_pressed': bool(self.player_fire_pressed),
             'autoaim_pressed': bool(self.player_autoaim_pressed),
+            'step_climb_mode_active': bool(getattr(self, 'player_step_climb_mode_active', False)),
+            'movement': deepcopy(self.player_movement_input),
+            'input_timing': self._consume_player_input_timing_snapshot(),
             'view_aim_state': deepcopy(self.player_view_aim_state) if isinstance(self.player_view_aim_state, dict) else None,
             'camera_mode': str(getattr(self, 'player_camera_mode', 'first_person')),
         }
@@ -357,6 +468,33 @@ class GameEngine:
         if entity is None:
             return {'ok': False, 'code': 'ENTITY_MISSING'}
         return self.rules_engine.purchase_manual_role_ammo(entity, amount, map_manager=self.map_manager)
+
+    def _player_ai_disabled_entity_ids(self):
+        if not bool(getattr(self, 'player_control_enabled', False)):
+            return set()
+        if not bool(self.config.get('simulator', {}).get('standalone_3d_program', False)):
+            return self.get_player_controlled_entity_ids()
+        return {
+            entity.id
+            for entity in getattr(self.entity_manager, 'entities', ())
+            if getattr(entity, 'type', None) in {'robot', 'sentry'}
+        }
+
+    def _freeze_player_mode_inactive_units(self, player_ids):
+        if not bool(getattr(self, 'player_control_enabled', False)):
+            return
+        if not bool(self.config.get('simulator', {}).get('standalone_3d_program', False)):
+            return
+        for entity in getattr(self.entity_manager, 'entities', ()):
+            if entity.id in player_ids:
+                continue
+            if getattr(entity, 'type', None) not in {'robot', 'sentry'}:
+                continue
+            entity.set_velocity(0.0, 0.0, 0.0)
+            entity.angular_velocity = 0.0
+            entity.target = None
+            entity.fire_control_state = 'idle'
+            entity.auto_aim_locked = False
 
     def _clear_single_unit_test_inactive_entity_state(self):
         if not self.is_single_unit_test_mode():
@@ -483,7 +621,7 @@ class GameEngine:
         self._restart_auto_aim_executor(wait=True)
         self.map_manager = MapManager(self.config)
         self.entity_manager = EntityManager(self.config)
-        self.physics_engine = PhysicsEngine(self.config)
+        self.physics_engine = PyBulletPhysicsEngine(self.config)
         self.rules_engine = RulesEngine(self.config)
         self.rules_engine.game_engine = self
         self.controller = Controller(self.config)
@@ -511,9 +649,22 @@ class GameEngine:
         controller = getattr(self, 'controller', None)
         if controller is not None and hasattr(controller, 'shutdown'):
             controller.shutdown()
+        physics_engine = getattr(self, 'physics_engine', None)
+        if physics_engine is not None and hasattr(physics_engine, 'shutdown'):
+            physics_engine.shutdown()
         map_manager = getattr(self, 'map_manager', None)
         if map_manager is not None and hasattr(map_manager, 'shutdown'):
             map_manager.shutdown()
+        message_bus = getattr(self, 'message_bus', None)
+        if message_bus is not None:
+            message_bus.shutdown()
+
+    def _drain_message_bus(self):
+        message_bus = getattr(self, 'message_bus', None)
+        if message_bus is None:
+            return
+        for message in message_bus.poll(limit=128):
+            self.recent_bus_messages.append(message)
 
     def _reset_runtime_state(self):
         self.game_time = 0
@@ -747,6 +898,7 @@ class GameEngine:
     
     def update(self):
         """更新游戏状态"""
+        self._drain_message_bus()
         if self.match_started and self.pre_match_countdown_remaining > 0.0:
             self.pre_match_countdown_remaining = max(0.0, self.pre_match_countdown_remaining - self.dt)
             if self.pre_match_countdown_remaining <= 1e-6:
@@ -782,6 +934,7 @@ class GameEngine:
         controller_start = time.perf_counter() if measure_perf else 0.0
         if self.feature_enabled('controller'):
             player_ids = self.get_player_controlled_entity_ids()
+            ai_disabled_ids = self._player_ai_disabled_entity_ids()
             self.controller.update(
                 self.entity_manager.entities,
                 self.map_manager,
@@ -789,10 +942,11 @@ class GameEngine:
                 self.game_time,
                 self.game_duration,
                 controlled_entity_ids=self.get_single_unit_test_controlled_entity_ids(),
-                ai_excluded_entity_ids=player_ids,
+                ai_excluded_entity_ids=ai_disabled_ids,
                 manual_entity_ids=player_ids,
                 manual_state=self.consume_player_input_state(),
             )
+            self._freeze_player_mode_inactive_units(player_ids)
             self._freeze_non_focus_single_unit_entities()
             self._clear_single_unit_test_inactive_entity_state()
         controller_end = time.perf_counter() if measure_perf else 0.0
@@ -880,7 +1034,7 @@ class GameEngine:
 
         track_speed = float(self.rules_engine.rules.get('shooting', {}).get('auto_aim_track_speed_deg_per_sec', 180.0))
         controlled_ids = self.get_single_unit_test_controlled_entity_ids()
-        player_ids = self.get_player_controlled_entity_ids()
+        player_ids = self._player_ai_disabled_entity_ids()
 
         for entity in self.entity_manager.entities:
             if not entity.is_alive():
@@ -1437,6 +1591,7 @@ class GameEngine:
             'auto_aim_locked': bool(getattr(entity, 'auto_aim_locked', False)),
             'supply_zone': self.is_player_in_supply_zone(),
             'pitch_deg': float(getattr(entity, 'gimbal_pitch_deg', 0.0)),
+            'step_climb_mode_active': bool(getattr(entity, 'step_climb_mode_active', False)),
         }
 
     def get_entity_detail_data(self, entity_id):

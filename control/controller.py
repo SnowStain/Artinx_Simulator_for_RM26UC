@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pygame
@@ -48,6 +49,9 @@ class Controller:
             self._player_control_dispatch_interval,
             float(ai_config.get('standalone_player_control_dispatch_interval_sec', max(0.32, self._player_control_dispatch_interval * 1.6))),
         )
+        self._controller_time_budget_sec = max(0.0, float(ai_config.get('controller_time_budget_ms', 12.0)) / 1000.0)
+        self._controller_dispatch_backoff_max = max(1.0, float(ai_config.get('controller_dispatch_backoff_max', 2.5)))
+        self._last_ai_dispatch_duration_sec = 0.0
         self._last_ai_dispatch_time = -1e9
         
         # 控制模式：'manual' 或 'ai'
@@ -169,6 +173,9 @@ class Controller:
             dispatch_interval = self._standalone_player_control_dispatch_interval
         else:
             dispatch_interval = self._player_control_dispatch_interval if player_control_active else self._controller_dispatch_interval
+        if self._controller_time_budget_sec > 1e-6 and self._last_ai_dispatch_duration_sec > self._controller_time_budget_sec:
+            overload_ratio = self._last_ai_dispatch_duration_sec / self._controller_time_budget_sec
+            dispatch_interval *= min(self._controller_dispatch_backoff_max, max(1.0, overload_ratio))
         if self._last_ai_dispatch_time <= -1e8:
             self._last_ai_dispatch_time = float(game_time)
             return True
@@ -193,6 +200,7 @@ class Controller:
             player_control_active=bool(manual_ids),
             standalone_player_mode=standalone_player_mode,
         )
+        dispatch_started_at = time.perf_counter() if dispatch_ai else None
         try:
             if dispatch_ai:
                 self._update_ai_parallel(
@@ -205,12 +213,16 @@ class Controller:
                     excluded_entity_ids=ai_excluded_entity_ids,
                     player_focus_entity_id=player_focus_entity_id,
                 )
+                if dispatch_started_at is not None:
+                    self._last_ai_dispatch_duration_sec = max(0.0, time.perf_counter() - dispatch_started_at)
             else:
                 self._maintain_ai_motion_only(entities, controlled_entity_ids=controlled_ids, excluded_entity_ids=ai_excluded_entity_ids)
         except Exception:
             ai_entities = [entity for entity in entities if entity.id not in set(ai_excluded_entity_ids or ())]
             if dispatch_ai:
                 self._ai_controllers[0].update(ai_entities, map_manager, rules_engine, game_time, game_duration, controlled_entity_ids=controlled_ids, controlled_entities=tuple(ai_entities))
+                if dispatch_started_at is not None:
+                    self._last_ai_dispatch_duration_sec = max(0.0, time.perf_counter() - dispatch_started_at)
             else:
                 self._ai_controllers[0].maintain_entities_motion(ai_entities)
 

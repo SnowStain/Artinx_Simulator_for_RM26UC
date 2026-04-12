@@ -210,8 +210,8 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.terrain_3d_map_rgb_cache = None
         self.terrain_scene_vertical_exaggeration = 1.0
         self.terrain_scene_ground_height_scale = 1.0
-        self.terrain_scene_max_cells = int(max(12000, config.get('simulator', {}).get('terrain_scene_max_cells', 64000)))
-        self.player_terrain_scene_max_cells = int(max(6000, config.get('simulator', {}).get('player_terrain_scene_max_cells', 12000)))
+        self.terrain_scene_max_cells = int(max(16000, config.get('simulator', {}).get('terrain_scene_max_cells', 96000)))
+        self.player_terrain_scene_max_cells = int(max(8000, config.get('simulator', {}).get('player_terrain_scene_max_cells', 18000)))
         self.terrain_scene_force_dark_gray = False
         self.player_control_terrain_dark_gray = bool(config.get('simulator', {}).get('player_control_terrain_dark_gray', True))
         self.player_camera_mode = str(config.get('simulator', {}).get('player_camera_mode', 'first_person') or 'first_person')
@@ -220,11 +220,15 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         self.player_third_person_distance_m = float(config.get('simulator', {}).get('player_third_person_distance_m', 1.85))
         self.player_third_person_height_m = float(config.get('simulator', {}).get('player_third_person_height_m', 0.58))
         self.player_view_ray_alpha = int(max(32, min(255, config.get('simulator', {}).get('player_view_ray_alpha', 176))))
-        self.player_terrain_render_scale = float(max(0.35, min(1.0, config.get('simulator', {}).get('player_terrain_render_scale', 0.52))))
+        self.player_terrain_render_scale = float(max(0.35, min(1.0, config.get('simulator', {}).get('player_terrain_render_scale', 0.58))))
         self.player_motion_terrain_render_scale = float(max(0.35, min(self.player_terrain_render_scale, config.get('simulator', {}).get('player_motion_terrain_render_scale', 0.36))))
         self.player_camera_motion_threshold_m = float(max(0.005, config.get('simulator', {}).get('player_camera_motion_threshold_m', 0.035)))
+        self.player_camera_anchor_smooth_time_sec = float(max(0.0, config.get('simulator', {}).get('player_camera_anchor_smooth_time_sec', 0.055)))
+        self.player_camera_eye_smooth_time_sec = float(max(0.0, config.get('simulator', {}).get('player_camera_eye_smooth_time_sec', 0.075)))
+        self.player_camera_reset_distance_m = float(max(0.20, config.get('simulator', {}).get('player_camera_reset_distance_m', 1.8)))
         self._active_player_terrain_render_scale = self.player_terrain_render_scale
         self._last_player_camera_sample = None
+        self._player_camera_smoothing_state = None
         self.terrain_scene_prewarm_thread = None
         self.terrain_scene_prewarm_key = None
         self.terrain_scene_prewarm_ready_key = None
@@ -475,7 +479,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         pygame.display.flip()
 
     def _standalone_control_candidate_ids(self):
-        return ('red_robot_1', 'red_robot_3', 'red_robot_4', 'blue_robot_1', 'blue_robot_3', 'blue_robot_4')
+        return ('red_robot_1', 'red_robot_2', 'red_robot_3', 'red_robot_4', 'blue_robot_1', 'blue_robot_2', 'blue_robot_3', 'blue_robot_4')
 
     def _standalone_control_candidates(self, game_engine, team=None):
         entity_map = {entity.id: entity for entity in getattr(game_engine.entity_manager, 'entities', [])}
@@ -523,7 +527,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
 
         lines = [
             '开始对局后，可在赛前选择可控机器人。',
-            '当前支持红/蓝 1、3、4 进入手控第一视角。',
+            '当前支持红/蓝 1、2、3、4 进入手控第一视角。',
         ]
         draw_y = panel_rect.y + 42
         for line in lines:
@@ -671,6 +675,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
     def _build_player_camera_override(self, game_engine, rect):
         entity = game_engine.get_player_controlled_entity()
         if entity is None:
+            self._player_camera_smoothing_state = None
             return None
         map_manager = game_engine.map_manager
         map_rgb = self._get_terrain_3d_map_rgb(map_manager)
@@ -688,14 +693,14 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             math.cos(pitch_rad) * math.sin(yaw_rad),
             math.sin(pitch_rad),
         ], dtype='f4')
-        world_target = np.array([
+        anchor_point = np.array([
             float(entity.position['x']),
             float(entity.position['y']),
             anchor_height_m,
-        ], dtype='f4') + direction * max(6.0, float(sample_data['grid_width']) * 0.12)
+        ], dtype='f4')
         if self.player_camera_mode == 'third_person':
             backward = np.array([math.cos(yaw_rad), math.sin(yaw_rad), 0.0], dtype='f4')
-            world_eye = self._resolve_third_person_camera_eye(
+            raw_world_eye = self._resolve_third_person_camera_eye(
                 map_manager,
                 float(entity.position['x']),
                 float(entity.position['y']),
@@ -703,11 +708,9 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 backward,
             )
         else:
-            world_eye = np.array([
-                float(entity.position['x']),
-                float(entity.position['y']),
-                anchor_height_m,
-            ], dtype='f4')
+            raw_world_eye = np.array(anchor_point, dtype='f4')
+        smoothed_anchor, world_eye = self._smooth_player_camera_pose(game_engine, entity, map_manager, anchor_point, raw_world_eye)
+        world_target = np.array(smoothed_anchor, dtype='f4') + direction * max(6.0, float(sample_data['grid_width']) * 0.12)
         eye = self._world_to_scene_point(map_manager, sample_data, world_eye[0], world_eye[1], world_eye[2])[:3]
         target = self._world_to_scene_point(map_manager, sample_data, world_target[0], world_target[1], world_target[2])[:3]
         projection = _terrain_scene_perspective_matrix(math.radians(76.0), rect.width / max(rect.height, 1), 0.05, 280.0)
@@ -724,6 +727,44 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             'camera_mode': self.player_camera_mode,
             'sample_data': sample_data,
         }
+
+    def _smooth_player_camera_pose(self, game_engine, entity, map_manager, anchor_point, raw_world_eye):
+        anchor_point = np.array(anchor_point, dtype='f4')
+        raw_world_eye = np.array(raw_world_eye, dtype='f4')
+        dt = max(1.0 / 240.0, float(getattr(game_engine, 'dt', 1.0 / 60.0)))
+        meters_per_world_unit = 1.0 / max(float(map_manager.meters_to_world_units(1.0)), 1e-6)
+        current_key = (getattr(entity, 'id', None), str(self.player_camera_mode))
+        state = self._player_camera_smoothing_state if isinstance(self._player_camera_smoothing_state, dict) else None
+
+        def distance_m(point_a, point_b):
+            delta_x_m = (float(point_a[0]) - float(point_b[0])) * meters_per_world_unit
+            delta_y_m = (float(point_a[1]) - float(point_b[1])) * meters_per_world_unit
+            delta_z_m = float(point_a[2]) - float(point_b[2])
+            return math.sqrt(delta_x_m * delta_x_m + delta_y_m * delta_y_m + delta_z_m * delta_z_m)
+
+        reset_required = (
+            state is None
+            or state.get('key') != current_key
+            or distance_m(anchor_point, state.get('raw_anchor', anchor_point)) > self.player_camera_reset_distance_m
+            or distance_m(raw_world_eye, state.get('raw_eye', raw_world_eye)) > self.player_camera_reset_distance_m
+        )
+        if reset_required:
+            smoothed_anchor = np.array(anchor_point, dtype='f4')
+            smoothed_eye = np.array(raw_world_eye, dtype='f4')
+        else:
+            state = state or {}
+            anchor_alpha = 1.0 if self.player_camera_anchor_smooth_time_sec <= 1e-6 else (1.0 - math.exp(-dt / self.player_camera_anchor_smooth_time_sec))
+            eye_alpha = 1.0 if self.player_camera_eye_smooth_time_sec <= 1e-6 else (1.0 - math.exp(-dt / self.player_camera_eye_smooth_time_sec))
+            smoothed_anchor = state['smoothed_anchor'] + (anchor_point - state['smoothed_anchor']) * anchor_alpha
+            smoothed_eye = state['smoothed_eye'] + (raw_world_eye - state['smoothed_eye']) * eye_alpha
+        self._player_camera_smoothing_state = {
+            'key': current_key,
+            'raw_anchor': np.array(anchor_point, dtype='f4'),
+            'raw_eye': np.array(raw_world_eye, dtype='f4'),
+            'smoothed_anchor': np.array(smoothed_anchor, dtype='f4'),
+            'smoothed_eye': np.array(smoothed_eye, dtype='f4'),
+        }
+        return smoothed_anchor, smoothed_eye
 
     def _player_terrain_surface_cache_key(self, game_engine, rect):
         camera_state = getattr(self, 'terrain_scene_camera_override', None)
@@ -951,14 +992,16 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         for entity in game_engine.entity_manager.entities:
             if not entity.is_alive() or entity.type not in {'robot', 'sentry'}:
                 continue
-            if not self._entity_visible_from_camera(entity, map_manager, camera_state):
+            visibility = self._entity_visibility_state(entity, map_manager, camera_state)
+            if not visibility.get('visible', True):
                 continue
             edges = self._project_entity_collision_box_edges(entity, map_manager, sample_data, camera_state, rect)
             if not edges:
                 continue
             color_rgb = (255, 110, 110) if entity.team == 'red' else (112, 188, 255)
+            alpha = max(48, min(220, int(220 * float(visibility.get('visible_ratio', 1.0)))))
             for start, end in edges:
-                pygame.draw.line(overlay, (*color_rgb, 220), start, end, 2)
+                pygame.draw.line(overlay, (*color_rgb, alpha), start, end, 2)
         self.screen.blit(overlay, rect.topleft)
 
     def _resolve_third_person_camera_eye(self, map_manager, anchor_x, anchor_y, anchor_height_m, backward):
@@ -1000,6 +1043,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
     def _camera_visibility_points(self, entity, map_manager):
         base_height = float(getattr(entity, 'position', {}).get('z', map_manager.get_terrain_height_m(entity.position['x'], entity.position['y'])))
         vertical_scale = self._entity_vertical_scale(entity)
+        body_bottom = base_height + float(getattr(entity, 'body_clearance_m', 0.10)) * vertical_scale
         body_mid = base_height + (float(getattr(entity, 'body_clearance_m', 0.10)) + float(getattr(entity, 'body_height_m', 0.18)) * 0.55) * vertical_scale
         turret_mid = base_height + float(getattr(entity, 'gimbal_height_m', 0.50)) * vertical_scale
         half_length = self._meters_to_world_units(map_manager, float(getattr(entity, 'body_length_m', getattr(entity, 'body_size_m', 0.42))) * 0.5)
@@ -1012,23 +1056,36 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         chassis_points = []
         for length_sign in (-1.0, 1.0):
             for width_sign in (-1.0, 1.0):
-                chassis_points.append((
-                    float(entity.position['x']) + forward_x * half_length * length_sign + right_x * half_width * width_sign,
-                    float(entity.position['y']) + forward_y * half_length * length_sign + right_y * half_width * width_sign,
-                    body_mid,
-                ))
-        chassis_points.append((float(entity.position['x']), float(entity.position['y']), body_mid))
-        chassis_points.append((float(entity.position['x']), float(entity.position['y']), turret_mid))
+                world_x = float(entity.position['x']) + forward_x * half_length * length_sign + right_x * half_width * width_sign
+                world_y = float(entity.position['y']) + forward_y * half_length * length_sign + right_y * half_width * width_sign
+                chassis_points.append(((world_x, world_y, body_bottom + 0.03), 0.08))
+                chassis_points.append(((world_x, world_y, body_mid), 0.48))
+        chassis_points.append(((float(entity.position['x']), float(entity.position['y']), body_mid), 0.48))
+        chassis_points.append(((float(entity.position['x']), float(entity.position['y']), turret_mid), 0.96))
         return tuple(chassis_points)
 
-    def _entity_visible_from_camera(self, entity, map_manager, camera_state):
+    def _entity_visibility_state(self, entity, map_manager, camera_state):
         world_eye = camera_state.get('world_eye') if isinstance(camera_state, dict) else None
         if world_eye is None:
-            return True
-        for point in self._camera_visibility_points(entity, map_manager):
+            return {'visible': True, 'visible_ratio': 1.0, 'min_visible_height_ratio': 0.0}
+        visible_count = 0
+        total_count = 0
+        min_visible_height_ratio = 1.0
+        for point, height_ratio in self._camera_visibility_points(entity, map_manager):
+            total_count += 1
             if map_manager.is_terrain_line_clear_3d(world_eye, point, clearance_m=0.03):
-                return True
-        return False
+                visible_count += 1
+                min_visible_height_ratio = min(min_visible_height_ratio, float(height_ratio))
+        if visible_count <= 0:
+            return {'visible': False, 'visible_ratio': 0.0, 'min_visible_height_ratio': 1.0}
+        return {
+            'visible': True,
+            'visible_ratio': float(visible_count) / max(total_count, 1),
+            'min_visible_height_ratio': max(0.0, min(1.0, min_visible_height_ratio)),
+        }
+
+    def _entity_visible_from_camera(self, entity, map_manager, camera_state):
+        return bool(self._entity_visibility_state(entity, map_manager, camera_state).get('visible', True))
 
     def _resolve_player_view_aim_state(self, game_engine, camera_state):
         if not isinstance(camera_state, dict):
@@ -1121,7 +1178,28 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             polygon = [(point[0], point[1]) for point in pts]
             depth = sum(point[2] for point in pts) / len(pts)
             face_color = tuple(max(0, min(255, int(channel * shade))) for channel in color)
-            faces.append((depth, polygon, face_color))
+            face_height_ratio = sum(1.0 if index >= 4 else 0.0 for index in indices) / len(indices)
+            faces.append((depth, polygon, face_color, face_height_ratio))
+
+    def _append_prism_faces(self, faces, corners, color):
+        face_indices = (
+            (4, 5, 6, 7),
+            (3, 2, 1, 0),
+            (0, 1, 5, 4),
+            (1, 2, 6, 5),
+            (2, 3, 7, 6),
+            (3, 0, 4, 7),
+        )
+        shades = (0.95, 0.50, 0.72, 0.82, 0.68, 0.60)
+        for indices, shade in zip(face_indices, shades):
+            pts = [corners[index] for index in indices]
+            if any(point is None for point in pts):
+                continue
+            polygon = [(point[0], point[1]) for point in pts]
+            depth = sum(point[2] for point in pts) / len(pts)
+            face_color = tuple(max(0, min(255, int(channel * shade))) for channel in color)
+            face_height_ratio = sum(1.0 if index >= 4 else 0.0 for index in indices) / len(indices)
+            faces.append((depth, polygon, face_color, face_height_ratio))
 
     def _trace_path_points(self, trace, map_manager):
         path_points = trace.get('path_points')
@@ -1206,12 +1284,26 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         if np.linalg.norm(up_basis) <= 1e-6:
             up_basis = np.array([0.0, 0.82, 0.0], dtype='f4')
 
+        if getattr(entity, 'robot_type', '') == '步兵':
+            forward_basis = np.array([
+                math.cos(yaw_rad) / sampled_cell_size,
+                0.0,
+                math.sin(yaw_rad) / sampled_cell_size,
+            ], dtype='f4')
+            right_basis = np.array([
+                -math.sin(yaw_rad) / sampled_cell_size,
+                0.0,
+                math.cos(yaw_rad) / sampled_cell_size,
+            ], dtype='f4')
+            return center_scene, forward_basis, right_basis, up_basis
+
         airborne = (
             float(base_height - terrain_height) > 0.03
             or float(getattr(entity, 'jump_airborne_height_m', 0.0)) > 1e-3
             or float(getattr(entity, 'fly_slope_airborne_height_m', 0.0)) > 1e-3
         )
-        if airborne:
+        climb_level_lock = bool(getattr(entity, 'step_climb_state', None))
+        if airborne or climb_level_lock:
             forward_basis = np.array([
                 math.cos(yaw_rad) / sampled_cell_size,
                 0.0,
@@ -1267,6 +1359,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         front_raise_m = 0.02
         rear_drop_m = 0.02
         rear_reach_m = 0.03
+        rear_straighten_ratio = 0.0
         state = getattr(entity, 'step_climb_state', None)
         if not isinstance(state, dict):
             return {
@@ -1274,6 +1367,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 'front_raise_m': front_raise_m,
                 'rear_drop_m': rear_drop_m,
                 'rear_reach_m': rear_reach_m,
+                'rear_straighten_ratio': rear_straighten_ratio,
             }
 
         phase = str(state.get('phase', 'front_ascent'))
@@ -1290,23 +1384,27 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             ratio = _ratio('front_ascent_duration', 0.35)
             front_drop_m = 0.10 + 0.18 * ratio
             front_raise_m = 0.05 + 0.06 * ratio
+            rear_straighten_ratio = 0.35 + 0.65 * ratio
         elif phase == 'rear_pause':
             front_drop_m = 0.18
             front_raise_m = 0.08
             rear_drop_m = 0.20
             rear_reach_m = 0.18
+            rear_straighten_ratio = 1.0
         elif phase == 'rear_ascent':
             ratio = _ratio('rear_ascent_duration', 0.25)
             front_drop_m = 0.18 - 0.10 * ratio
             front_raise_m = 0.08 - 0.04 * ratio
             rear_drop_m = 0.20 * (1.0 - ratio)
             rear_reach_m = 0.18 * (1.0 - ratio)
+            rear_straighten_ratio = max(0.45, 1.0 - ratio * 0.55)
 
         return {
             'front_drop_m': max(0.0, front_drop_m),
             'front_raise_m': max(0.0, front_raise_m),
             'rear_drop_m': max(0.0, rear_drop_m),
             'rear_reach_m': max(0.0, rear_reach_m),
+            'rear_straighten_ratio': max(0.0, min(1.0, rear_straighten_ratio)),
         }
 
     def _build_entity_model_faces(self, entity, camera_state, rect, map_manager, sample_data):
@@ -1350,6 +1448,49 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 for local_x, local_y in local_points:
                     projected.append(self._project_scene_point(local_to_scene(local_x + cx, local_y + cy, height, angle_rad), camera_state, rect))
             return projected
+
+        def trapezoid_corners(cx, cy, top_length, bottom_length, half_y, low_h, high_h, angle_rad):
+            rear_x = cx - bottom_length * 0.5
+            front_top_x = rear_x + top_length
+            front_bottom_x = rear_x + bottom_length
+            local_points = [
+                (rear_x, cy - half_y),
+                (front_bottom_x, cy - half_y),
+                (front_bottom_x, cy + half_y),
+                (rear_x, cy + half_y),
+            ]
+            top_points = [
+                (rear_x, cy - half_y),
+                (front_top_x, cy - half_y),
+                (front_top_x, cy + half_y),
+                (rear_x, cy + half_y),
+            ]
+            projected = []
+            for local_x, local_y in local_points:
+                projected.append(self._project_scene_point(local_to_scene(local_x, local_y, low_h, angle_rad), camera_state, rect))
+            for local_x, local_y in top_points:
+                projected.append(self._project_scene_point(local_to_scene(local_x, local_y, high_h, angle_rad), camera_state, rect))
+            return projected
+
+        def beam_corners(start_x, start_y, start_h, end_x, end_y, end_h, half_width, half_height):
+            delta_x = end_x - start_x
+            delta_y = end_y - start_y
+            beam_length = math.hypot(delta_x, delta_y)
+            if beam_length <= 1e-6:
+                return [None] * 8
+            side_x = -delta_y / beam_length * half_width
+            side_y = delta_x / beam_length * half_width
+            points = [
+                (start_x + side_x, start_y + side_y, start_h - half_height),
+                (end_x + side_x, end_y + side_y, end_h - half_height),
+                (end_x - side_x, end_y - side_y, end_h - half_height),
+                (start_x - side_x, start_y - side_y, start_h - half_height),
+                (start_x + side_x, start_y + side_y, start_h + half_height),
+                (end_x + side_x, end_y + side_y, end_h + half_height),
+                (end_x - side_x, end_y - side_y, end_h + half_height),
+                (start_x - side_x, start_y - side_y, start_h + half_height),
+            ]
+            return [self._project_scene_point(local_to_scene(local_x, local_y, height, yaw_rad), camera_state, rect) for local_x, local_y, height in points]
 
         team_color = self.colors['red'] if entity.team == 'red' else self.colors['blue']
         body_base_color = tuple(getattr(entity, 'body_color_rgb', ()) or team_color)
@@ -1413,12 +1554,13 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         climb_assist = self._climb_assist_animation_state(entity)
         assist_side_offset = max(1.0, body_width_half + wheel_half_width * 0.45)
         if front_climb_style != 'none':
-            plate_half_x = self._meters_to_world_units(map_manager, float(getattr(entity, 'front_climb_assist_plate_length_m', 0.05)) * 0.5)
+            plate_top_length = self._meters_to_world_units(map_manager, float(getattr(entity, 'front_climb_assist_top_length_m', getattr(entity, 'front_climb_assist_plate_length_m', 0.05))))
+            plate_bottom_length = self._meters_to_world_units(map_manager, float(getattr(entity, 'front_climb_assist_bottom_length_m', max(0.02, getattr(entity, 'front_climb_assist_top_length_m', getattr(entity, 'front_climb_assist_plate_length_m', 0.05)) * 0.6))))
             plate_half_y = self._meters_to_world_units(map_manager, float(getattr(entity, 'front_climb_assist_plate_width_m', 0.018)) * 0.5)
             plate_height = float(getattr(entity, 'front_climb_assist_plate_height_m', 0.18)) * vertical_scale
-            plate_center_x = body_length_half + self._meters_to_world_units(map_manager, float(getattr(entity, 'front_climb_assist_forward_offset_m', 0.04))) + plate_half_x
+            plate_center_x = body_length_half + self._meters_to_world_units(map_manager, float(getattr(entity, 'front_climb_assist_forward_offset_m', 0.04))) + plate_bottom_length * 0.5
             plate_inner_offset = self._meters_to_world_units(map_manager, float(getattr(entity, 'front_climb_assist_inner_offset_m', 0.06)) * render_width_scale)
-            mount_half_x = max(self._meters_to_world_units(map_manager, 0.012), plate_half_x * 0.55)
+            mount_half_x = max(self._meters_to_world_units(map_manager, 0.012), plate_bottom_length * 0.28)
             mount_half_y = max(self._meters_to_world_units(map_manager, 0.010), plate_half_y * 1.15)
             plate_low = max(terrain_height, body_bottom - float(climb_assist['front_drop_m']) * vertical_scale)
             plate_high = max(plate_low + 0.03, plate_low + plate_height + float(climb_assist['front_raise_m']) * vertical_scale * 0.45)
@@ -1431,44 +1573,79 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                     box_corners(body_length_half * 0.78, side_y, mount_half_x, mount_half_y, mount_low, mount_high, yaw_rad),
                     (118, 122, 132),
                 )
-                self._append_box_faces(
+                self._append_prism_faces(
                     faces,
-                    box_corners(plate_center_x, side_y, plate_half_x, plate_half_y, plate_low, plate_high, yaw_rad),
+                    trapezoid_corners(plate_center_x, side_y, plate_top_length, plate_bottom_length, plate_half_y, plate_low, plate_high, yaw_rad),
                     (82, 86, 96),
                 )
         if rear_climb_style != 'none':
-            upper_half_x = self._meters_to_world_units(map_manager, float(getattr(entity, 'rear_climb_assist_upper_length_m', 0.09)) * 0.5)
-            lower_half_x = self._meters_to_world_units(map_manager, float(getattr(entity, 'rear_climb_assist_lower_length_m', 0.08)) * 0.5)
-            bar_half_y = self._meters_to_world_units(map_manager, float(getattr(entity, 'rear_climb_assist_bar_width_m', 0.016)) * 0.5)
-            upper_offset = self._meters_to_world_units(map_manager, float(getattr(entity, 'rear_climb_assist_upper_offset_m', 0.055)))
-            lower_offset = self._meters_to_world_units(map_manager, float(getattr(entity, 'rear_climb_assist_lower_offset_m', 0.015)))
             rear_inner_offset = self._meters_to_world_units(map_manager, float(getattr(entity, 'rear_climb_assist_inner_offset_m', 0.03)) * render_width_scale)
-            upper_center_x = -body_length_half - upper_offset + upper_half_x * 0.25
-            lower_center_x = -body_length_half - lower_offset + lower_half_x * 0.25 + self._meters_to_world_units(map_manager, float(climb_assist['rear_reach_m']) * 0.25)
-            upper_low = body_top + 0.008 * vertical_scale
-            upper_high = upper_low + max(0.012, float(getattr(entity, 'rear_climb_assist_bar_width_m', 0.016)) * vertical_scale)
-            lower_low = max(terrain_height, body_bottom - float(climb_assist['rear_drop_m']) * vertical_scale)
-            lower_high = lower_low + max(0.012, float(getattr(entity, 'rear_climb_assist_bar_width_m', 0.016)) * vertical_scale)
-            connector_center_x = (upper_center_x + lower_center_x) * 0.5
-            connector_half_x = max(self._meters_to_world_units(map_manager, 0.010), abs(upper_center_x - lower_center_x) * 0.5 + bar_half_y)
-            connector_half_y = max(self._meters_to_world_units(map_manager, 0.008), bar_half_y * 0.9)
-            connector_low = min(lower_high, upper_low)
-            connector_high = max(lower_high, upper_low + max(0.018, float(getattr(entity, 'rear_climb_assist_bar_width_m', 0.016)) * vertical_scale * 1.2))
+            upper_half_w = self._meters_to_world_units(map_manager, float(getattr(entity, 'rear_climb_assist_upper_width_m', getattr(entity, 'rear_climb_assist_bar_width_m', 0.016))) * 0.5)
+            lower_half_w = self._meters_to_world_units(map_manager, float(getattr(entity, 'rear_climb_assist_lower_width_m', getattr(entity, 'rear_climb_assist_bar_width_m', 0.016))) * 0.5)
+            upper_half_h = max(0.012, float(getattr(entity, 'rear_climb_assist_upper_height_m', getattr(entity, 'rear_climb_assist_bar_width_m', 0.016))) * vertical_scale * 0.5)
+            lower_half_h = max(0.012, float(getattr(entity, 'rear_climb_assist_lower_height_m', getattr(entity, 'rear_climb_assist_bar_width_m', 0.016))) * vertical_scale * 0.5)
+            body_length_half_m = float(getattr(entity, 'body_length_m', getattr(entity, 'body_size_m', 0.42))) * 0.5
+            upper_length_m = float(getattr(entity, 'rear_climb_assist_upper_length_m', 0.09))
+            lower_length_m = float(getattr(entity, 'rear_climb_assist_lower_length_m', 0.08))
+            mount_offset_x_m = float(getattr(entity, 'rear_climb_assist_mount_offset_x_m', 0.03))
+            mount_height = base_height + float(getattr(entity, 'rear_climb_assist_mount_height_m', float(getattr(entity, 'body_clearance_m', 0.0)) + float(getattr(entity, 'body_height_m', 0.0)) * 0.92)) * vertical_scale
+            custom_wheel_positions_raw = getattr(entity, 'custom_wheel_positions_m', None)
+            if isinstance(custom_wheel_positions_raw, (list, tuple)) and custom_wheel_positions_raw:
+                rear_wheel_x_m = min(
+                    (float(position[0]) for position in custom_wheel_positions_raw if isinstance(position, (list, tuple)) and len(position) >= 2),
+                    default=-body_length_half_m * 0.78,
+                )
+            else:
+                rear_wheel_x_m = -body_length_half_m * 0.78
+            foot_x_m = rear_wheel_x_m
+            foot_h = wheel_bottom + wheel_radius_height
+            upper_anchor_x_m = -body_length_half_m + mount_offset_x_m
+            upper_anchor_h = mount_height
+            foot_distance = math.hypot(foot_x_m - upper_anchor_x_m, foot_h - upper_anchor_h)
+            clamped_distance = max(abs(upper_length_m - lower_length_m) + 1e-6, min(foot_distance, upper_length_m + lower_length_m - 1e-6))
+            if foot_distance <= 1e-6:
+                direction_x = 1.0
+                direction_h = 0.0
+            else:
+                direction_x = (foot_x_m - upper_anchor_x_m) / foot_distance
+                direction_h = (foot_h - upper_anchor_h) / foot_distance
+            base_distance = (upper_length_m * upper_length_m - lower_length_m * lower_length_m + clamped_distance * clamped_distance) / max(2.0 * clamped_distance, 1e-6)
+            bend_height = math.sqrt(max(upper_length_m * upper_length_m - base_distance * base_distance, 0.0))
+            base_x = upper_anchor_x_m + direction_x * base_distance
+            base_h = upper_anchor_h + direction_h * base_distance
+            perp_x = -direction_h
+            perp_h = direction_x
+            joint_a = (base_x + perp_x * bend_height, base_h + perp_h * bend_height)
+            joint_b = (base_x - perp_x * bend_height, base_h - perp_h * bend_height)
+            preferred_joint = joint_a if joint_a[0] >= joint_b[0] else joint_b
+            alternate_joint = joint_b if preferred_joint is joint_a else joint_a
+            folded_joint_x, folded_joint_h = preferred_joint
+            if folded_joint_x < max(upper_anchor_x_m, foot_x_m):
+                folded_joint_x, folded_joint_h = alternate_joint
+            straight_ratio = upper_length_m / max(upper_length_m + lower_length_m, 1e-6)
+            straight_joint_x = upper_anchor_x_m + (foot_x_m - upper_anchor_x_m) * straight_ratio
+            straight_joint_h = upper_anchor_h + (foot_h - upper_anchor_h) * straight_ratio
+            rear_straighten_ratio = float(climb_assist.get('rear_straighten_ratio', 0.0))
+            joint_x_m = folded_joint_x + (straight_joint_x - folded_joint_x) * rear_straighten_ratio
+            joint_h = folded_joint_h + (straight_joint_h - folded_joint_h) * rear_straighten_ratio
+            upper_anchor_x = self._meters_to_world_units(map_manager, upper_anchor_x_m)
+            foot_x = self._meters_to_world_units(map_manager, foot_x_m)
+            joint_x = self._meters_to_world_units(map_manager, joint_x_m)
             for side_sign in (-1.0, 1.0):
                 side_y = max(body_width_half * 0.45, assist_side_offset - rear_inner_offset) * side_sign
-                self._append_box_faces(
+                self._append_prism_faces(
                     faces,
-                    box_corners(upper_center_x, side_y, upper_half_x, bar_half_y, upper_low, upper_high, yaw_rad),
+                    beam_corners(upper_anchor_x, side_y, upper_anchor_h, joint_x, side_y, joint_h, upper_half_w, upper_half_h),
                     (106, 110, 120),
                 )
-                self._append_box_faces(
+                self._append_prism_faces(
                     faces,
-                    box_corners(lower_center_x, side_y, lower_half_x, bar_half_y, lower_low, lower_high, yaw_rad),
+                    beam_corners(joint_x, side_y, joint_h, foot_x, side_y, foot_h, lower_half_w, lower_half_h),
                     (92, 96, 108),
                 )
                 self._append_box_faces(
                     faces,
-                    box_corners(connector_center_x, side_y, connector_half_x, connector_half_y, connector_low, connector_high, yaw_rad),
+                    box_corners(joint_x, side_y, max(upper_half_w, lower_half_w) * 1.2, max(upper_half_w, lower_half_w) * 1.05, joint_h - max(upper_half_h, lower_half_h) * 0.85, joint_h + max(upper_half_h, lower_half_h) * 0.85, yaw_rad),
                     (116, 120, 132),
                 )
 
@@ -1617,16 +1794,18 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 continue
             if controlled_id is not None and entity.id == controlled_id and camera_mode != 'third_person':
                 continue
-            if not self._entity_visible_from_camera(entity, map_manager, camera_state):
+            visibility = self._entity_visibility_state(entity, map_manager, camera_state)
+            if not visibility.get('visible', True):
                 continue
             entity_faces, barrel_start, barrel_end, wheel_positions, wheel_radius_world, wheel_radius_height, base_height, light_segments, wheel_color = self._build_entity_model_faces(entity, camera_state, rect, map_manager, sample_data)
-            faces.extend(entity_faces)
+            min_visible_height_ratio = float(visibility.get('min_visible_height_ratio', 0.0))
+            faces.extend(face for face in entity_faces if face[3] + 0.08 >= min_visible_height_ratio)
             if barrel_start is not None and barrel_end is not None:
                 barrel_segments.append((barrel_start, barrel_end))
             barrel_light_segments.extend(light_segments)
 
         faces.sort(key=lambda item: item[0], reverse=True)
-        for _, polygon, color in faces:
+        for _, polygon, color, _ in faces:
             if len(polygon) < 3:
                 continue
             pygame.draw.polygon(self.screen, color, polygon)
@@ -1710,6 +1889,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             f'发弹量 {hud["ammo"]}   底盘功率 {hud["power"]:.1f}/{hud["max_power"]:.1f}',
             f'枪口热量 {hud["heat"]:.1f}/{hud["max_heat"]:.1f}   俯仰 {hud["pitch_deg"]:.1f}°',
             f'右键自瞄 {"锁定" if hud["auto_aim_locked"] else "待机"}   左键射击 {hud["fire_control_state"]}',
+            f'上台阶模式 {"开启" if hud.get("step_climb_mode_active") else "关闭"}   F 切换   底盘锁定当前朝向',
             f'视角 {"第三人称" if self.player_camera_mode == "third_person" else "第一人称"}   V 切换   F3 碰撞箱/坐标/轮高',
         ]
         if hud['supply_zone']:
@@ -1872,7 +2052,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
         cancel_rect = pygame.Rect(panel_rect.right - 242, panel_rect.bottom - 54, 170, 36)
         pygame.draw.rect(self.screen, self.colors['toolbar_button_active'], confirm_rect, border_radius=10)
         pygame.draw.rect(self.screen, (70, 76, 88), cancel_rect, border_radius=10)
-        self.screen.blit(self.small_font.render('确认并开始倒计时', True, self.colors['white']), self.small_font.render('确认并开始倒计时', True, self.colors['white']).get_rect(center=confirm_rect.center))
+        self.screen.blit(self.small_font.render('确认', True, self.colors['white']), self.small_font.render('确认', True, self.colors['white']).get_rect(center=confirm_rect.center))
         self.screen.blit(self.small_font.render('取消', True, self.colors['white']), self.small_font.render('取消', True, self.colors['white']).get_rect(center=cancel_rect.center))
         self.panel_actions.append((confirm_rect, 'pre_match_confirm'))
         self.panel_actions.append((cancel_rect, 'pre_match_cancel'))
@@ -3323,6 +3503,7 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
 
         self.render_health_bar(entity, x, y)
         self.render_entity_status(entity, x, y)
+        self.render_damage_feedback(entity, x, y)
 
     def render_robot(self, entity, x, y, color):
         radius = self._entity_draw_radius(entity)
@@ -3489,13 +3670,44 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
 
     def render_outpost(self, entity, x, y, color):
         radius = self.entity_radius['outpost']
-        pygame.draw.circle(self.screen, color, (x, y), radius, 4)
-        pygame.draw.circle(self.screen, color, (x, y), max(8, radius - 8), 1)
+        body_color = (76, 82, 92)
+        outline = (220, 226, 233)
+        hex_points = []
+        for index in range(6):
+            angle = math.radians(-90.0 + index * 60.0)
+            hex_points.append((int(x + math.cos(angle) * radius), int(y + math.sin(angle) * radius * 0.82)))
+        pygame.draw.polygon(self.screen, body_color, hex_points)
+        pygame.draw.polygon(self.screen, outline, hex_points, 2)
+        tower_rect = pygame.Rect(x - radius // 3, y - radius // 2, max(10, radius * 2 // 3), max(14, radius))
+        pygame.draw.rect(self.screen, (96, 104, 116), tower_rect, border_radius=4)
+        pygame.draw.rect(self.screen, outline, tower_rect, 1, border_radius=4)
+        ring_radius = radius + 6
+        spin_angle = float(getattr(getattr(self, 'game_engine', None), 'game_time', 0.0)) * 1.8
+        for index in range(4):
+            plate_angle = spin_angle + index * (math.pi * 0.5)
+            center_x = x + math.cos(plate_angle) * ring_radius
+            center_y = y - radius * 0.35 + math.sin(plate_angle) * ring_radius * 0.42
+            plate = self._rotate_local_polygon([(-7, -3), (7, -3), (7, 3), (-7, 3)], center_x, center_y, plate_angle)
+            pygame.draw.polygon(self.screen, (232, 236, 240), plate)
+            pygame.draw.polygon(self.screen, color, plate, 1)
+        pygame.draw.circle(self.screen, color, (x, y - radius // 3), max(4, radius // 4), 2)
 
     def render_base(self, entity, x, y, color):
         radius = self.entity_radius['base']
-        pygame.draw.circle(self.screen, color, (x, y), radius, 3)
-        pygame.draw.circle(self.screen, color, (x, y), radius // 2)
+        outer = []
+        for index in range(8):
+            angle = math.radians(-90.0 + index * 45.0)
+            scale = 1.0 if index % 2 == 0 else 0.82
+            outer.append((int(x + math.cos(angle) * radius * scale), int(y + math.sin(angle) * radius * 0.72 * scale)))
+        pygame.draw.polygon(self.screen, (70, 76, 88), outer)
+        pygame.draw.polygon(self.screen, color, outer, 2)
+        core_rect = pygame.Rect(x - radius // 3, y - radius // 2, max(16, radius * 2 // 3), max(20, radius))
+        pygame.draw.rect(self.screen, (112, 118, 130), core_rect, border_radius=6)
+        pygame.draw.rect(self.screen, (235, 238, 243), core_rect, 1, border_radius=6)
+        gate_rect = pygame.Rect(x - radius // 5, y + radius // 6, max(10, radius * 2 // 5), max(8, radius // 3))
+        pygame.draw.rect(self.screen, (42, 46, 54), gate_rect, border_radius=4)
+        for offset in (-radius // 2, radius // 2):
+            pygame.draw.circle(self.screen, color, (x + offset, y - radius // 5), max(5, radius // 5), 2)
 
     def render_dart(self, entity, x, y, color):
         pygame.draw.circle(self.screen, color, (x, y), self.entity_radius['dart'])
@@ -3580,6 +3792,31 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             text = self.tiny_font.render(label, True, color)
             self.screen.blit(text, text.get_rect(center=(x, y_offset)))
             y_offset += 12
+
+    def render_damage_feedback(self, entity, x, y):
+        feedbacks = list(getattr(entity, 'damage_feedbacks', ()))
+        if not feedbacks:
+            return
+        base_y = y - self._entity_draw_radius(entity) - 34
+        for index, feedback in enumerate(feedbacks[-4:]):
+            ttl = float(feedback.get('ttl', 0.0))
+            total_ttl = max(float(feedback.get('total_ttl', ttl)), 1e-6)
+            progress = 1.0 - ttl / total_ttl
+            alpha = int(max(0, min(255, 255 * (1.0 - progress * 0.9))))
+            drift_px = float(feedback.get('drift_px', 0.0)) * progress
+            rise_px = float(feedback.get('rise_px', 28.0)) * progress
+            amount = int(round(float(feedback.get('amount', 0.0))))
+            if amount <= 0:
+                continue
+            label = f'-{amount}'
+            text_surface = self.small_font.render(label, True, (255, 96, 96))
+            shadow_surface = self.small_font.render(label, True, (24, 10, 10))
+            text_surface.set_alpha(alpha)
+            shadow_surface.set_alpha(max(0, alpha - 40))
+            center_x = int(x + drift_px)
+            center_y = int(base_y - rise_px - index * 14)
+            self.screen.blit(shadow_surface, shadow_surface.get_rect(center=(center_x + 1, center_y + 1)))
+            self.screen.blit(text_surface, text_surface.get_rect(center=(center_x, center_y)))
 
     def _handle_terrain_left_press(self, game_engine, world_pos):
         self._end_terrain_edit_batch(game_engine)
@@ -4431,6 +4668,20 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
             if self.player_mouse_captured:
                 self._sync_player_mouse_capture(False)
             return False
+        movement_key_map = {
+            pygame.K_w: 'forward',
+            pygame.K_s: 'backward',
+            pygame.K_a: 'left',
+            pygame.K_d: 'right',
+            pygame.K_SPACE: 'jump',
+            pygame.K_LSHIFT: 'small_gyro',
+            pygame.K_RSHIFT: 'small_gyro',
+        }
+        if event.type in {pygame.KEYDOWN, pygame.KEYUP} and event.key in movement_key_map:
+            setter = getattr(game_engine, 'set_player_movement_state', None)
+            if callable(setter):
+                setter(**{movement_key_map[event.key]: event.type == pygame.KEYDOWN})
+            return True
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 if self.pre_match_config_menu_open:
@@ -4464,6 +4715,12 @@ class Renderer(TerrainOverviewMixin, RendererSidebarMixin, RendererHudMixin, Ren
                 if callable(camera_mode_setter):
                     camera_mode_setter(self.player_camera_mode)
                 game_engine.add_log('已切换到第三人称视角' if self.player_camera_mode == 'third_person' else '已切换到第一人称视角', 'system')
+                return True
+            if event.key == pygame.K_f and not game_engine.paused:
+                toggle_climb_mode = getattr(game_engine, 'toggle_player_step_climb_mode', None)
+                if callable(toggle_climb_mode):
+                    active = bool(toggle_climb_mode())
+                    game_engine.add_log('上台阶模式已开启，底盘朝向已锁定' if active else '上台阶模式已关闭，底盘恢复跟随云台', 'system')
                 return True
         if event.type == pygame.MOUSEMOTION:
             if game_engine.paused:

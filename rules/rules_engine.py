@@ -1488,7 +1488,8 @@ class RulesEngine:
         map_manager = self._map_manager()
         if map_manager is None:
             return None, None
-        hit_radius = max(1.0, self._meters_to_world_units(float(getattr(shooter, 'armor_plate_size_m', 0.12)) * 0.45))
+        ammo_type = getattr(shooter, 'ammo_type', '17mm')
+        hit_radius = max(0.5, self._meters_to_world_units(self._projectile_diameter_m(ammo_type) * 0.5))
         best_hit = None
         best_distance = float('inf')
         candidate_entities = []
@@ -1537,7 +1538,7 @@ class RulesEngine:
             'end': (points[-1][0], points[-1][1]),
             'start_height_m': points[0][2],
             'end_height_m': points[-1][2],
-            'path_points': points,
+            'path_points': tuple(points),
             'elapsed': 0.0,
             'lifetime': min(1.05, max(0.12, total_length / speed * 1.35)),
         }
@@ -1568,7 +1569,8 @@ class RulesEngine:
         }
 
     def _find_projectile_hit_target_metric_segment(self, shooter, start_point_m, end_point_m, entities, preferred_target=None):
-        hit_radius_m = max(0.015, float(getattr(shooter, 'armor_plate_size_m', 0.12)) * 0.45)
+        ammo_type = getattr(shooter, 'ammo_type', '17mm')
+        hit_radius_m = max(0.0085, self._projectile_diameter_m(ammo_type) * 0.5)
         best_hit = None
         best_distance = float('inf')
         candidate_entities = []
@@ -1610,24 +1612,42 @@ class RulesEngine:
         return best_hit if best_hit is not None else (None, None)
 
     def _simulate_ballistic_projectile(self, shooter, entities, target=None, aim_point=None, allow_ricochet=False):
+        game_engine = getattr(self, 'game_engine', None)
+        physics_engine = getattr(game_engine, 'physics_engine', None) if game_engine is not None else None
+        backend_simulator = getattr(physics_engine, 'simulate_ballistic_projectile', None)
+        if callable(backend_simulator):
+            return backend_simulator(
+                shooter,
+                entities,
+                self,
+                target=target,
+                aim_point=aim_point,
+                allow_ricochet=allow_ricochet,
+            )
         map_manager = self._map_manager()
-        start_point = self._shooter_muzzle_point(shooter)
         if aim_point is not None:
+            preferred_pitch_deg = float(getattr(shooter, 'gimbal_pitch_deg', 0.0))
+            start_point = self._shooter_muzzle_point(shooter, pitch_deg=preferred_pitch_deg)
             target_point = (
                 float(aim_point.get('x', shooter.position['x'])),
                 float(aim_point.get('y', shooter.position['y'])),
                 float(aim_point.get('z', start_point[2])),
             )
             yaw_deg = math.degrees(math.atan2(target_point[1] - start_point[1], target_point[0] - start_point[0]))
-            pitch_deg = self._solve_ballistic_pitch_deg(
-                shooter,
-                start_point,
-                target_point,
-                preferred_pitch_deg=float(getattr(shooter, 'gimbal_pitch_deg', 0.0)),
-            )
+            pitch_deg = preferred_pitch_deg
+            for _ in range(2):
+                pitch_deg = self._solve_ballistic_pitch_deg(
+                    shooter,
+                    start_point,
+                    target_point,
+                    preferred_pitch_deg=preferred_pitch_deg,
+                )
+                start_point = self._shooter_muzzle_point(shooter, pitch_deg=pitch_deg)
+                yaw_deg = math.degrees(math.atan2(target_point[1] - start_point[1], target_point[0] - start_point[0]))
         else:
             yaw_deg = float(getattr(shooter, 'turret_angle', shooter.angle))
             pitch_deg = float(getattr(shooter, 'gimbal_pitch_deg', 0.0))
+            start_point = self._shooter_muzzle_point(shooter, pitch_deg=pitch_deg)
         yaw_rad = math.radians(yaw_deg)
         pitch_rad = math.radians(pitch_deg)
         speed_mps = max(1e-6, self._projectile_speed_mps(getattr(shooter, 'ammo_type', '17mm')))
@@ -1722,11 +1742,24 @@ class RulesEngine:
         self.projectile_traces = active_traces
 
     def _queue_pending_rule_event(self, entity, event_type, delay, payload):
-        entity.pending_rule_events.append({
+        queued_event = {
             'type': event_type,
             'time_left': float(delay),
             'payload': deepcopy(payload),
-        })
+        }
+        entity.pending_rule_events.append(queued_event)
+        game_engine = getattr(self, 'game_engine', None)
+        message_bus = getattr(game_engine, 'message_bus', None) if game_engine is not None else None
+        if message_bus is not None:
+            message_bus.publish(
+                'rule_event_queued',
+                {
+                    'entity_id': getattr(entity, 'id', ''),
+                    'event_type': event_type,
+                    'delay_sec': float(delay),
+                    'payload': deepcopy(payload),
+                },
+            )
 
     def _process_pending_rule_events(self, entity):
         events = []
@@ -1736,6 +1769,17 @@ class RulesEngine:
                 events.append(event)
                 continue
             payload = event.get('payload', {})
+            game_engine = getattr(self, 'game_engine', None)
+            message_bus = getattr(game_engine, 'message_bus', None) if game_engine is not None else None
+            if message_bus is not None:
+                message_bus.publish(
+                    'rule_event_dispatch',
+                    {
+                        'entity_id': getattr(entity, 'id', ''),
+                        'event_type': event.get('type'),
+                        'payload': deepcopy(payload),
+                    },
+                )
             if event.get('type') == 'remote_ammo':
                 self._add_allowed_ammo(entity, int(payload.get('amount', 0)), payload.get('ammo_type'))
             elif event.get('type') == 'remote_hp':
@@ -3257,6 +3301,13 @@ class RulesEngine:
         entity.fire_control_state = 'idle'
         entity.velocity = {'vx': 0, 'vy': 0, 'vz': 0}
         entity.angular_velocity = 0
+        entity.toppled = False
+        entity.topple_pitch_deg = 0.0
+        entity.topple_roll_deg = 0.0
+        entity.jump_clearance_target_m = 0.0
+        entity.jump_airborne_height_m = 0.0
+        entity.jump_vertical_velocity_mps = 0.0
+        entity.step_climb_state = None
         entity.respawn_timer = 0.0
         entity.respawn_duration = 0.0
         entity.respawn_mode = respawn_mode

@@ -1542,6 +1542,9 @@ class MapManager:
         if distance <= 1e-6:
             return True
         heading_deg = self._heading_between_points_deg((from_x, from_y), (to_x, to_y))
+        start_height = float(self.get_terrain_height_m(from_x, from_y))
+        end_height = float(self.get_terrain_height_m(to_x, to_y))
+        allow_step_descent = end_height <= start_height + 1e-6 and self._segment_touches_step_surface(from_x, from_y, to_x, to_y)
         stride = max(1.0, float(sample_stride or self.terrain_grid_cell_size * 0.35))
         sample_count = max(1, int(math.ceil(distance / stride)))
         radius = max(0.0, float(collision_radius))
@@ -1555,6 +1558,8 @@ class MapManager:
             if self.function_cell_blocks_movement(sample_cell):
                 return False
             if not self._is_function_heading_passable(sample_cell, heading_deg, tolerance_deg=tolerance_deg):
+                if allow_step_descent:
+                    continue
                 return False
             if radius > 1.0:
                 for edge_x, edge_y in (
@@ -1565,6 +1570,8 @@ class MapManager:
                     if self.function_cell_blocks_movement(edge_cell):
                         return False
                     if not self._is_function_heading_passable(edge_cell, heading_deg, tolerance_deg=tolerance_deg):
+                        if allow_step_descent:
+                            continue
                         return False
         return True
 
@@ -2576,7 +2583,7 @@ class MapManager:
             return False
         current_height = float(self.height_map[int(current_cell[1]), int(current_cell[0])])
         neighbor_height = float(self.height_map[int(neighbor_cell[1]), int(neighbor_cell[0])])
-        if abs(neighbor_height - current_height) <= float(max_height_delta_m) + 1e-6:
+        if float(neighbor_height) - float(current_height) <= float(max_height_delta_m) + 1e-6:
             return True
         return self._segment_touches_step_surface(
             current_world[0],
@@ -2881,7 +2888,7 @@ class MapManager:
             neighbor_world = self._nav_cell_center(neighbor_cell, step)
             current_height = float(self.get_terrain_height_m(current_world[0], current_world[1]))
             neighbor_height = float(self.get_terrain_height_m(neighbor_world[0], neighbor_world[1]))
-            if abs(neighbor_height - current_height) <= float(max_height_delta_m) + 1e-6:
+            if float(neighbor_height) - float(current_height) <= float(max_height_delta_m) + 1e-6:
                 return True
             if self._segment_touches_step_surface(current_world[0], current_world[1], neighbor_world[0], neighbor_world[1]):
                 return True
@@ -3276,7 +3283,7 @@ class MapManager:
         if abs(delta_x) <= 1 and abs(delta_y) <= 1 and (delta_x != 0 or delta_y != 0):
             if self._lpa_is_cell_passable(planner, current) and self._lpa_is_cell_passable(planner, neighbor):
                 if self._is_nav_transition_passable(current, neighbor, planner['step'], traversal_profile=planner['traversal_profile']):
-                    height_delta = abs(self._lpa_cell_height(planner, neighbor) - self._lpa_cell_height(planner, current))
+                    height_delta = self._lpa_cell_height(planner, neighbor) - self._lpa_cell_height(planner, current)
                     current_world = self._nav_cell_center(current, planner['step'])
                     neighbor_world = self._nav_cell_center(neighbor, planner['step'])
                     if height_delta <= planner['max_height_delta_m'] + 1e-6 or self._segment_touches_step_surface(current_world[0], current_world[1], neighbor_world[0], neighbor_world[1]):
@@ -3382,7 +3389,7 @@ class MapManager:
                     if self._is_nav_transition_passable(current, neighbor, step, traversal_profile=traversal_profile):
                         current_world = self._nav_cell_center(current, step)
                         neighbor_world = self._nav_cell_center(neighbor, step)
-                        height_delta = abs(cell_height(neighbor) - cell_height(current))
+                        height_delta = cell_height(neighbor) - cell_height(current)
                         if height_delta <= float(max_height_delta_m) + 1e-6 or self._segment_touches_step_surface(current_world[0], current_world[1], neighbor_world[0], neighbor_world[1]):
                             cost = math.hypot(neighbor_world[0] - current_world[0], neighbor_world[1] - current_world[1])
             edge_cost_cache[cache_key] = cost
@@ -3460,7 +3467,7 @@ class MapManager:
                 continue
             neighbor_world = self._nav_cell_center(neighbor, step)
             neighbor_height = self.get_terrain_height_m(neighbor_world[0], neighbor_world[1])
-            if abs(float(neighbor_height) - float(current_height)) > float(max_height_delta_m) + 1e-6:
+            if float(neighbor_height) - float(current_height) > float(max_height_delta_m) + 1e-6:
                 if not self._segment_touches_step_surface(current_world[0], current_world[1], neighbor_world[0], neighbor_world[1]):
                     continue
             parents[neighbor] = current
@@ -3856,7 +3863,7 @@ class MapManager:
             return None
 
         step_limit = float(max_height_delta_m if max_height_delta_m is not None else 0.23)
-        total_height = abs(float(end_sample['height_m']) - float(start_sample['height_m']))
+        total_height = float(end_sample['height_m']) - float(start_sample['height_m'])
         if total_height <= 1e-3 or total_height > step_limit + 1e-6:
             return None
 
@@ -3998,7 +4005,7 @@ class MapManager:
                     'start_height_m': start_sample['height_m'],
                     'end_height_m': sample['height_m'],
                 }
-            height_delta = abs(float(sample['height_m']) - previous_height)
+            height_delta = float(sample['height_m']) - previous_height
             if height_delta > float(max_height_delta_m) + 1e-6:
                 if self._segment_touches_step_surface(previous_x, previous_y, sample_x, sample_y):
                     requires_step_alignment = True
@@ -4024,7 +4031,7 @@ class MapManager:
             'reason': 'ok',
             'start_height_m': start_sample['height_m'],
             'end_height_m': end_sample['height_m'],
-            'height_delta_m': round(abs(float(end_sample['height_m']) - float(start_sample['height_m'])), 3),
+            'height_delta_m': round(max(0.0, float(end_sample['height_m']) - float(start_sample['height_m'])), 3),
             'requires_step_alignment': requires_step_alignment,
             'step_heading_deg': step_heading_deg,
         }
@@ -4074,7 +4081,7 @@ class MapManager:
                     'previous_point': (float(previous_x), float(previous_y)),
                     'distance': trace_distance * (step_index / sample_count),
                 }
-            height_delta = abs(float(sample['height_m']) - previous_height)
+            height_delta = float(sample['height_m']) - previous_height
             if height_delta > float(max_height_delta_m) + 1e-6:
                 if not self._segment_touches_step_surface(previous_x, previous_y, sample_x, sample_y):
                     return {

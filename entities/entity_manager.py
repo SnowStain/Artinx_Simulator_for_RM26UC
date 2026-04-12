@@ -81,16 +81,20 @@ class EntityManager:
             'barrel_light_width_m',
             'barrel_light_height_m',
             'body_render_width_scale',
-            'front_climb_assist_plate_length_m',
+            'front_climb_assist_top_length_m',
+            'front_climb_assist_bottom_length_m',
             'front_climb_assist_plate_width_m',
             'front_climb_assist_plate_height_m',
             'front_climb_assist_forward_offset_m',
             'front_climb_assist_inner_offset_m',
             'rear_climb_assist_upper_length_m',
             'rear_climb_assist_lower_length_m',
-            'rear_climb_assist_bar_width_m',
-            'rear_climb_assist_upper_offset_m',
-            'rear_climb_assist_lower_offset_m',
+            'rear_climb_assist_upper_width_m',
+            'rear_climb_assist_upper_height_m',
+            'rear_climb_assist_lower_width_m',
+            'rear_climb_assist_lower_height_m',
+            'rear_climb_assist_mount_offset_x_m',
+            'rear_climb_assist_mount_height_m',
             'rear_climb_assist_inner_offset_m',
         )
         for field_name in numeric_fields:
@@ -268,16 +272,20 @@ class EntityManager:
         entity.barrel_radius_m = 0.015
         entity.front_climb_assist_style = 'none'
         entity.rear_climb_assist_style = 'none'
-        entity.front_climb_assist_plate_length_m = 0.05
+        entity.front_climb_assist_top_length_m = 0.05
+        entity.front_climb_assist_bottom_length_m = 0.03
         entity.front_climb_assist_plate_width_m = 0.018
         entity.front_climb_assist_plate_height_m = 0.18
         entity.front_climb_assist_forward_offset_m = 0.04
         entity.front_climb_assist_inner_offset_m = 0.06
         entity.rear_climb_assist_upper_length_m = 0.09
         entity.rear_climb_assist_lower_length_m = 0.08
-        entity.rear_climb_assist_bar_width_m = 0.016
-        entity.rear_climb_assist_upper_offset_m = 0.055
-        entity.rear_climb_assist_lower_offset_m = 0.015
+        entity.rear_climb_assist_upper_width_m = 0.016
+        entity.rear_climb_assist_upper_height_m = 0.016
+        entity.rear_climb_assist_lower_width_m = 0.016
+        entity.rear_climb_assist_lower_height_m = 0.016
+        entity.rear_climb_assist_mount_offset_x_m = 0.03
+        entity.rear_climb_assist_mount_height_m = 0.22
         entity.rear_climb_assist_inner_offset_m = 0.03
         entity.wheel_style = 'standard'
         entity.suspension_style = 'none'

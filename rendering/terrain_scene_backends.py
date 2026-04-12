@@ -245,11 +245,11 @@ def _append_face(vertices, p0, p1, p2, p3, color):
 
 
 def _extrude_cell_box_vertices(vertices, x0, x1, y0, y1, z0, z1, top_color):
-    bottom_color = [max(0.0, channel * 0.52) for channel in top_color]
-    left_color = [max(0.0, channel * 0.68) for channel in top_color]
-    right_color = [max(0.0, channel * 0.82) for channel in top_color]
-    front_color = [max(0.0, channel * 0.76) for channel in top_color]
-    back_color = [max(0.0, channel * 0.60) for channel in top_color]
+    bottom_color = list(top_color)
+    left_color = list(top_color)
+    right_color = list(top_color)
+    front_color = list(top_color)
+    back_color = list(top_color)
 
     top_nw = (x0, y1, z0)
     top_ne = (x1, y1, z0)
@@ -399,11 +399,11 @@ class SoftwareTerrainSceneBackend:
                 bottom[1],
                 bottom[0],
             ]
-            bottom_color = tuple(max(0, int(channel * 0.52)) for channel in top_color)
-            left_color = tuple(max(0, int(channel * 0.70)) for channel in top_color)
-            right_color = tuple(max(0, int(channel * 0.86)) for channel in top_color)
-            front_color = tuple(max(0, int(channel * 0.78)) for channel in top_color)
-            back_color = tuple(max(0, int(channel * 0.62)) for channel in top_color)
+            bottom_color = top_color
+            left_color = top_color
+            right_color = top_color
+            front_color = top_color
+            back_color = top_color
             pygame.draw.polygon(surface, bottom_color, bottom)
             pygame.draw.polygon(surface, back_color, back)
             pygame.draw.polygon(surface, front_color, front)

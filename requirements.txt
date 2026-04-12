@@ -1,6 +1,7 @@
 glcontext>=3.0
 moderngl>=5.12
 numpy>=2.0
+pybullet>=3.2
 pygame-ce>=2.5
 pyglet>=2.1
 trimesh>=4.9

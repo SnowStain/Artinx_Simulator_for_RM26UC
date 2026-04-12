@@ -46,16 +46,20 @@ class Entity:
         self.barrel_radius_m = 0.015
         self.front_climb_assist_style = 'none'
         self.rear_climb_assist_style = 'none'
-        self.front_climb_assist_plate_length_m = 0.05
+        self.front_climb_assist_top_length_m = 0.05
+        self.front_climb_assist_bottom_length_m = 0.03
         self.front_climb_assist_plate_width_m = 0.018
         self.front_climb_assist_plate_height_m = 0.18
         self.front_climb_assist_forward_offset_m = 0.04
         self.front_climb_assist_inner_offset_m = 0.06
         self.rear_climb_assist_upper_length_m = 0.09
         self.rear_climb_assist_lower_length_m = 0.08
-        self.rear_climb_assist_bar_width_m = 0.016
-        self.rear_climb_assist_upper_offset_m = 0.055
-        self.rear_climb_assist_lower_offset_m = 0.015
+        self.rear_climb_assist_upper_width_m = 0.016
+        self.rear_climb_assist_upper_height_m = 0.016
+        self.rear_climb_assist_lower_width_m = 0.016
+        self.rear_climb_assist_lower_height_m = 0.016
+        self.rear_climb_assist_mount_offset_x_m = 0.03
+        self.rear_climb_assist_mount_height_m = 0.22
         self.rear_climb_assist_inner_offset_m = 0.03
         self.wheel_style = 'standard'
         self.suspension_style = 'none'
@@ -145,6 +149,9 @@ class Entity:
         self.auto_aim_hit_probability_updated_at = -1e9
         self.player_controlled = False
         self.manual_aim_point = None
+        self.actor_state = 'idle'
+        self.actor_state_tags = set()
+        self.actor_state_context = {}
         self.shot_cooldown = 0.0
         self.overheat_lock_timer = 0.0
         self.evasive_spin_timer = 0.0
@@ -172,10 +179,15 @@ class Entity:
         self.fly_slope_airborne_height_m = 0.0
         self.jump_airborne_height_m = 0.0
         self.jump_vertical_velocity_mps = 0.0
+        self.jump_clearance_target_m = 0.0
         self.jump_requested = False
         self.player_jump_key_down = False
+        self.player_key_timing = {}
+        self.player_input_timing = {}
         self.small_gyro_active = False
         self.small_gyro_direction = 1.0
+        self.step_climb_mode_active = False
+        self.step_climb_lock_heading_deg = None
         self.fly_slope_immunity_armed = False
         self.supply_cooldown = 0.0
         self.supply_ammo_claimed = 0
@@ -189,6 +201,11 @@ class Entity:
         self.can_climb_steps = True
         self.step_climb_duration_sec = 2.0
         self.step_climb_state = None
+        self.toppled = False
+        self.topple_pitch_deg = 0.0
+        self.topple_roll_deg = 0.0
+        self.stability_pitch_limit_deg = 0.0
+        self.stability_roll_limit_deg = 0.0
         self.dynamic_damage_taken_mult = 1.0
         self.dynamic_damage_dealt_mult = 1.0
         self.dynamic_cooling_mult = 1.0
@@ -228,10 +245,15 @@ class Entity:
         self.exchange_zone_id = None
         self.role_purchase_cooldown = 0.0
         self.recent_attackers = []
+        self.damage_feedbacks = []
     
     def update(self, dt):
         """更新实体状态"""
         if getattr(self, 'robot_type', '') == '英雄' and bool(getattr(self, 'hero_deployment_active', False)):
+            self.velocity = {'vx': 0.0, 'vy': 0.0, 'vz': 0.0}
+            self.angular_velocity = 0.0
+
+        if bool(getattr(self, 'toppled', False)):
             self.velocity = {'vx': 0.0, 'vy': 0.0, 'vz': 0.0}
             self.angular_velocity = 0.0
 
@@ -269,17 +291,30 @@ class Entity:
             self.heat -= self.heat_dissipation_rate * cooling_mult * dt
             if self.heat < 0:
                 self.heat = 0
+
+        active_feedbacks = []
+        for feedback in list(getattr(self, 'damage_feedbacks', [])):
+            feedback['ttl'] = max(0.0, float(feedback.get('ttl', 0.0)) - dt)
+            if feedback['ttl'] > 0.0:
+                active_feedbacks.append(feedback)
+        self.damage_feedbacks = active_feedbacks
     
     def set_position(self, x, y, z=0):
         """设置位置"""
         self.position = {'x': x, 'y': y, 'z': z}
         self.previous_position = dict(self.position)
         self.last_valid_position = dict(self.position)
+        self.toppled = False
+        self.topple_pitch_deg = 0.0
+        self.topple_roll_deg = 0.0
     
     def set_velocity(self, vx, vy, vz=0):
         """设置速度"""
         if not self.movable:
             self.velocity = {'vx': 0, 'vy': 0, 'vz': 0}
+            return
+        if bool(getattr(self, 'toppled', False)):
+            self.velocity = {'vx': 0.0, 'vy': 0.0, 'vz': 0.0}
             return
         if getattr(self, 'robot_type', '') == '英雄' and bool(getattr(self, 'hero_deployment_active', False)):
             self.velocity = {'vx': 0.0, 'vy': 0.0, 'vz': 0.0}
@@ -288,7 +323,20 @@ class Entity:
     
     def take_damage(self, damage):
         """受到伤害"""
-        self.health -= damage
+        damage_value = max(0.0, float(damage))
+        if damage_value <= 0.0:
+            return
+        feedback_count = len(getattr(self, 'damage_feedbacks', ()))
+        self.damage_feedbacks.append({
+            'amount': damage_value,
+            'ttl': 0.85,
+            'total_ttl': 0.85,
+            'rise_px': 34.0,
+            'drift_px': -12.0 if feedback_count % 2 == 0 else 12.0,
+        })
+        if len(self.damage_feedbacks) > 6:
+            self.damage_feedbacks = self.damage_feedbacks[-6:]
+        self.health -= damage_value
         if self.health< 0:
             self.health = 0
             self.state = "destroyed"

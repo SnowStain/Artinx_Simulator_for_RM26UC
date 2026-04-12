@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import math
+from copy import deepcopy
 
 from pygame_compat import pygame
 from control.player_look import clamp_entity_pitch, set_player_mouse_input_settings
@@ -46,6 +47,25 @@ class ManualController:
         except Exception:
             return 0.0
 
+    def _update_player_key_timing(self, entity, now_sec, frame_dt, key_states):
+        previous = getattr(entity, 'player_key_timing', {}) if isinstance(getattr(entity, 'player_key_timing', {}), dict) else {}
+        timing = {}
+        for key_name, is_down in key_states.items():
+            prior = previous.get(key_name, {}) if isinstance(previous.get(key_name, {}), dict) else {}
+            was_down = bool(prior.get('is_down', False))
+            held_sec = float(prior.get('held_sec', 0.0)) if was_down else 0.0
+            if is_down:
+                held_sec = held_sec + float(frame_dt) if was_down else 0.0
+            timing[key_name] = {
+                'is_down': bool(is_down),
+                'held_sec': float(held_sec),
+                'just_pressed': bool(is_down and not was_down),
+                'just_released': bool((not is_down) and was_down),
+                'last_pressed_at': float(now_sec if is_down and not was_down else prior.get('last_pressed_at', -1.0)),
+                'last_released_at': float(now_sec if (not is_down) and was_down else prior.get('last_released_at', -1.0)),
+            }
+        entity.player_key_timing = timing
+
     def _select_manual_autoaim_target(self, entity, all_entities, rules_engine):
         if rules_engine is None:
             return None, None, None, None
@@ -83,14 +103,28 @@ class ManualController:
     def update(self, keys, entities, all_entities=None, rules_engine=None, manual_state=None):
         """更新手动控制"""
         state = manual_state or {}
+        movement_state = state.get('movement', {}) if isinstance(state.get('movement'), dict) else {}
+        now_sec = float(state.get('input_time_sec', 0.0))
+        frame_dt = max(0.0, float(state.get('frame_dt', 0.0)))
         yaw_delta = float(state.get('look_dx', 0.0))
         pitch_delta = float(state.get('look_dy', 0.0))
         fire_pressed = bool(state.get('fire_pressed', False))
         autoaim_pressed = bool(state.get('autoaim_pressed', False))
         view_aim_state = state.get('view_aim_state') if isinstance(state.get('view_aim_state'), dict) else None
         camera_mode = str(state.get('camera_mode', 'first_person') or 'first_person')
-        small_gyro_pressed = bool(self._pressed(keys, pygame.K_LSHIFT) or self._pressed(keys, pygame.K_RSHIFT))
-        jump_pressed = bool(self._pressed(keys, pygame.K_SPACE))
+        step_climb_mode_active = bool(state.get('step_climb_mode_active', False))
+
+        def state_pressed(name, *key_codes):
+            if name in movement_state:
+                return bool(movement_state.get(name, False))
+            return any(bool(self._pressed(keys, key_code)) for key_code in key_codes)
+
+        small_gyro_pressed = state_pressed('small_gyro', pygame.K_LSHIFT, pygame.K_RSHIFT)
+        jump_pressed = state_pressed('jump', pygame.K_SPACE)
+        move_forward_pressed = state_pressed('forward', pygame.K_w)
+        move_back_pressed = state_pressed('backward', pygame.K_s)
+        move_left_pressed = state_pressed('left', pygame.K_a)
+        move_right_pressed = state_pressed('right', pygame.K_d)
 
         for entity in tuple(entities or ()):
             if not entity.is_alive():
@@ -100,6 +134,29 @@ class ManualController:
             entity.chassis_state = 'player_controlled'
             entity.small_gyro_active = bool(small_gyro_pressed)
             entity.player_camera_mode = camera_mode
+            entity.step_climb_mode_active = step_climb_mode_active
+            entity.player_input_timing = deepcopy(state.get('input_timing', {})) if isinstance(state.get('input_timing'), dict) else {}
+            self._update_player_key_timing(
+                entity,
+                now_sec,
+                frame_dt,
+                {
+                    'forward': move_forward_pressed,
+                    'backward': move_back_pressed,
+                    'left': move_left_pressed,
+                    'right': move_right_pressed,
+                    'jump': jump_pressed,
+                    'small_gyro': small_gyro_pressed,
+                    'step_climb_mode': step_climb_mode_active,
+                },
+            )
+            if step_climb_mode_active:
+                if getattr(entity, 'step_climb_lock_heading_deg', None) is None:
+                    entity.step_climb_lock_heading_deg = float(getattr(entity, 'angle', 0.0))
+                entity.max_terrain_step_height_m = float(getattr(entity, 'max_step_climb_height_m', getattr(entity, 'max_terrain_step_height_m', 0.0)))
+            else:
+                entity.step_climb_lock_heading_deg = None
+                entity.max_terrain_step_height_m = float(getattr(entity, 'direct_terrain_step_height_m', getattr(entity, 'max_terrain_step_height_m', 0.0)))
 
             if getattr(entity, 'robot_type', '') == '步兵':
                 if jump_pressed and not bool(getattr(entity, 'player_jump_key_down', False)):
@@ -160,19 +217,22 @@ class ManualController:
                 entity.fire_control_state = 'firing' if fire_pressed else 'idle'
                 continue
 
-            move_forward = self._pressed(keys, pygame.K_w) - self._pressed(keys, pygame.K_s)
-            move_right = self._pressed(keys, pygame.K_d) - self._pressed(keys, pygame.K_a)
+            move_forward = float(move_forward_pressed) - float(move_back_pressed)
+            move_right = float(move_right_pressed) - float(move_left_pressed)
             speed = self._speed_to_world_units()
             turret_angle = getattr(entity, 'turret_angle', None)
             if turret_angle is None:
                 turret_angle = entity.angle
-            movement_angle_deg = float(turret_angle)
+            chassis_reference_heading = getattr(entity, 'step_climb_lock_heading_deg', None) if step_climb_mode_active else None
+            if chassis_reference_heading is None:
+                chassis_reference_heading = float(turret_angle)
+            movement_angle_deg = float(chassis_reference_heading)
             movement_intensity = 0.0
             velocity_x = 0.0
             velocity_y = 0.0
             if getattr(entity, 'robot_type', '') == '步兵':
-                move_left = self._pressed(keys, pygame.K_a)
-                move_right_key = self._pressed(keys, pygame.K_d)
+                move_left = float(move_left_pressed)
+                move_right_key = float(move_right_pressed)
                 if move_forward > 1e-6:
                     movement_angle_deg = float(turret_angle)
                     movement_intensity = min(1.0, float(move_forward))
@@ -191,7 +251,7 @@ class ManualController:
                     move_forward /= diagonal
                     move_right /= diagonal
                     movement_intensity = 1.0
-                yaw_rad = math.radians(float(turret_angle))
+                yaw_rad = math.radians(float(chassis_reference_heading))
                 forward_x = math.cos(yaw_rad)
                 forward_y = math.sin(yaw_rad)
                 right_x = math.cos(yaw_rad + math.pi * 0.5)
@@ -218,10 +278,14 @@ class ManualController:
                             target_chassis_angle = entity.angle
                         target_chassis_angle = float(target_chassis_angle)
                 else:
-                    target_chassis_angle = getattr(entity, 'turret_angle', None)
-                    if target_chassis_angle is None:
-                        target_chassis_angle = entity.angle
-                    target_chassis_angle = float(target_chassis_angle)
+                    locked_heading = getattr(entity, 'step_climb_lock_heading_deg', None)
+                    if step_climb_mode_active and locked_heading is not None:
+                        target_chassis_angle = float(locked_heading)
+                    else:
+                        target_chassis_angle = getattr(entity, 'turret_angle', None)
+                        if target_chassis_angle is None:
+                            target_chassis_angle = entity.angle
+                        target_chassis_angle = float(target_chassis_angle)
                 angle_diff = self._normalize_angle_diff(target_chassis_angle - float(getattr(entity, 'angle', 0.0)))
                 max_step = self.player_turn_follow_rate_deg * (1.0 / max(float(self.config.get('simulator', {}).get('fps', 50)), 1.0))
                 if abs(angle_diff) <= max_step:

@@ -21,9 +21,10 @@
     "perf_sample_window": 20000,
     "perf_log_interval_sec": 5.0,
     "debug_feature_toggles": {},
-    "player_terrain_render_scale": 0.52,
-    "player_motion_terrain_render_scale": 0.36,
-    "player_terrain_scene_max_cells": 12000
+    "terrain_scene_max_cells": 96000,
+    "player_terrain_render_scale": 0.58,
+    "player_motion_terrain_render_scale": 0.40,
+    "player_terrain_scene_max_cells": 18000
   },
   "ai": {
     "behavior_preset": "latest_behavior",
