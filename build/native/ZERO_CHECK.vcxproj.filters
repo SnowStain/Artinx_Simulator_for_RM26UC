@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="E:\Artinx\260111new\sentryBehaviorSimulator\build\native\CMakeFiles\cac978839eb78bccccf7484b02609886\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{41757E32-C8AA-3B70-A928-137DB6B5432C}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
